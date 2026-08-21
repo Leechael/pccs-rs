@@ -1,0 +1,22 @@
+{
+  "label": "rust_http_5s",
+  "url": "http://127.0.0.1:18081",
+  "pid": 636000,
+  "duration": 5,
+  "before": {
+    "VmPeak": 616056,
+    "VmSize": 551064,
+    "VmHWM": 7104,
+    "VmRSS": 7104
+  },
+  "after": {
+    "VmPeak": 616056,
+    "VmSize": 551596,
+    "VmHWM": 12928,
+    "VmRSS": 12848
+  },
+  "ps": "    PID   RSS    VSZ %CPU %MEM CMD\n 636000 12848 551596  129  0.0 /workspace/pccs-rs/target/release/pccs-rs --host 127.0.0.1 --port 18081 --cache-mode offline --seed /workspace/pccs-rs/compare/seed.json --http\n",
+  "loadgen_stdout": "pccs-rs cache-hit benchmark\nendpoint mix: 70% GET /sgx/certification/v4/pckcert, 20% GET /tcb, 10% GET /qe/identity\nseeded cache, HTTP, no TLS, no Intel network\nurl: http://127.0.0.1:18081\nconcurrency: 32\nwarmup_s: 2\nduration_s: 5.001\nrequests: 626177 (ok=626177 err=0)\nrps: 125206.4\np50_ms: 0.226\np99_ms: 0.703\n",
+  "loadgen_stderr": "",
+  "exit": 0
+}

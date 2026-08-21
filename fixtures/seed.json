@@ -1,0 +1,242 @@
+{
+  "pckcerts": [
+    {
+      "qeid": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "cpusvn": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "pcesvn": "CCCC",
+      "pceid": "DDDD",
+      "encrypted_ppid": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+      "tcbm": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBCCCC",
+      "fmspc": "ABCDABCDABCD",
+      "ca": "processor",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-pck-intmd%0A-----END%20CERTIFICATE-----%0A-----BEGIN%20CERTIFICATE-----%0Aseed-pck-root%0A-----END%20CERTIFICATE-----",
+      "cert": "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUSeedPckCert0000000000000001wDQYJKoZIhvcNAQEL\nBQAwEjEQMA4GA1UEAwwHc2VlZC1jYTAeFw0yNjAxMDEwMDAwMDBaFw0yNzAxMDEw\nMDAwMDBaMBIxEDAOBgNVBAMMB3NlZWQtcGNrMFwwDQYJKoZIhvcNAQEBBQADSwAw\nSAJBAOseed000000000000000000000000000000000000000000000000000000\nAwIDAQABo1MwUTAdBgNVHQ4EFgQUseed000000000000000000000000000wHwYD\nVR0jBBgwFoAUseed000000000000000000000000000wDwYDVR0TAQH/BAUwAwEB\n/zANBgkqhkiG9w0BAQsFAANBASeedPckCertSyntheticOnlyNotARealX509Value=\n-----END CERTIFICATE-----\n"
+    }
+  ],
+  "platforms": [
+    {
+      "qe_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "pce_id": "DDDD",
+      "cpu_svn": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "pce_svn": "CCCC",
+      "enc_ppid": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+      "platform_manifest": "",
+      "fmspc": "ABCDABCDABCD",
+      "ca": "processor"
+    }
+  ],
+  "tcbinfo": [
+    {
+      "prod_type": "sgx",
+      "fmspc": "ABCDABCDABCD",
+      "version": 4,
+      "update_type": "STANDARD",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-tcb-signing%0A-----END%20CERTIFICATE-----%0A-----BEGIN%20CERTIFICATE-----%0Aseed-tcb-root%0A-----END%20CERTIFICATE-----",
+      "tcbinfo": {
+        "tcbInfo": {
+          "id": "SGX",
+          "version": 3,
+          "issueDate": "2026-01-01T00:00:00Z",
+          "nextUpdate": "2027-01-01T00:00:00Z",
+          "fmspc": "ABCDABCDABCD",
+          "pceId": "0000",
+          "tcbType": 0,
+          "tcbEvaluationDataNumber": 1,
+          "tcbLevels": [
+            {
+              "tcb": {
+                "sgxtcbcomponents": [
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  },
+                  {
+                    "svn": 1
+                  }
+                ],
+                "pcesvn": 1
+              },
+              "tcbDate": "2026-01-01T00:00:00Z",
+              "tcbStatus": "UpToDate"
+            }
+          ]
+        },
+        "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "prod_type": "sgx",
+      "fmspc": "ABCDABCDABCD",
+      "version": 3,
+      "update_type": "STANDARD",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-tcb-v3-signing%0A-----END%20CERTIFICATE-----",
+      "tcbinfo": {
+        "tcbInfo": {
+          "version": 2,
+          "fmspc": "ABCDABCDABCD",
+          "pceId": "0000"
+        },
+        "signature": "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+      }
+    },
+    {
+      "prod_type": "tdx",
+      "fmspc": "ABCDABCDABCD",
+      "version": 4,
+      "update_type": "STANDARD",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-tdx-tcb-signing%0A-----END%20CERTIFICATE-----",
+      "tcbinfo": {
+        "tcbInfo": {
+          "id": "TDX",
+          "version": 3,
+          "fmspc": "ABCDABCDABCD"
+        },
+        "signature": "22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"
+      }
+    }
+  ],
+  "identities": [
+    {
+      "enclave_id": 1,
+      "name": "qe",
+      "version": 4,
+      "update_type": "STANDARD",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-qe-identity-chain%0A-----END%20CERTIFICATE-----",
+      "identity": {
+        "enclaveIdentity": {
+          "id": "QE",
+          "version": 2,
+          "issueDate": "2026-01-01T00:00:00Z",
+          "nextUpdate": "2027-01-01T00:00:00Z",
+          "tcbEvaluationDataNumber": 1,
+          "miscselect": "00000000",
+          "attributes": "0000000000000000",
+          "mrsigner": "0000000000000000000000000000000000000000000000000000000000000000",
+          "isvprodid": 1,
+          "tcbLevels": [
+            {
+              "tcb": {
+                "isvsvn": 1
+              },
+              "tcbStatus": "UpToDate"
+            }
+          ]
+        },
+        "signature": "33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    {
+      "enclave_id": 1,
+      "name": "qe",
+      "version": 3,
+      "update_type": "STANDARD",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-qe-v3-identity-chain%0A-----END%20CERTIFICATE-----",
+      "identity": {
+        "enclaveIdentity": {
+          "id": "QE",
+          "version": 1
+        },
+        "signature": "44444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444"
+      }
+    },
+    {
+      "enclave_id": 2,
+      "name": "qve",
+      "version": 4,
+      "update_type": "STANDARD",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-qve-identity-chain%0A-----END%20CERTIFICATE-----",
+      "identity": {
+        "enclaveIdentity": {
+          "id": "QVE",
+          "version": 2
+        },
+        "signature": "55555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"
+      }
+    },
+    {
+      "enclave_id": 3,
+      "name": "tdqe",
+      "version": 4,
+      "update_type": "STANDARD",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-tdqe-identity-chain%0A-----END%20CERTIFICATE-----",
+      "identity": {
+        "enclaveIdentity": {
+          "id": "TD_QE",
+          "version": 2
+        },
+        "signature": "66666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666"
+      }
+    }
+  ],
+  "pckcrls": [
+    {
+      "ca": "PROCESSOR",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-pckcrl-processor-chain%0A-----END%20CERTIFICATE-----",
+      "pckcrl_hex": "3081abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+    },
+    {
+      "ca": "PLATFORM",
+      "issuer_chain": "-----BEGIN%20CERTIFICATE-----%0Aseed-pckcrl-platform-chain%0A-----END%20CERTIFICATE-----",
+      "pckcrl_hex": "3081cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    }
+  ],
+  "rootcacrl_hex": "3081efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+  "crls": [
+    {
+      "uri": "https://certificates.trustedservices.intel.com/IntelSGXRootCA.crl",
+      "crl_hex": "3081efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+    },
+    {
+      "uri": "https://api.trustedservices.intel.com/sgx/certification/v4/pckcrl?ca=processor",
+      "crl_hex": "3081abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+    }
+  ],
+  "appraisal_policies": [
+    {
+      "fmspc": "ABCDABCDABCD",
+      "is_default": true,
+      "policy": "seed.policy.default"
+    }
+  ]
+}

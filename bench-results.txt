@@ -1,0 +1,12 @@
+pccs-rs cache-hit benchmark
+measured: 2026-08-21 21:25 CST (UTC+8)
+endpoint mix: 70% GET /sgx/certification/v4/pckcert, 20% GET /tcb, 10% GET /qe/identity
+seeded RocksDB cache, HTTP, no TLS, no Intel network
+concurrency: 32
+duration: 5.001 s
+requests: 678652 (ok=678652 err=0)
+rps: 135695.1
+p50_ms: 0.205
+p99_ms: 0.653
+rocksdb_rss_mib: 27.1
+compare: old in-memory DashMap ~8 MiB / ~128k rps; Node PCCS ~112 MiB

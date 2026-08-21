@@ -1,0 +1,22 @@
+{
+  "label": "node_https_15s",
+  "url": "https://127.0.0.1:18082",
+  "pid": 634038,
+  "duration": 15,
+  "before": {
+    "VmPeak": 1444292,
+    "VmSize": 1444040,
+    "VmHWM": 208660,
+    "VmRSS": 208660
+  },
+  "after": {
+    "VmPeak": 1482260,
+    "VmSize": 1471104,
+    "VmHWM": 246060,
+    "VmRSS": 236440
+  },
+  "ps": "    PID   RSS    VSZ %CPU %MEM CMD\n 634038 236440 1471104 23.5  1.4 node /workspace/confidential-computing.tee.dcap.pccs/service/pccs_server.js\n",
+  "loadgen_stdout": "pccs-rs cache-hit benchmark\nendpoint mix: 70% GET /sgx/certification/v4/pckcert, 20% GET /tcb, 10% GET /qe/identity\nseeded cache, HTTPS, no Intel network\nurl: https://127.0.0.1:18082\nconcurrency: 32\nwarmup_s: 2\nduration_s: 15.019\nrequests: 17159 (ok=17159 err=0)\nrps: 1142.5\np50_ms: 32.970\np99_ms: 47.795\n",
+  "loadgen_stderr": "",
+  "exit": 0
+}

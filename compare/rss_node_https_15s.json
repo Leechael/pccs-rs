@@ -1,0 +1,25 @@
+{
+  "pid": 634038,
+  "n": 91,
+  "rss_kib_min": 208740,
+  "rss_kib_median": 236440,
+  "rss_kib_max": 246280,
+  "rss_kib_mean": 235969,
+  "vmsize_kib_last": 1471104,
+  "vmpeak_kib_last": 1482260,
+  "vmhwm_kib_last": 246060,
+  "first": {
+    "VmPeak": 1444292,
+    "VmSize": 1444040,
+    "VmHWM": 208740,
+    "VmRSS": 208740,
+    "t": 9.417533874511719e-05
+  },
+  "last": {
+    "VmPeak": 1482260,
+    "VmSize": 1471104,
+    "VmHWM": 246060,
+    "VmRSS": 236440,
+    "t": 18.032716035842896
+  }
+}
