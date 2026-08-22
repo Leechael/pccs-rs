@@ -13,6 +13,9 @@ pub const ROOTCACRL: &str = "rootcacrl";
 pub const CRL: &str = "crl/";
 pub const APPRAISAL: &str = "appraisal/";
 pub const PREG: &str = "preg/";
+/// Per-platform PCK cert pool + known raw TCBs (Intel `platforms` +
+/// `pck_cert` + `platform_tcbs` rows collapsed into one record).
+pub const PLATFORM: &str = "platform/";
 
 fn join_lower(parts: &[&str]) -> String {
     parts
@@ -56,6 +59,10 @@ pub fn appraisal(fmspc: &str) -> String {
 
 pub fn preg(qeid: &str, pceid: &str, cpusvn: &str, pcesvn: &str) -> String {
     make(PREG, &[qeid, pceid, cpusvn, pcesvn])
+}
+
+pub fn platform(qeid: &str, pceid: &str) -> String {
+    make(PLATFORM, &[qeid, pceid])
 }
 
 pub fn prod_name(prod_type: u8) -> &'static str {
