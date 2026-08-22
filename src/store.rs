@@ -35,6 +35,8 @@ pub struct TcbRecord {
     pub version: u32,
     pub update_type: String,
     pub tcbinfo: Value,
+    #[serde(default)]
+    pub raw_body: String,
     pub issuer_chain: String,
 }
 
@@ -44,6 +46,8 @@ pub struct IdentityRecord {
     pub version: u32,
     pub update_type: String,
     pub identity: Value,
+    #[serde(default)]
+    pub raw_body: String,
     pub issuer_chain: String,
 }
 
@@ -120,7 +124,8 @@ impl Store {
             max_open_files = rocks.max_open_files,
             "rocksdb memory knobs"
         );
-        let db = DB::open(&opts, path).map_err(|e| format!("rocksdb open {}: {e}", path.display()))?;
+        let db =
+            DB::open(&opts, path).map_err(|e| format!("rocksdb open {}: {e}", path.display()))?;
         Ok(Self {
             db,
             cache_mode,
@@ -440,7 +445,10 @@ impl Store {
                     .and_then(|x| x.as_str())
                     .unwrap_or("")
                     .to_string();
-                let hexv = item.get("pckcrl_hex").and_then(|x| x.as_str()).unwrap_or("");
+                let hexv = item
+                    .get("pckcrl_hex")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 if let Ok(bytes) = hex::decode(hexv) {
                     let _ = self.put_pckcrl(&PckCrlRecord {
                         ca,
@@ -506,7 +514,11 @@ impl Store {
             pceid,
             cpusvn,
             pcesvn,
-            cert: item.get("cert").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            cert: item
+                .get("cert")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
             tcbm: upper(item, "tcbm"),
             fmspc: upper(item, "fmspc"),
             ca: item
@@ -534,7 +546,11 @@ impl Store {
     }
 
     fn upsert_tcb_from_json(&self, item: &Value) {
-        let prod = match item.get("prod_type").and_then(|x| x.as_str()).unwrap_or("sgx") {
+        let prod = match item
+            .get("prod_type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("sgx")
+        {
             "tdx" | "TDX" => 1u8,
             _ => 0,
         };
@@ -557,6 +573,7 @@ impl Store {
                 .unwrap_or("")
                 .to_string(),
             tcbinfo: item.get("tcbinfo").cloned().unwrap_or(Value::Null),
+            raw_body: String::new(),
         };
         let _ = self.put_tcb(&rec);
     }
@@ -576,6 +593,7 @@ impl Store {
                 .unwrap_or("")
                 .to_string(),
             identity: item.get("identity").cloned().unwrap_or(Value::Null),
+            raw_body: String::new(),
         };
         let _ = self.put_identity(&rec);
     }
@@ -622,6 +640,7 @@ impl Store {
                             version,
                             update_type: update.into(),
                             tcbinfo: info.clone(),
+                            raw_body: String::new(),
                             issuer_chain: issuer.clone(),
                         });
                     }
@@ -654,6 +673,7 @@ impl Store {
                     version,
                     update_type: update.into(),
                     identity,
+                    raw_body: String::new(),
                     issuer_chain: issuer,
                 });
             }

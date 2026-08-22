@@ -27,7 +27,10 @@ enum AnyClient {
 }
 
 impl AnyClient {
-    async fn request(&self, req: Request<Empty<Bytes>>) -> Result<hyper::Response<hyper::body::Incoming>, PccsError> {
+    async fn request(
+        &self,
+        req: Request<Empty<Bytes>>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, PccsError> {
         match self {
             AnyClient::Http(c) => c.request(req).await.map_err(|e| {
                 tracing::warn!("upstream http: {e}");
@@ -65,7 +68,10 @@ impl PcsClient {
             AnyClient::Http(Client::builder(TokioExecutor::new()).build_http())
         };
         if !cfg.proxy.trim().is_empty() {
-            tracing::warn!("proxy={} is set; use HTTPS_PROXY/HTTP_PROXY in the environment for outbound PCS", cfg.proxy);
+            tracing::warn!(
+                "proxy={} is set; use HTTPS_PROXY/HTTP_PROXY in the environment for outbound PCS",
+                cfg.proxy
+            );
         }
         Ok(Self {
             base: normalize_base(&cfg.uri),
@@ -103,7 +109,9 @@ impl PcsClient {
                 tokio::time::sleep(Duration::from_millis(50 * (1 << attempt.min(5)))).await;
             }
             let uri: Uri = url.parse().map_err(|_| error::INTERNAL_ERROR)?;
-            let mut req = Request::get(uri).body(Empty::<Bytes>::new()).map_err(|_| error::INTERNAL_ERROR)?;
+            let mut req = Request::get(uri)
+                .body(Empty::<Bytes>::new())
+                .map_err(|_| error::INTERNAL_ERROR)?;
             if self.is_intel && !self.api_key.is_empty() {
                 if let (Ok(n), Ok(v)) = (
                     HeaderName::from_bytes(b"Ocp-Apim-Subscription-Key"),
@@ -193,7 +201,10 @@ impl PcsClient {
         if enc_ppid.is_empty() || enc_ppid.chars().all(|c| c == '0') {
             return Err(error::NO_CACHE_DATA);
         }
-        let url = format!("{}pckcerts?encrypted_ppid={}&pceid={}", self.base, enc_ppid, pceid);
+        let url = format!(
+            "{}pckcerts?encrypted_ppid={}&pceid={}",
+            self.base, enc_ppid, pceid
+        );
         let (status, h, body) = self.get(&url).await?;
         if status != 200 {
             return Err(error::NO_CACHE_DATA);
@@ -211,7 +222,11 @@ impl PcsClient {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_ascii_uppercase();
-            let mut cert = c.get("cert").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let mut cert = c
+                .get("cert")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             if cert == "Not available" {
                 continue;
             }
@@ -263,8 +278,9 @@ impl PcsClient {
         if status != 200 {
             return Err(error::NO_CACHE_DATA);
         }
+        let raw_body = String::from_utf8(body).map_err(|_| error::NO_CACHE_DATA)?;
         let tcbinfo: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| error::NO_CACHE_DATA)?;
+            serde_json::from_str(&raw_body).map_err(|_| error::NO_CACHE_DATA)?;
         let issuer = {
             let v4 = Self::hdr(&h, headers::TCB_INFO_ISSUER_CHAIN);
             if v4.is_empty() {
@@ -279,6 +295,7 @@ impl PcsClient {
             version,
             update_type: update.as_str().to_string(),
             tcbinfo,
+            raw_body,
             issuer_chain: issuer,
         })
     }
@@ -305,13 +322,15 @@ impl PcsClient {
         if status != 200 {
             return Err(error::NO_CACHE_DATA);
         }
+        let raw_body = String::from_utf8(body).map_err(|_| error::NO_CACHE_DATA)?;
         let identity: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| error::NO_CACHE_DATA)?;
+            serde_json::from_str(&raw_body).map_err(|_| error::NO_CACHE_DATA)?;
         Ok(IdentityRecord {
             enclave_id,
             version,
             update_type: update.as_str().to_string(),
             identity,
+            raw_body,
             issuer_chain: Self::hdr(&h, headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN),
         })
     }
@@ -339,7 +358,10 @@ impl PcsClient {
         if status != 200 {
             return Err(error::NO_CACHE_DATA);
         }
-        if body.iter().all(|b| b.is_ascii_hexdigit() || b.is_ascii_whitespace()) {
+        if body
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() || b.is_ascii_whitespace())
+        {
             let s = String::from_utf8_lossy(&body);
             let cleaned: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
             if let Ok(bytes) = hex::decode(&cleaned) {

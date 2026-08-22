@@ -3,14 +3,14 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use pccs_rs::config::CacheMode;
 use pccs_rs::config::{Config, DEFAULT_ADMIN_TOKEN, DEFAULT_USER_TOKEN};
 use pccs_rs::{create_app_from_config, headers};
 use serde_json::json;
-use tower::ServiceExt;
-use pccs_rs::config::CacheMode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tower::ServiceExt;
 
 fn app() -> axum::Router {
     create_app_from_config(Config::test_default())
@@ -196,7 +196,12 @@ async fn user_auth_on_post_platforms() {
 async fn seeded_v4_pckcert_tcb_identity_pckcrl_200_with_intel_headers() {
     // pckcert
     let (status, h, body) = send(app(), get(PCKCERT)).await;
-    assert_eq!(status, StatusCode::OK, "pckcert {}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "pckcert {}",
+        String::from_utf8_lossy(&body)
+    );
     assert!(h.get(headers::SGX_TCBM).is_some());
     assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), "ABCDABCDABCD");
     assert!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).is_some());
@@ -206,7 +211,9 @@ async fn seeded_v4_pckcert_tcb_identity_pckcrl_200_with_intel_headers() {
         headers::CONTENT_TYPE_PEM
     );
     assert!(h.get(headers::REQUEST_ID).is_some());
-    assert!(body.windows(b"BEGIN CERTIFICATE".len()).any(|w| w == b"BEGIN CERTIFICATE"));
+    assert!(body
+        .windows(b"BEGIN CERTIFICATE".len())
+        .any(|w| w == b"BEGIN CERTIFICATE"));
     assert!(h.get("x-powered-by").is_none());
 
     // tcb
@@ -241,7 +248,11 @@ async fn seeded_v4_pckcert_tcb_identity_pckcrl_200_with_intel_headers() {
     );
 
     // pckcrl DER
-    let (status, h, _) = send(app(), get("/sgx/certification/v4/pckcrl?ca=platform&encoding=DER")).await;
+    let (status, h, _) = send(
+        app(),
+        get("/sgx/certification/v4/pckcrl?ca=platform&encoding=DER"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         h.get(axum::http::header::CONTENT_TYPE).unwrap(),
@@ -257,7 +268,11 @@ async fn v3_requests_include_warning_header() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let warn = h.get(headers::WARNING).expect("Warning header").to_str().unwrap();
+    let warn = h
+        .get(headers::WARNING)
+        .expect("Warning header")
+        .to_str()
+        .unwrap();
     assert!(warn.contains("PCS API version 3 is no longer available"));
     assert!(warn.starts_with("299 - "));
 
@@ -271,11 +286,7 @@ async fn v3_requests_include_warning_header() {
 
 #[tokio::test]
 async fn v3_cache_miss_is_410() {
-    let (status, h, body) = send(
-        app(),
-        get("/sgx/certification/v3/tcb?fmspc=FFFFFFFFFFFF"),
-    )
-    .await;
+    let (status, h, body) = send(app(), get("/sgx/certification/v3/tcb?fmspc=FFFFFFFFFFFF")).await;
     assert_eq!(status, StatusCode::GONE);
     assert!(h.get(headers::WARNING).is_some());
     assert!(String::from_utf8_lossy(&body).contains("planned EOL"));
@@ -342,7 +353,12 @@ async fn put_collateral_then_get_pckcert_is_cache_hit() {
         put_admin("/sgx/certification/v4/platformcollateral", body),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body_txt));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body_txt)
+    );
     assert_eq!(body_txt.as_ref(), b"Operation successful.");
 
     let path = format!(
@@ -375,7 +391,8 @@ async fn post_then_get_platforms_reg_queue() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, h, body) = send(router.clone(), get_admin("/sgx/certification/v4/platforms")).await;
+    let (status, h, body) =
+        send(router.clone(), get_admin("/sgx/certification/v4/platforms")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h.get(headers::PLATFORM_COUNT).unwrap(), "1");
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -512,8 +529,10 @@ async fn spawn_mock(
                 async move {
                     calls.fetch_add(1, Ordering::Relaxed);
                     let sig = tcb_sig.read().await.clone();
-                    let body = serde_json::json!({"tcbInfo":{"fmspc":"00A067110000","id":"SGX"},"signature":sig});
-                    let mut resp = axum::response::Response::new(axum::body::Body::from(body.to_string()));
+                    let body = format!(
+                        "{{\n  \"signature\":\"{sig}\",\n  \"tcbInfo\":{{\"id\":\"SGX\",\"fmspc\":\"00A067110000\"}}\n}}"
+                    );
+                    let mut resp = axum::response::Response::new(axum::body::Body::from(body));
                     resp.headers_mut().insert(
                         headers::TCB_INFO_ISSUER_CHAIN,
                         axum::http::HeaderValue::from_static("mock-tcb-chain"),
@@ -532,8 +551,8 @@ async fn spawn_mock(
                 let calls = calls_i.clone();
                 async move {
                     calls.fetch_add(1, Ordering::Relaxed);
-                    let body = serde_json::json!({"enclaveIdentity":{"id":"QE"},"signature":"mock-qe"});
-                    let mut resp = axum::response::Response::new(axum::body::Body::from(body.to_string()));
+                    let body = "{\n  \"signature\":\"mock-qe\",\n  \"enclaveIdentity\":{\"id\":\"QE\"}\n}";
+                    let mut resp = axum::response::Response::new(axum::body::Body::from(body));
                     resp.headers_mut().insert(
                         headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
                         axum::http::HeaderValue::from_static("mock-qe-chain"),
@@ -603,14 +622,44 @@ async fn lazy_miss_fetches_mock_then_hit() {
     let (status, _, body) = send(router.clone(), get(path)).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(calls.load(Ordering::Relaxed), 1);
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["signature"], "first");
+    let expected = b"{\n  \"signature\":\"first\",\n  \"tcbInfo\":{\"id\":\"SGX\",\"fmspc\":\"00A067110000\"}\n}";
+    assert_eq!(body.as_ref(), expected);
 
     let (status, _, body) = send(router, get(path)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(calls.load(Ordering::Relaxed), 1, "second GET must be RocksDB hit");
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["signature"], "first");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "second GET must be RocksDB hit"
+    );
+    assert_eq!(body.as_ref(), expected);
+}
+
+#[tokio::test]
+async fn lazy_cache_preserves_identity_body_bytes() {
+    let sig = Arc::new(RwLock::new("unused".to_string()));
+    let calls = Arc::new(AtomicU64::new(0));
+    let (uri, _h) = spawn_mock(sig, calls.clone()).await;
+    let mut cfg = cfg_empty();
+    cfg.uri = uri;
+    cfg.cache_mode = CacheMode::Lazy;
+    let router = app_cfg(cfg);
+    let path = "/sgx/certification/v4/qe/identity";
+    let expected = b"{\n  \"signature\":\"mock-qe\",\n  \"enclaveIdentity\":{\"id\":\"QE\"}\n}";
+
+    let (status, _, body) = send(router.clone(), get(path)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), expected);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    let (status, _, body) = send(router, get(path)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), expected);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "second GET must be RocksDB hit"
+    );
 }
 
 #[tokio::test]
@@ -621,7 +670,11 @@ async fn offline_miss_is_404_no_upstream() {
     let mut cfg = cfg_empty();
     cfg.uri = uri;
     cfg.cache_mode = CacheMode::Offline;
-    let (status, _, body) = send(app_cfg(cfg), get("/sgx/certification/v4/tcb?fmspc=00A067110000")).await;
+    let (status, _, body) = send(
+        app_cfg(cfg),
+        get("/sgx/certification/v4/tcb?fmspc=00A067110000"),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body.as_ref(), b"No cache data for this platform.");
     assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -664,18 +717,32 @@ async fn put_collateral_then_get_tcb_and_identity() {
             }
         }
     });
-    let (status, _, _) = send(router.clone(), put_admin("/sgx/certification/v4/platformcollateral", body)).await;
+    let (status, _, _) = send(
+        router.clone(),
+        put_admin("/sgx/certification/v4/platformcollateral", body),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, h, body) = send(router.clone(), get("/sgx/certification/v4/tcb?fmspc=00AABBCCDDEE")).await;
+    let (status, h, body) = send(
+        router.clone(),
+        get("/sgx/certification/v4/tcb?fmspc=00AABBCCDDEE"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(h.get(headers::TCB_INFO_ISSUER_CHAIN).unwrap(), "put-tcb-issuer");
+    assert_eq!(
+        h.get(headers::TCB_INFO_ISSUER_CHAIN).unwrap(),
+        "put-tcb-issuer"
+    );
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["signature"], "put-tcb");
 
     let (status, h, body) = send(router, get("/sgx/certification/v4/qe/identity")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(h.get(headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN).unwrap(), "put-qe-issuer");
+    assert_eq!(
+        h.get(headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN).unwrap(),
+        "put-qe-issuer"
+    );
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["enclaveIdentity"]["id"], "QE-PUT");
 }
@@ -713,8 +780,22 @@ async fn live_phala_tcb_and_qe_identity() {
     cfg.uri = "https://pccs.phala.network/sgx/certification/v4/".into();
     cfg.cache_mode = CacheMode::Lazy;
     let router = app_cfg(cfg);
-    let (status, _, body) = send(router.clone(), get("/sgx/certification/v4/tcb?fmspc=00A067110000")).await;
-    assert_eq!(status, StatusCode::OK, "live tcb {}", String::from_utf8_lossy(&body));
+    let (status, _, body) = send(
+        router.clone(),
+        get("/sgx/certification/v4/tcb?fmspc=00A067110000"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "live tcb {}",
+        String::from_utf8_lossy(&body)
+    );
     let (status, _, body) = send(router, get("/sgx/certification/v4/qe/identity")).await;
-    assert_eq!(status, StatusCode::OK, "live qe {}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "live qe {}",
+        String::from_utf8_lossy(&body)
+    );
 }

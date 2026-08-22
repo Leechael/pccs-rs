@@ -34,13 +34,17 @@ fn bytes(status: StatusCode, headers: HeaderMap, body: Vec<u8>) -> Response {
     (status, headers, body).into_response()
 }
 
-fn json_value(status: StatusCode, headers: HeaderMap, value: &Value) -> Response {
+fn json_value(status: StatusCode, headers: HeaderMap, value: &Value, raw_body: &str) -> Response {
     let mut h = headers;
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(headers::CONTENT_TYPE_JSON),
     );
-    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    let body = if raw_body.is_empty() {
+        serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec())
+    } else {
+        raw_body.as_bytes().to_vec()
+    };
     (status, h, body).into_response()
 }
 
@@ -125,10 +129,17 @@ async fn get_tcb(
     let version = version(uri)?;
     let fmspc = validate::fmspc(first(q, "fmspc"))?;
     let update = validate::update_type(first(q, "update"), false)?;
-    let rec = state.cache.get_tcb(prod_type, &fmspc, version, update).await?;
+    let rec = state
+        .cache
+        .get_tcb(prod_type, &fmspc, version, update)
+        .await?;
     let mut h = HeaderMap::new();
-    insert(&mut h, headers::tcb_issuer_chain_name(version), &rec.issuer_chain);
-    Ok(json_value(StatusCode::OK, h, &rec.tcbinfo))
+    insert(
+        &mut h,
+        headers::tcb_issuer_chain_name(version),
+        &rec.issuer_chain,
+    );
+    Ok(json_value(StatusCode::OK, h, &rec.tcbinfo, &rec.raw_body))
 }
 
 pub async fn get_sgx_tcb(
@@ -157,14 +168,17 @@ async fn get_identity(
 ) -> Result<Response, PccsError> {
     let version = version(uri)?;
     let update = validate::update_type(first(q, "update"), false)?;
-    let rec = state.cache.get_identity(enclave_id, version, update).await?;
+    let rec = state
+        .cache
+        .get_identity(enclave_id, version, update)
+        .await?;
     let mut h = HeaderMap::new();
     insert(
         &mut h,
         headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
         &rec.issuer_chain,
     );
-    Ok(json_value(StatusCode::OK, h, &rec.identity))
+    Ok(json_value(StatusCode::OK, h, &rec.identity, &rec.raw_body))
 }
 
 pub async fn get_qe_identity(
@@ -267,7 +281,12 @@ pub async fn post_platforms(
         .and_then(|x| x.as_str())
         .unwrap_or("");
     let (cpu_svn, pce_svn, enc_ppid, manifest) = if !manifest.is_empty() {
-        (String::new(), String::new(), String::new(), manifest.to_string())
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            manifest.to_string(),
+        )
     } else {
         let cpu = obj.get("cpu_svn").and_then(|x| x.as_str()).unwrap_or("");
         let pce = obj.get("pce_svn").and_then(|x| x.as_str()).unwrap_or("");
