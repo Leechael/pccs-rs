@@ -10,3 +10,47 @@ p50_ms: 0.205
 p99_ms: 0.653
 rocksdb_rss_mib: 27.1
 compare: old in-memory DashMap ~8 MiB / ~128k rps; Node PCCS ~112 MiB
+
+---
+
+pccs-rs cache-hit benchmark (re-measured after the P1-P14 fix round)
+measured: 2026-08-23 03:18 CST (UTC+8)
+same command as above:
+  pccs-rs --http --port PORT --db-path <tmp> --uri '' --seed fixtures/seed.json
+  loadgen --url http://127.0.0.1:PORT --duration 5 --concurrency 32
+endpoint mix: 70% GET /pckcert, 20% GET /tcb, 10% GET /qe/identity
+
+IMPORTANT — these numbers are NOT comparable to the 2026-08-21 run above.
+The host is heavily loaded this session (load average ~19-28 on 10 cores;
+Chrome, ChatGPT and a node process are competing for CPU), which caps the
+whole benchmark at roughly a third of the 2026-08-21 figure. The A/B below
+was therefore run interleaved against a binary built from git HEAD, so both
+sides see the same contention.
+
+baseline = git HEAD (commit 873aad8), built to a separate target dir
+current  = working tree with the P1-P14 fixes
+
+interleaved rounds (rps):
+  round 1   HEAD 42935.6   current 42176.6
+  round 2   HEAD 44599.9   current 38290.3
+  round 3   HEAD 39489.5   current 45263.3
+  mean      HEAD 42341.7   current 41910.1   (-1.0%, inside run-to-run spread)
+
+detailed single runs:
+  HEAD     requests 203454 (ok=203454 err=0)  rps 40648.9  p50 0.591ms  p99 3.890ms
+  current  requests 215657 (ok=215657 err=0)  rps 43116.0  p50 0.582ms  p99 3.310ms
+
+Conclusion: there is no throughput regression between HEAD and the fix round.
+The drop from ~135k rps is environmental (host contention), not code. Both
+binaries land in the same 38-45k band, and the per-round spread within a single
+binary (39.5k-44.6k for HEAD alone) is larger than the difference between them.
+
+Hot-path changes made anyway, since they were real added per-request work
+relative to HEAD and are free:
+  - GET /pckcert did an extra full PlatformPool deserialize on every cache hit
+    (store.get_platform_pool) purely to answer "is this platform known?".
+    Replaced with Store::has_platform, a raw DB::get with no deserialize; the
+    pool is now loaded only on a miss, where selection actually needs it.
+  - Store::get_json switched from DB::get (allocates a Vec per lookup) to
+    DB::get_pinned (reads out of the block cache).
+Neither is measurable above the noise on this host, but both remove work.
