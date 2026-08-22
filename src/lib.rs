@@ -24,8 +24,10 @@ use axum::Router;
 use std::sync::Arc;
 
 pub fn app_state(cfg: Config) -> AppState {
+    // `build_cache` fails for more than a bad DB path (a rejected proxy URL, a
+    // seed that will not load), so the message must not claim RocksDB.
     let cache = build_cache(&cfg).unwrap_or_else(|e| {
-        panic!("open RocksDB at {}: {e}", cfg.db_path.display());
+        panic!("failed to initialise cache: {e}");
     });
     AppState {
         cache,
@@ -37,7 +39,11 @@ pub fn create_app(state: AppState) -> Router {
     let body_limit = state.config.max_body_size;
     let pcs_ver = state.config.pcs_version();
 
+    // Node mounts `v3EolWarning` with `app.use`, so every v3 request carries
+    // the header — including ones that match no route. A fallback inside the
+    // nested router keeps unmatched v3 paths under the layer.
     let sgx_v3 = routes::sgx_router(state.clone())
+        .fallback(routes::handlers::not_found)
         .layer(middleware::from_fn(auth::v3_eol_warning));
 
     let mut app = Router::new().nest("/sgx/certification/v3", sgx_v3);

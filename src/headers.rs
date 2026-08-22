@@ -17,6 +17,8 @@ pub const SGX_PCK_CRL_ISSUER_CHAIN: &str = "SGX-PCK-CRL-Issuer-Chain";
 
 pub const CONTENT_TYPE_PEM: &str = "application/x-pem-file";
 pub const CONTENT_TYPE_JSON: &str = "application/json";
+/// Express `res.json` / `res.send(object)`.
+pub const CONTENT_TYPE_JSON_UTF8: &str = "application/json; charset=utf-8";
 pub const CONTENT_TYPE_CRL: &str = "application/pkix-crl";
 
 /// Node `v3EolWarning.js` Warning header value.

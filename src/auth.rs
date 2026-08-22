@@ -62,15 +62,10 @@ pub async fn require_admin(
     Ok(next.run(req).await)
 }
 
-/// Attach `Request-ID` (client-supplied or generated UUID without dashes).
+/// Attach `Request-ID`. Node `addRequestId.js` always generates a fresh UUID —
+/// a client-supplied Request-ID is never echoed back.
 pub async fn add_request_id(req: Request<axum::body::Body>, next: Next) -> Response {
-    let id = req
-        .headers()
-        .get(headers::REQUEST_ID)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let id = uuid::Uuid::new_v4().simple().to_string();
 
     let mut response = next.run(req).await;
     if let Ok(val) = axum::http::HeaderValue::from_str(&id) {

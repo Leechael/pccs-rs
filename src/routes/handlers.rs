@@ -1,16 +1,29 @@
 //! HTTP handlers — 1:1 with Node controllers (query names, headers, status, bodies).
 
 use crate::auth::AppState;
-use crate::error::{self, PccsError};
+use crate::error::{self, PccsError, PccsJson};
 use crate::headers;
 use crate::store::RegisteredPlatform;
 use crate::validate::{self, PlatformsSource};
-use axum::extract::{OriginalUri, Query, State};
+use axum::extract::{FromRequestParts, OriginalUri, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Query extractor with Node semantics: duplicated names keep the FIRST value
+/// (`middleware/filterDuplicatedParams.js`) and a malformed query string is a
+/// PCCS `400 Invalid request parameters.`, not axum's plain-text rejection.
+pub struct PccsQuery(pub HashMap<String, String>);
+
+impl<S: Send + Sync> FromRequestParts<S> for PccsQuery {
+    type Rejection = PccsError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        validate::query_params(parts.uri.query()).map(Self)
+    }
+}
 
 fn first<'a>(q: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
     q.get(key).map(|s| s.as_str())
@@ -52,7 +65,7 @@ fn json_value(status: StatusCode, headers: HeaderMap, value: &Value, raw_body: &
 
 pub async fn get_pckcert(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
     let version = version(&uri)?;
@@ -87,7 +100,7 @@ pub async fn get_pckcert(
 
 pub async fn get_pckcrl(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
     let version = version(&uri)?;
@@ -144,7 +157,7 @@ async fn get_tcb(
 
 pub async fn get_sgx_tcb(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
     get_tcb(&state, &q, &uri, 0).await
@@ -152,7 +165,7 @@ pub async fn get_sgx_tcb(
 
 pub async fn get_tdx_tcb(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
     get_tcb(&state, &q, &uri, 1).await
@@ -183,7 +196,7 @@ async fn get_identity(
 
 pub async fn get_qe_identity(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
     get_identity(&state, &q, &uri, 1).await
@@ -191,7 +204,7 @@ pub async fn get_qe_identity(
 
 pub async fn get_qve_identity(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
     get_identity(&state, &q, &uri, 2).await
@@ -199,7 +212,7 @@ pub async fn get_qve_identity(
 
 pub async fn get_tdqe_identity(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
     get_identity(&state, &q, &uri, 3).await
@@ -224,7 +237,7 @@ pub async fn get_rootcacrl(
 
 pub async fn get_crl(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
     let version = version(&uri)?;
@@ -249,101 +262,64 @@ pub async fn get_crl(
 
 pub async fn post_platforms(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
-    Json(body): Json<Value>,
+    PccsQuery(q): PccsQuery,
+    PccsJson(body): PccsJson<Value>,
 ) -> Result<Response, PccsError> {
     let _update = validate::update_type(first(&q, "update"), true)?;
-
-    // Node schema is a single object (PLATFORM_REG_SCHEMA). Also accept a 1-element array.
-    let obj = if let Some(arr) = body.as_array() {
-        arr.first().cloned().ok_or(error::INVALID_REQ)?
-    } else if body.is_object() {
-        body
-    } else {
-        return Err(error::INVALID_REQ);
-    };
-
-    let qe_id = obj
-        .get("qe_id")
-        .and_then(|x| x.as_str())
-        .ok_or(error::INVALID_REQ)?;
-    let pce_id = obj
-        .get("pce_id")
-        .and_then(|x| x.as_str())
-        .ok_or(error::INVALID_REQ)?;
-    if qe_id.is_empty() || qe_id.len() > 260 {
-        return Err(error::INVALID_REQ);
-    }
-    let _ = validate::pceid(Some(pce_id))?;
-
-    let manifest = obj
-        .get("platform_manifest")
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
-    let (cpu_svn, pce_svn, enc_ppid, manifest) = if !manifest.is_empty() {
-        (
-            String::new(),
-            String::new(),
-            String::new(),
-            manifest.to_string(),
-        )
-    } else {
-        let cpu = obj.get("cpu_svn").and_then(|x| x.as_str()).unwrap_or("");
-        let pce = obj.get("pce_svn").and_then(|x| x.as_str()).unwrap_or("");
-        let enc = obj.get("enc_ppid").and_then(|x| x.as_str()).unwrap_or("");
-        if cpu.is_empty() || pce.is_empty() || enc.is_empty() {
-            return Err(error::INVALID_REQ);
-        }
-        let cpu = validate::cpusvn(Some(cpu))?;
-        let pce = validate::pcesvn(Some(pce))?;
-        let enc = validate::encrypted_ppid(Some(enc))?.unwrap_or_default();
-        (cpu, pce, enc, String::new())
-    };
+    // Node `PLATFORM_REG_SCHEMA` is `type: 'object'`; an array is a 400.
+    let reg = validate::platform_reg(&body)?;
 
     state
         .cache
         .register_platform(
             RegisteredPlatform {
-                qe_id: qe_id.to_string(),
-                pce_id: pce_id.to_string(),
-                cpu_svn,
-                pce_svn,
-                enc_ppid,
-                platform_manifest: manifest,
+                qe_id: reg.qe_id,
+                pce_id: reg.pce_id,
+                cpu_svn: reg.cpu_svn,
+                pce_svn: reg.pce_svn,
+                enc_ppid: reg.enc_ppid,
+                platform_manifest: reg.platform_manifest,
                 state: 0,
             },
             _update,
         )
         .await?;
 
-    Ok((StatusCode::OK, error::success_body()).into_response())
+    Ok(error::success_response())
 }
 
 pub async fn get_platforms(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
 ) -> Result<Response, PccsError> {
     let src = validate::platforms_source(first(&q, "source"))?;
-    let platforms_json: Value = match src {
-        PlatformsSource::Reg => {
-            let list = state.cache.store.take_registered(0);
-            serde_json::to_value(list).unwrap_or(Value::Array(vec![]))
-        }
-        PlatformsSource::RegNa => {
-            let list = state.cache.store.take_registered(1);
-            serde_json::to_value(list).unwrap_or(Value::Array(vec![]))
-        }
-        PlatformsSource::Fmspc(fmspcs) => {
-            let list = state.cache.store.cached_platforms_by_fmspc(&fmspcs);
-            serde_json::to_value(list).unwrap_or(Value::Array(vec![]))
-        }
-    };
+    // Every branch is a full RocksDB prefix scan; keep it off the runtime.
+    let cache = state.cache.clone();
+    let platforms_json: Value = tokio::task::spawn_blocking(move || match src {
+        PlatformsSource::Reg => cache
+            .store
+            .take_registered(0)
+            .map(|l| serde_json::to_value(l).unwrap_or(Value::Array(vec![]))),
+        PlatformsSource::RegNa => cache
+            .store
+            .take_registered(1)
+            .map(|l| serde_json::to_value(l).unwrap_or(Value::Array(vec![]))),
+        PlatformsSource::Fmspc(fmspcs) => Ok(serde_json::to_value(
+            cache.store.cached_platforms_by_fmspc(&fmspcs),
+        )
+        .unwrap_or(Value::Array(vec![]))),
+    })
+    .await
+    .map_err(|_| error::INTERNAL_ERROR)??;
     let count = platforms_json.as_array().map(|a| a.len()).unwrap_or(0);
     let mut h = HeaderMap::new();
     insert(&mut h, headers::PLATFORM_COUNT, &count.to_string());
+    // Node reaches Express `res.json` here (`res.send(array)` delegates to it),
+    // which labels the body `application/json; charset=utf-8` — unlike the
+    // collateral GETs, which set the bare `application/json` themselves.
     h.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(headers::CONTENT_TYPE_JSON),
+        HeaderValue::from_static(headers::CONTENT_TYPE_JSON_UTF8),
     );
     let body = serde_json::to_vec(&platforms_json).unwrap_or_else(|_| b"[]".to_vec());
     Ok((StatusCode::OK, h, body).into_response())
@@ -354,47 +330,43 @@ pub async fn get_platforms(
 pub async fn put_platform_collateral(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
-    Json(body): Json<Value>,
+    PccsJson(body): PccsJson<Value>,
 ) -> Result<Response, PccsError> {
     let version = version(&uri)?;
     state.cache.store.put_platform_collateral(&body, version)?;
-    Ok((StatusCode::OK, error::success_body()).into_response())
+    Ok(error::success_response())
 }
 
 // --------------- refresh ---------------
 
 pub async fn refresh(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
 ) -> Result<Response, PccsError> {
-    let typ = first(&q, "type");
-    if let Some(t) = typ {
-        if t != "certs" {
-            tracing::error!("Invalid refresh type : {t}");
-            return Err(error::INVALID_REQ);
-        }
-    }
-    state.cache.refresh(typ, first(&q, "fmspc")).await?;
-    Ok((StatusCode::OK, error::success_body()).into_response())
+    state
+        .cache
+        .refresh(first(&q, "type"), first(&q, "fmspc"))
+        .await?;
+    Ok(error::success_response())
 }
 
 // --------------- appraisalpolicy ---------------
 
 pub async fn put_appraisal_policy(
     State(state): State<AppState>,
-    Json(body): Json<Value>,
+    PccsJson(body): PccsJson<Value>,
 ) -> Result<Response, PccsError> {
     let id = state.cache.store.put_appraisal_policy(&body)?;
-    Ok((StatusCode::OK, id).into_response())
+    Ok(error::text_html(StatusCode::OK, id))
 }
 
 pub async fn get_appraisal_policy(
     State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
+    PccsQuery(q): PccsQuery,
 ) -> Result<Response, PccsError> {
     let fmspc = validate::fmspc(first(&q, "fmspc"))?;
     let policies = state.cache.store.get_default_policies(&fmspc)?;
-    Ok((StatusCode::OK, policies).into_response())
+    Ok(error::text_html(StatusCode::OK, policies))
 }
 
 pub async fn not_found() -> Response {
