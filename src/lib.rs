@@ -2,6 +2,8 @@
 //!
 //! HTTP API is 1:1 with Node. RocksDB is the source of truth.
 
+#![forbid(unsafe_code)]
+
 pub mod auth;
 pub mod cache;
 pub mod config;

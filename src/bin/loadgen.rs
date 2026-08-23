@@ -3,6 +3,8 @@
 //! Mix: 70% GET /pckcert, 20% GET /tcb, 10% GET /qe/identity.
 //! HTTP and HTTPS (use --insecure for self-signed dev certs).
 
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
