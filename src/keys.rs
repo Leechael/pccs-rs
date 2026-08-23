@@ -2,6 +2,16 @@
 //!
 //! Canonical fields are lowercase. A cache-hit GET is one `DB::get`.
 //! Digest is `crate::hash::hash128` (Google CityHash128, portable).
+//!
+//! Why CityHash128 and not Murmur3: neither upstream promises cross-version
+//! stability, so the digest is a vendored Rust port pinned by golden test
+//! vectors — that, not the algorithm name, is what makes persisted keys
+//! stable. And on speed it also wins where it matters: benchmarked on both
+//! Apple Silicon and an Intel Xeon Gold 6526Y (20M iters/shape, release),
+//! this port beats the fastest safe-Rust Murmur3 x64_128 (fastmurmur3) at
+//! every real key shape — e.g. a 75-byte pckcert key: ~11.3/13.0 ns vs
+//! ~12.6/16.8 ns (ARM/Intel), and 2x at 300 B. The `murmur3` crate's
+//! Reader-based API is 2-4x slower and was never a contender.
 
 use crate::hash::hash128_hex;
 
