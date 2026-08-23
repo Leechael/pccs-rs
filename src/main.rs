@@ -377,3 +377,103 @@ fn spawn_refresh_scheduler(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_bind_addr_accepts_hosts_and_ips() {
+        let addr = resolve_bind_addr("127.0.0.1:8081");
+        assert_eq!(addr.port(), 8081);
+        let addr = resolve_bind_addr("localhost:9090");
+        assert_eq!(addr.port(), 9090);
+    }
+
+    #[test]
+    fn configure_http_both_keepalive_modes() {
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        let mut cfg = Config::default();
+        configure_http(&mut builder, &cfg);
+        cfg.keepalive_timeout_secs = 0;
+        configure_http(&mut builder, &cfg);
+    }
+
+    #[test]
+    fn warn_helpers_only_log() {
+        let mut cfg = Config::default();
+        warn_on_dev_tokens(&cfg);
+        cfg.user_token_hash = DEFAULT_USER_TOKEN_HASH.into();
+        warn_on_dev_tokens(&cfg);
+
+        // No URI host at all: nothing to compare.
+        cfg.uri = String::new();
+        warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        // Upstream on this very address: warns.
+        cfg.uri = "http://127.0.0.1:8081/sgx/certification/v4/".into();
+        warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        // Unresolvable upstream host: no warning, no panic.
+        cfg.uri = "https://nonexistent.invalid/sgx/".into();
+        warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn tune_tcp_and_acceptor_survive_a_live_socket() {
+        use axum_server::accept::Accept;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr).await.unwrap()
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        tune_tcp(&stream);
+        let (stream, _service) = TunedAcceptor.accept(stream, ()).await.unwrap();
+        drop(stream);
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn await_first_byte_peeks_without_consuming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A client that sends a byte: true, and the byte is still there.
+        // (Connect before accept: the backlog completes the handshake.)
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        client.write_all(b"G").await.unwrap();
+        assert!(await_first_byte(&stream, Duration::from_secs(5)).await);
+        let mut buf = [0u8; 1];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"G", "peek must not consume the request head");
+
+        // A client that hangs up immediately: false.
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(client);
+        assert!(!await_first_byte(&stream, Duration::from_secs(5)).await);
+
+        // A silent client past the deadline: false.
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(!await_first_byte(&stream, Duration::from_millis(50)).await);
+
+        // A zero deadline disables the check.
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(await_first_byte(&stream, Duration::ZERO).await);
+    }
+
+    #[tokio::test]
+    async fn invalid_refresh_schedule_falls_back_to_the_default() {
+        let cfg = Config::test_default();
+        let cache = pccs_rs::cache::build_cache(&cfg).unwrap();
+        // An unparseable schedule must not kill the task; it still computes a
+        // next run from the daily-01:00 default.
+        let handle = spawn_refresh_scheduler(cache, "not a cron".to_string());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!handle.is_finished());
+        handle.abort();
+    }
+}

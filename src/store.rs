@@ -1391,4 +1391,519 @@ mod tests {
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn temp_store() -> Store {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-store-{}", uuid::Uuid::new_v4()));
+        Store::open(&dir, CacheMode::Lazy, &RocksDbOpts::default()).expect("temp store")
+    }
+
+    fn pckcert_rec(qeid: &str) -> PckCertRecord {
+        PckCertRecord {
+            qeid: qeid.into(),
+            pceid: "0001".into(),
+            cpusvn: "AB".repeat(16),
+            pcesvn: "00FF".into(),
+            cert: "pem".into(),
+            tcbm: "tcbm".into(),
+            fmspc: "00906EA10000".into(),
+            ca: "PROCESSOR".into(),
+            issuer_chain: "chain".into(),
+            encrypted_ppid: None,
+            platform_manifest: String::new(),
+        }
+    }
+
+    #[test]
+    fn counters_count() {
+        let s = temp_store();
+        s.record_hit();
+        s.record_hit();
+        s.record_miss();
+        s.record_upstream();
+        assert_eq!(s.hits.load(Ordering::Relaxed), 2);
+        assert_eq!(s.misses.load(Ordering::Relaxed), 1);
+        assert_eq!(s.upstream_fetches.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pckcert_round_trip_and_key_mismatch_is_a_miss() {
+        let s = temp_store();
+        let rec = pckcert_rec("QEID1");
+        s.put_pckcert(&rec).unwrap();
+        // Case-insensitive on every field, like Node's SQL.
+        let got = s.get_pckcert("qeid1", &"ab".repeat(16), "00ff", "0001").unwrap();
+        assert_eq!(got.qeid, "QEID1");
+        // A different raw TCB is a different key.
+        assert!(s.get_pckcert("QEID1", &"CD".repeat(16), "00FF", "0001").is_none());
+
+        // A record stored under a key it does not match reads as a miss, never
+        // as another platform's certificate.
+        let other = pckcert_rec("QEID2");
+        let key = keys::pckcert("QEID3", "0001", &"AB".repeat(16), "00FF");
+        s.put_json(&key, &other).unwrap();
+        assert!(s.get_pckcert("QEID3", &"AB".repeat(16), "00FF", "0001").is_none());
+    }
+
+    #[test]
+    fn platform_pool_lifecycle() {
+        let s = temp_store();
+        assert!(!s.has_platform("QE", "0001"));
+        assert!(s.get_platform_pool("QE", "0001").is_none());
+        // upsert / remove on an unknown platform are no-ops, not errors.
+        s.upsert_raw_tcb("QE", "0001", "AA", "BB", "TM").unwrap();
+        s.remove_raw_tcb("QE", "0001", "AA", "BB").unwrap();
+
+        let mut pool = PlatformPool {
+            qe_id: "QE".into(),
+            pce_id: "0001".into(),
+            fmspc: "00906EA10000".into(),
+            ..Default::default()
+        };
+        pool.raw_tcbs.push(RawTcb {
+            cpu_svn: "AA".into(),
+            pce_svn: "BB".into(),
+            tcbm: "TM1".into(),
+        });
+        s.put_platform_pool(&pool).unwrap();
+        assert!(s.has_platform("qe", "0001"));
+        assert_eq!(s.list_platform_pools().len(), 1);
+
+        // upsert appends a new level and updates an existing one in place.
+        s.upsert_raw_tcb("QE", "0001", "cc", "dd", "tm2").unwrap();
+        s.upsert_raw_tcb("QE", "0001", "AA", "BB", "TM3").unwrap();
+        let pool = s.get_platform_pool("QE", "0001").unwrap();
+        assert_eq!(pool.raw_tcbs.len(), 2);
+        assert_eq!(pool.raw_tcbs[0].tcbm, "TM3");
+        assert_eq!(pool.raw_tcbs[1].tcbm, "TM2");
+        assert_eq!(pool.cert_pairs(), Vec::<(String, String)>::new());
+
+        // replace_platform_certs carries the known raw TCBs forward and
+        // returns them for re-selection.
+        let fresh = PlatformPool {
+            qe_id: "QE".into(),
+            pce_id: "0001".into(),
+            certs: vec![PlatformCert {
+                tcbm: "T".into(),
+                cert: "C".into(),
+            }],
+            ..Default::default()
+        };
+        let previous = s.replace_platform_certs(&fresh).unwrap();
+        assert_eq!(previous.len(), 2);
+        let pool = s.get_platform_pool("QE", "0001").unwrap();
+        assert_eq!(pool.raw_tcbs.len(), 2, "raw TCBs must survive a cert refresh");
+        assert_eq!(pool.cert_pairs(), vec![("T".to_string(), "C".to_string())]);
+
+        s.remove_raw_tcb("QE", "0001", "aa", "bb").unwrap();
+        let pool = s.get_platform_pool("QE", "0001").unwrap();
+        assert_eq!(pool.raw_tcbs.len(), 1);
+        assert_eq!(pool.raw_tcbs[0].cpu_svn, "CC");
+
+        // A record stored under a key it does not match reads as a miss.
+        let key = keys::platform("QEX", "0001");
+        s.put_json(&key, &pool).unwrap();
+        assert!(s.get_platform_pool("QEX", "0001").is_none());
+    }
+
+    #[test]
+    fn cached_platforms_by_fmspc_filters_and_expands_raw_tcbs() {
+        let s = temp_store();
+        let pool = PlatformPool {
+            qe_id: "QE".into(),
+            pce_id: "0001".into(),
+            enc_ppid: "PP".into(),
+            fmspc: "00906EA10000".into(),
+            raw_tcbs: vec![
+                RawTcb { cpu_svn: "A".into(), pce_svn: "B".into(), tcbm: String::new() },
+                RawTcb { cpu_svn: "C".into(), pce_svn: "D".into(), tcbm: String::new() },
+            ],
+            ..Default::default()
+        };
+        s.put_platform_pool(&pool).unwrap();
+
+        // One row per known raw TCB.
+        let all = s.cached_platforms_by_fmspc(&[]);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].qe_id, "QE");
+        // Filtered by fmspc, case-insensitively.
+        let hit = s.cached_platforms_by_fmspc(&["00906ea10000".to_string()]);
+        assert_eq!(hit.len(), 2);
+        assert!(s.cached_platforms_by_fmspc(&["FFFFFFFFFFFF".to_string()]).is_empty());
+    }
+
+    fn tcb_rec(version: u32, update: &str) -> TcbRecord {
+        TcbRecord {
+            prod_type: 0,
+            fmspc: "00906EA10000".into(),
+            version,
+            update_type: update.into(),
+            tcbinfo: serde_json::json!({"id": "SGX"}),
+            raw_body: String::new(),
+            issuer_chain: "chain".into(),
+        }
+    }
+
+    #[test]
+    fn tcb_identity_crl_round_trips_and_mismatches() {
+        let s = temp_store();
+        s.put_tcb(&tcb_rec(4, "STANDARD")).unwrap();
+        assert!(s.get_tcb(0, "00906ea10000", 4, UpdateType::Standard).is_some());
+        // Version / update / prod type are part of the identity of a record.
+        assert!(s.get_tcb(0, "00906EA10000", 3, UpdateType::Standard).is_none());
+        assert!(s.get_tcb(0, "00906EA10000", 4, UpdateType::Early).is_none());
+        assert!(s.get_tcb(1, "00906EA10000", 4, UpdateType::Standard).is_none());
+        assert_eq!(s.list_tcbs().len(), 1);
+        // Tampered record under a foreign key is a miss.
+        let key = keys::tcb("sgx", 4, "FFFFFFFFFFFF", "STANDARD");
+        s.put_json(&key, &tcb_rec(4, "STANDARD")).unwrap();
+        assert!(s.get_tcb(0, "FFFFFFFFFFFF", 4, UpdateType::Standard).is_none());
+
+        let id = IdentityRecord {
+            enclave_id: 1,
+            version: 4,
+            update_type: "STANDARD".into(),
+            identity: serde_json::json!({"id": "QE"}),
+            raw_body: String::new(),
+            issuer_chain: "chain".into(),
+        };
+        s.put_identity(&id).unwrap();
+        assert!(s.get_identity(1, 4, UpdateType::Standard).is_some());
+        assert!(s.get_identity(2, 4, UpdateType::Standard).is_none());
+        assert_eq!(s.list_identities().len(), 1);
+        let key = keys::identity("qe", 3, "STANDARD");
+        s.put_json(&key, &id).unwrap();
+        assert!(s.get_identity(1, 3, UpdateType::Standard).is_none());
+
+        let crl = PckCrlRecord {
+            ca: "PROCESSOR".into(),
+            pckcrl: vec![1, 2, 3],
+            issuer_chain: "chain".into(),
+        };
+        s.put_pckcrl(&crl).unwrap();
+        assert_eq!(s.get_pckcrl("processor").unwrap().pckcrl, vec![1, 2, 3]);
+        assert!(s.get_pckcrl("PLATFORM").is_none());
+        assert_eq!(s.list_pckcrls().len(), 1);
+        let key = keys::pckcrl("PLATFORM");
+        s.put_json(&key, &crl).unwrap();
+        assert!(s.get_pckcrl("PLATFORM").is_none(), "ca mismatch reads as a miss");
+
+        s.put_rootcacrl(&[9, 9]).unwrap();
+        assert_eq!(s.get_rootcacrl().unwrap(), vec![9, 9]);
+
+        s.put_crl("https://example/x.crl", &[7]).unwrap();
+        assert_eq!(s.get_crl("https://example/x.crl").unwrap(), vec![7]);
+        assert!(s.get_crl("https://example/other.crl").is_none());
+        assert_eq!(s.list_crls().len(), 1);
+    }
+
+    fn reg(qe: &str, state: u8) -> RegisteredPlatform {
+        RegisteredPlatform {
+            qe_id: qe.into(),
+            pce_id: "0001".into(),
+            cpu_svn: "AA".into(),
+            pce_svn: "BB".into(),
+            enc_ppid: "PP".into(),
+            platform_manifest: String::new(),
+            state,
+        }
+    }
+
+    #[test]
+    fn registration_queue_normalises_takes_and_deletes() {
+        let s = temp_store();
+        s.register_platform(reg("qe-lowercase", 0)).unwrap();
+        s.register_platform(reg("QE2", 1)).unwrap();
+
+        // take_registered(state) returns only that state's rows, uppercased,
+        // and removes them from the queue.
+        let new = s.take_registered(0).unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].qe_id, "QE-LOWERCASE");
+        assert!(s.take_registered(0).unwrap().is_empty());
+        let na = s.take_registered(1).unwrap();
+        assert_eq!(na.len(), 1);
+        assert_eq!(na[0].qe_id, "QE2");
+
+        // delete_registered removes exactly one row, case-insensitively.
+        s.register_platform(reg("QE3", 0)).unwrap();
+        s.register_platform(reg("QE4", 0)).unwrap();
+        s.delete_registered(&reg("qe3", 0)).unwrap();
+        let rest = s.take_registered(0).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].qe_id, "QE4");
+    }
+
+    #[test]
+    fn appraisal_defaults_join_and_404_when_absent() {
+        let s = temp_store();
+        assert!(s.get_default_policies("ABCDABCDABCD").is_err());
+        // No default policy for the fmspc is also a 404.
+        s.upsert_appraisal_policy_raw("ABCDABCDABCD", "p.nondefault", false);
+        assert!(s.get_default_policies("ABCDABCDABCD").is_err());
+
+        s.upsert_appraisal_policy_raw("ABCDABCDABCD", "p.first", true);
+        assert_eq!(s.get_default_policies("abcdabcdabcd").unwrap(), "p.first");
+        // A second default clears the first.
+        s.upsert_appraisal_policy_raw("ABCDABCDABCD", "p.second", true);
+        assert_eq!(s.get_default_policies("ABCDABCDABCD").unwrap(), "p.second");
+        // Re-upserting the same policy does not duplicate it.
+        s.upsert_appraisal_policy_raw("ABCDABCDABCD", "p.second", true);
+        let list: AppraisalList = s.get_json(&keys::appraisal("ABCDABCDABCD")).unwrap();
+        assert_eq!(list.policies.len(), 3, "nondefault + first + second");
+    }
+
+    #[test]
+    fn seed_value_loads_every_section() {
+        let s = temp_store();
+        s.load_seed_value(&serde_json::json!({
+            "tcbinfo": [{
+                "prod_type": "tdx", "fmspc": "00a067110000", "version": 4,
+                "update_type": "early", "issuer_chain": "c",
+                "tcbinfo": {"id": "TDX"}
+            }],
+            "identities": [{
+                "enclave_id": 2, "version": 4, "update_type": "early",
+                "issuer_chain": "c", "identity": {"id": "QVE"}
+            }],
+            "pckcrls": [{ "ca": "platform", "issuer_chain": "c", "pckcrl_hex": "0a0b" }],
+            "rootcacrl_hex": "0c0d",
+            "crls": [{ "uri": "https://example/x.crl", "crl_hex": "0e" }],
+            "appraisal_policies": [
+                { "fmspc": "abcdabcdabcd", "policy": "p.a", "is_default": true },
+                { "fmspc": "", "policy": "p.skip" }
+            ]
+        }));
+        assert!(s.get_tcb(1, "00A067110000", 4, UpdateType::Early).is_some());
+        assert!(s.get_identity(2, 4, UpdateType::Early).is_some());
+        assert_eq!(s.get_pckcrl("PLATFORM").unwrap().pckcrl, vec![0x0a, 0x0b]);
+        assert_eq!(s.get_rootcacrl().unwrap(), vec![0x0c, 0x0d]);
+        assert_eq!(s.get_crl("https://example/x.crl").unwrap(), vec![0x0e]);
+        assert_eq!(s.get_default_policies("ABCDABCDABCD").unwrap(), "p.a");
+    }
+
+    #[test]
+    fn seed_platform_merges_without_overwriting_cert_fields() {
+        let s = temp_store();
+        // A seeded cert establishes the pool first…
+        s.load_seed_value(&serde_json::json!({
+            "pckcerts": [{
+                "qe_id": "QE", "pce_id": "0001",
+                "cpusvn": "AB".repeat(16), "pcesvn": "00FF",
+                "cert": "pem", "tcbm": "TM", "fmspc": "00906EA10000",
+                "ca": "processor", "issuer_chain": "c", "enc_ppid": "PP"
+            }]
+        }));
+        let pool = s.get_platform_pool("QE", "0001").unwrap();
+        assert_eq!(pool.enc_ppid, "PP");
+        assert_eq!(pool.certs.len(), 1);
+        assert_eq!(pool.raw_tcbs.len(), 1);
+
+        // …and a later platforms[] row only fills blanks / adds raw levels.
+        s.load_seed_value(&serde_json::json!({
+            "platforms": [{
+                "qe_id": "QE", "pce_id": "0001", "enc_ppid": "OTHER",
+                "fmspc": "FFFFFFFFFFFF",
+                "cpu_svn": "CD".repeat(16), "pce_svn": "00FE"
+            }, {
+                // Missing pce_id: skipped.
+                "qe_id": "QE2"
+            }]
+        }));
+        let pool = s.get_platform_pool("QE", "0001").unwrap();
+        assert_eq!(pool.enc_ppid, "PP", "cert-established fields win");
+        assert_eq!(pool.fmspc, "00906EA10000");
+        assert_eq!(pool.raw_tcbs.len(), 2);
+        assert!(s.get_platform_pool("QE2", "").is_none());
+
+        // Seeding the same cert twice does not duplicate pool entries.
+        s.load_seed_value(&serde_json::json!({
+            "pckcerts": [{
+                "qeid": "QE", "pceid": "0001",
+                "cpusvn": "AB".repeat(16), "pcesvn": "00FF",
+                "cert": "pem", "tcbm": "TM", "fmspc": "00906EA10000"
+            }]
+        }));
+        let pool = s.get_platform_pool("QE", "0001").unwrap();
+        assert_eq!(pool.certs.len(), 1);
+        // The alternate key spelling (qeid/pceid) is accepted.
+        assert!(s.get_pckcert("QE", &"AB".repeat(16), "00FF", "0001").is_some());
+    }
+
+    /// A synthetic PCK certificate (Platform CA) matching the TCB below.
+    const PCK_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIICPDCCAjOgAwIBAgIBATAKBggqhkjOPQQDAjAkMSIwIAYDVQQDDBlJbnRlbCBT\nR1ggUENLIFBsYXRmb3JtIENBMAAwJDEiMCAGA1UEAwwZSW50ZWwgU0dYIFBDSyBD\nZXJ0aWZpY2F0ZTAAo4IByzCCAccwggHDBgkqhkiG+E0BDQEEggG0MIIBsDAeBgoq\nhkiG+E0BDQEBBBARERERERERERERERERERERMBAGCiqGSIb4TQENAQMEAkREMBQG\nCiqGSIb4TQENAQQEBhI0VniQqzCCAWQGCiqGSIb4TQENAQIwggFUMBAGCyqGSIb4\nTQENAQIBAgEiMBAGCyqGSIb4TQENAQICAgEiMBAGCyqGSIb4TQENAQIDAgEiMBAG\nCyqGSIb4TQENAQIEAgEiMBAGCyqGSIb4TQENAQIFAgEiMBAGCyqGSIb4TQENAQIG\nAgEiMBAGCyqGSIb4TQENAQIHAgEiMBAGCyqGSIb4TQENAQIIAgEiMBAGCyqGSIb4\nTQENAQIJAgEiMBAGCyqGSIb4TQENAQIKAgEiMBAGCyqGSIb4TQENAQILAgEiMBAG\nCyqGSIb4TQENAQIMAgEiMBAGCyqGSIb4TQENAQINAgEiMBAGCyqGSIb4TQENAQIO\nAgEiMBAGCyqGSIb4TQENAQIPAgEiMBAGCyqGSIb4TQENAQIQAgEiMBEGCyqGSIb4\nTQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA\n-----END CERTIFICATE-----\n";
+    const CPUSVN: &str = "22222222222222222222222222222222";
+    const PCESVN: &str = "3333";
+    const PCEID: &str = "4444";
+    const FMSPC: &str = "1234567890AB";
+
+    fn tcb_info_json() -> serde_json::Value {
+        let comps: Vec<serde_json::Value> =
+            (0..16).map(|_| serde_json::json!({ "svn": 0x22 })).collect();
+        serde_json::json!({
+            "id": "SGX", "fmspc": FMSPC, "pceId": PCEID, "tcbType": 0,
+            "tcbLevels": [{
+                "tcb": { "sgxtcbcomponents": comps, "pcesvn": 0x3333 },
+                "tcbStatus": "UpToDate"
+            }]
+        })
+    }
+
+    #[test]
+    fn put_platform_collateral_v3_stores_every_collateral_kind() {
+        let s = temp_store();
+        let qeid = "33333333333333333333333333333333";
+        let body = serde_json::json!({
+            "platforms": [{
+                "qe_id": qeid, "pce_id": PCEID,
+                "cpu_svn": CPUSVN, "pce_svn": PCESVN, "enc_ppid": "E".repeat(768)
+            }],
+            "collaterals": {
+                "pck_certs": [{
+                    "qe_id": qeid, "pce_id": PCEID, "enc_ppid": "E".repeat(768),
+                    "certs": [{
+                        "tcb": { "pcesvn": 0x3333 },
+                        "tcbm": format!("{CPUSVN}{PCESVN}"),
+                        "cert": PCK_PEM
+                    }]
+                }],
+                "tcbinfos": [{
+                    "fmspc": FMSPC,
+                    "tcbinfo": { "tcbInfo": tcb_info_json(), "signature": "v3-std" },
+                    "tcbinfo_early": { "tcbInfo": tcb_info_json(), "signature": "v3-early" }
+                }],
+                "qeidentity": "{\"enclaveIdentity\":{\"id\":\"QE\"}}",
+                "qveidentity": { "enclaveIdentity": { "id": "QVE" } },
+                "pckcacrl": { "processorCrl": "0a0b", "platformCrl": "0c" },
+                "rootcacrl": "0d0e",
+                "rootcacrl_cdp": "https://certificates.trustedservices.intel.com/IntelSGXRootCA.crl",
+                "certificates": {
+                    "SGX-PCK-Certificate-Issuer-Chain": { "PLATFORM": "pck-chain" },
+                    "SGX-TCB-Info-Issuer-Chain": "tcb-chain",
+                    "SGX-Enclave-Identity-Issuer-Chain": "id-chain"
+                }
+            }
+        });
+        s.put_platform_collateral(&body, 3).unwrap();
+
+        // v3 TCB field names land as STANDARD / EARLY v3 records.
+        let rec = s.get_tcb(0, FMSPC, 3, UpdateType::Standard).unwrap();
+        assert_eq!(rec.issuer_chain, "tcb-chain");
+        assert!(rec.raw_body.contains("v3-std"));
+        assert!(s.get_tcb(0, FMSPC, 3, UpdateType::Early).is_some());
+        assert!(s.get_tcb(0, FMSPC, 4, UpdateType::Standard).is_none());
+
+        // Identities: string form and object form both stored, v3.
+        let qe = s.get_identity(1, 3, UpdateType::Standard).unwrap();
+        assert_eq!(qe.identity["enclaveIdentity"]["id"], "QE");
+        assert_eq!(qe.issuer_chain, "id-chain");
+        assert!(s.get_identity(2, 3, UpdateType::Standard).is_some());
+
+        // CRLs: per-CA chains, and the CDP copy of the root CA CRL.
+        assert_eq!(s.get_pckcrl("PROCESSOR").unwrap().pckcrl, vec![0x0a, 0x0b]);
+        let platform = s.get_pckcrl("PLATFORM").unwrap();
+        assert_eq!(platform.pckcrl, vec![0x0c]);
+        assert_eq!(platform.issuer_chain, "pck-chain");
+        assert_eq!(s.get_rootcacrl().unwrap(), vec![0x0d, 0x0e]);
+        assert_eq!(
+            s.get_crl("https://certificates.trustedservices.intel.com/IntelSGXRootCA.crl")
+                .unwrap(),
+            vec![0x0d, 0x0e]
+        );
+
+        // The cert was selected for the platform's raw TCB.
+        let rec = s.get_pckcert(qeid, CPUSVN, PCESVN, PCEID).unwrap();
+        assert_eq!(rec.ca, "PLATFORM");
+        assert_eq!(rec.issuer_chain, "pck-chain");
+        let pool = s.get_platform_pool(qeid, PCEID).unwrap();
+        assert_eq!(pool.raw_tcbs.len(), 1);
+        assert_eq!(pool.enc_ppid, "E".repeat(768));
+    }
+
+    #[test]
+    fn put_platform_collateral_rejects_broken_inputs() {
+        let s = temp_store();
+        let base = serde_json::json!({
+            "platforms": [{
+                "qe_id": "QE", "pce_id": PCEID,
+                "cpu_svn": CPUSVN, "pce_svn": PCESVN, "enc_ppid": "E".repeat(768)
+            }],
+            "collaterals": {
+                "version": 4,
+                "pck_certs": [{
+                    "qe_id": "QE", "pce_id": PCEID, "enc_ppid": "E".repeat(768),
+                    "certs": [{
+                        "tcb": { "pcesvn": 0x3333 },
+                        "tcbm": format!("{CPUSVN}{PCESVN}"),
+                        "cert": PCK_PEM
+                    }]
+                }],
+                "tcbinfos": [{
+                    "fmspc": FMSPC,
+                    "sgx_tcbinfo": { "tcbInfo": tcb_info_json(), "signature": "s" }
+                }],
+                "certificates": {
+                    "SGX-PCK-Certificate-Issuer-Chain": { "PLATFORM": "c" }
+                }
+            }
+        });
+
+        // An empty certs array passes the schema but is rejected here.
+        let mut bad = base.clone();
+        bad["collaterals"]["pck_certs"][0]["certs"] = serde_json::json!([]);
+        assert!(s.put_platform_collateral(&bad, 4).is_err());
+
+        // An unparsable certificate is a 400, never a field fallback.
+        let mut bad = base.clone();
+        bad["collaterals"]["pck_certs"][0]["certs"][0]["cert"] =
+            serde_json::json!("not a certificate");
+        assert!(s.put_platform_collateral(&bad, 4).is_err());
+
+        // No TCB info for the cert's fmspc.
+        let mut bad = base.clone();
+        bad["collaterals"]["tcbinfos"][0]["fmspc"] = serde_json::json!("FFFFFFFFFFFF");
+        assert!(s.put_platform_collateral(&bad, 4).is_err());
+
+        // A raw TCB below every cert fails selection.
+        let mut bad = base.clone();
+        bad["platforms"][0]["cpu_svn"] = serde_json::json!("11".repeat(16));
+        bad["platforms"][0]["pce_svn"] = serde_json::json!("1100");
+        assert!(s.put_platform_collateral(&bad, 4).is_err());
+
+        // The happy path stores the pool.
+        s.put_platform_collateral(&base, 4).unwrap();
+        assert!(s.has_platform("QE", PCEID));
+    }
+
+    #[test]
+    fn sha384_hex_matches_known_vector() {
+        assert_eq!(
+            sha384_hex(""),
+            "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"
+        );
+        assert_eq!(sha384_hex("abc").len(), 96);
+    }
+
+    #[test]
+    fn first_str_supports_dotted_pointers() {
+        let v = serde_json::json!({
+            "flat": "f",
+            "nested": { "inner": "n" }
+        });
+        assert_eq!(first_str(&v, &["flat"]).as_deref(), Some("f"));
+        assert_eq!(first_str(&v, &["nested.inner"]).as_deref(), Some("n"));
+        assert_eq!(first_str(&v, &["missing", "flat"]).as_deref(), Some("f"));
+        assert_eq!(first_str(&v, &["missing"]), None);
+    }
+
+    #[test]
+    fn find_seed_path_prefers_explicit_and_falls_back() {
+        let explicit = std::env::temp_dir().join(format!("pccs-rs-seed-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&explicit, "{}").unwrap();
+        assert_eq!(find_seed_path(Some(&explicit)), Some(explicit.clone()));
+        // A missing explicit path falls through to the built-in candidates;
+        // the repo ships fixtures/seed.json, so this is always Some here.
+        let missing = std::path::Path::new("/definitely/not/here.json");
+        assert!(find_seed_path(Some(missing)).unwrap().ends_with("seed.json"));
+        let _ = std::fs::remove_file(&explicit);
+    }
 }

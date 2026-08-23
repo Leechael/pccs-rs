@@ -803,4 +803,572 @@ mod tests {
                    -----BEGIN CERTIFICATE-----\nd29ybGQ=\n-----END CERTIFICATE-----\n";
         assert_eq!(last_pem_der(pem).unwrap(), b"world");
     }
+
+    #[test]
+    fn normalize_base_appends_a_slash() {
+        assert_eq!(normalize_base(""), "");
+        assert_eq!(normalize_base("https://x/v4/"), "https://x/v4/");
+        assert_eq!(normalize_base("https://x/v4"), "https://x/v4/");
+        assert_eq!(normalize_base("  https://x/v4  "), "https://x/v4/");
+    }
+
+    #[test]
+    fn tdx_if_swaps_the_product_segment() {
+        assert_eq!(tdx_if("https://x/sgx/v4/", false), "https://x/sgx/v4/");
+        assert_eq!(tdx_if("https://x/sgx/v4/", true), "https://x/tdx/v4/");
+    }
+
+    #[test]
+    fn percent_decode_edge_cases() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("plain"), "plain");
+    }
+
+    #[test]
+    fn redact_url_only_shortens_values_over_50_chars() {
+        let exact = "A".repeat(50);
+        let url = format!("https://x/pckcerts?encrypted_ppid={exact}");
+        assert_eq!(redact_url(&url), url, "50 chars is not redacted");
+        let over = "B".repeat(51);
+        let url = format!("https://x/pckcerts?encrypted_ppid={over}");
+        assert_eq!(
+            redact_url(&url),
+            "https://x/pckcerts?encrypted_ppid=BBBB...BBBB"
+        );
+    }
+
+    #[test]
+    fn parse_pckcerts_status_and_shape_checks() {
+        let mut h = HeaderMap::new();
+        h.insert(headers::SGX_FMSPC, HeaderValue::from_static("00a067110000"));
+        h.insert(
+            headers::SGX_PCK_CERTIFICATE_CA_TYPE,
+            HeaderValue::from_static("processor"),
+        );
+        h.insert(
+            headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+            HeaderValue::from_static("chain"),
+        );
+
+        // Non-200 is a cache miss.
+        assert!(PcsClient::parse_pckcerts(404, &h, b"[]").is_err());
+        // Missing fmspc / ca headers is a 500, as in Node.
+        assert!(PcsClient::parse_pckcerts(200, &HeaderMap::new(), b"[]").is_err());
+        // Unparseable / non-array bodies.
+        assert!(PcsClient::parse_pckcerts(200, &h, b"not json").is_err());
+        assert!(PcsClient::parse_pckcerts(200, &h, b"{}").is_err());
+
+        let body = serde_json::json!([
+            { "tcbm": "aa", "cert": "cert-pem" },
+            // "Not available" goes to the registration queue, not the pool.
+            { "tcbm": "bb", "cert": "Not%20available", "tcb": { "pcesvn": 7 } },
+            // Entries without both tcbm and cert are dropped.
+            { "tcbm": "", "cert": "x" },
+            { "tcbm": "cc" }
+        ])
+        .to_string();
+        let resp = PcsClient::parse_pckcerts(200, &h, body.as_bytes()).unwrap();
+        assert_eq!(resp.certs, vec![("AA".to_string(), "cert-pem".to_string())]);
+        assert_eq!(resp.not_available.len(), 1);
+        assert_eq!(resp.not_available[0]["pcesvn"], 7);
+        assert_eq!(resp.fmspc, "00A067110000");
+        assert_eq!(resp.ca, "PROCESSOR");
+        assert_eq!(resp.issuer_chain, "chain");
+    }
+
+    // ---- mock-upstream integration tests (loopback only, never Intel) ----
+
+    use axum::http::StatusCode;
+    use std::sync::Mutex as StdMutex;
+
+    fn client_for(base: &str) -> PcsClient {
+        let cfg = Config {
+            uri: base.into(),
+            api_key: "secret-key".into(),
+            upstream_max_attempts: 1,
+            ..Config::default()
+        };
+        PcsClient::new(&cfg).unwrap()
+    }
+
+    async fn spawn(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}/sgx/certification/v4/")
+    }
+
+    type Seen = Arc<StdMutex<Vec<(String, String, String)>>>;
+
+    /// Records `(method, path?query, subscription-key)` for every request.
+    fn recorder() -> (Seen, axum::Router) {
+        use axum::routing::any;
+        let seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let app = axum::Router::new().fallback(any(move |req: Request<axum::body::Body>| {
+            let seen = seen2.clone();
+            async move {
+                let method = req.method().to_string();
+                let pq = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string();
+                let key = req
+                    .headers()
+                    .get("Ocp-Apim-Subscription-Key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                seen.lock().unwrap().push((method, pq, key));
+                hyper::Response::builder()
+                    .status(404)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+        }));
+        (seen, app)
+    }
+
+    #[tokio::test]
+    async fn pckcert_pccs_normalises_and_encodes() {
+        let (seen, app) = recorder();
+        let base = spawn(app).await;
+        let client = client_for(&base);
+
+        // 404 upstream → NO_CACHE_DATA.
+        assert!(client
+            .fetch_pckcert_pccs("qe", "aa", "bb", "cc", None)
+            .await
+            .is_err());
+        let req = seen.lock().unwrap()[0].clone();
+        assert_eq!(req.0, "GET");
+        assert!(req.1.starts_with("/sgx/certification/v4/pckcert?"), "{}", req.1);
+        // No enc_ppid param when None; the key is not sent on plain collateral.
+        assert!(!req.1.contains("encrypted_ppid"), "{}", req.1);
+        assert_eq!(req.2, "");
+
+        // Serve a cert and check record normalisation + query encoding.
+        let (seen2, app2) = {
+            use axum::routing::get;
+            let seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+            let seen2 = seen.clone();
+            let app = axum::Router::new().route(
+                "/sgx/certification/v4/pckcert",
+                get(move |req: Request<axum::body::Body>| {
+                    let seen = seen2.clone();
+                    async move {
+                        let pq = req.uri().query().unwrap_or("").to_string();
+                        seen.lock().unwrap().push(("GET".into(), pq, String::new()));
+                        let mut resp = axum::response::Response::new(axum::body::Body::from(
+                            "-----BEGIN CERTIFICATE-----\nPEM\n-----END CERTIFICATE-----\n",
+                        ));
+                        let h = resp.headers_mut();
+                        h.insert(headers::SGX_TCBM, HeaderValue::from_static("aabb"));
+                        h.insert(headers::SGX_FMSPC, HeaderValue::from_static("00a067110000"));
+                        h.insert(
+                            headers::SGX_PCK_CERTIFICATE_CA_TYPE,
+                            HeaderValue::from_static("processor"),
+                        );
+                        h.insert(
+                            headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                            HeaderValue::from_static("the-chain"),
+                        );
+                        resp
+                    }
+                }),
+            );
+            (seen, app)
+        };
+        let base = spawn(app2).await;
+        let client = client_for(&base);
+        let rec = client
+            .fetch_pckcert_pccs("qeid", "ab", "cd", "ef", Some("p p&id"))
+            .await
+            .unwrap();
+        assert_eq!(rec.qeid, "QEID");
+        assert_eq!(rec.pceid, "EF");
+        assert_eq!(rec.cpusvn, "AB");
+        assert_eq!(rec.pcesvn, "CD");
+        assert_eq!(rec.tcbm, "AABB");
+        assert_eq!(rec.fmspc, "00A067110000");
+        assert_eq!(rec.ca, "PROCESSOR");
+        assert_eq!(rec.issuer_chain, "the-chain");
+        assert_eq!(rec.encrypted_ppid.as_deref(), Some("P P&ID"));
+        assert!(rec.cert.contains("BEGIN CERTIFICATE"));
+        let query = &seen2.lock().unwrap()[0].1;
+        assert!(query.contains("encrypted_ppid=p%20p%26id"), "{query}");
+    }
+
+    #[tokio::test]
+    async fn pckcerts_intel_rejects_all_zero_ppid_without_network() {
+        let client = client_for("");
+        assert!(!client.enabled());
+        assert!(client.fetch_pckcerts_intel("", "0000").await.is_err());
+        assert!(client.fetch_pckcerts_intel("00000000", "0000").await.is_err());
+        assert_eq!(client.call_count(), 0, "no network call may happen");
+    }
+
+    #[tokio::test]
+    async fn pckcerts_endpoints_send_the_api_key() {
+        use axum::routing::get;
+        let seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_g = seen.clone();
+        let seen_p = seen.clone();
+        let responder = |seen: Seen| {
+            move |req: Request<axum::body::Body>| {
+                let seen = seen.clone();
+                async move {
+                    let key = req
+                        .headers()
+                        .get("Ocp-Apim-Subscription-Key")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    seen.lock()
+                        .unwrap()
+                        .push((req.method().to_string(), String::new(), key));
+                    let mut resp = axum::response::Response::new(axum::body::Body::from("[]"));
+                    let h = resp.headers_mut();
+                    h.insert(headers::SGX_FMSPC, HeaderValue::from_static("00A067110000"));
+                    h.insert(
+                        headers::SGX_PCK_CERTIFICATE_CA_TYPE,
+                        HeaderValue::from_static("PLATFORM"),
+                    );
+                    resp
+                }
+            }
+        };
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/pckcerts",
+            get(responder(seen_g)).post(responder(seen_p)),
+        );
+        let base = spawn(app).await;
+        let client = client_for(&base);
+
+        let resp = client.fetch_pckcerts_intel("AA", "0000").await.unwrap();
+        assert!(resp.certs.is_empty());
+        let resp = client
+            .fetch_pckcerts_intel_manifest("{}", "0000")
+            .await
+            .unwrap();
+        assert!(resp.certs.is_empty());
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "GET");
+        assert_eq!(seen[0].2, "secret-key", "GET pckcerts carries the key");
+        assert_eq!(seen[1].0, "POST");
+        assert_eq!(seen[1].2, "secret-key", "POST pckcerts carries the key");
+    }
+
+    #[tokio::test]
+    async fn fetch_tcb_paths_headers_and_errors() {
+        use axum::routing::get;
+        let seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let ok = move |req: Request<axum::body::Body>, legacy_chain: bool| {
+            let seen = seen2.clone();
+            async move {
+                seen.lock().unwrap().push((
+                    String::new(),
+                    req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string(),
+                    String::new(),
+                ));
+                let mut resp = axum::response::Response::new(axum::body::Body::from(
+                    "{\"tcbInfo\":{\"id\":\"SGX\"}}",
+                ));
+                let name = if legacy_chain {
+                    headers::SGX_TCB_INFO_ISSUER_CHAIN
+                } else {
+                    headers::TCB_INFO_ISSUER_CHAIN
+                };
+                resp.headers_mut().insert(name, HeaderValue::from_static("tcb-chain"));
+                resp
+            }
+        };
+        let seen3 = seen.clone();
+        let app = axum::Router::new()
+            .route("/sgx/certification/v4/tcb", get(move |req| ok(req, false)))
+            .route(
+                "/tdx/certification/v4/tcb",
+                get(move |req: Request<axum::body::Body>| {
+                    let seen = seen3.clone();
+                    async move {
+                        seen.lock().unwrap().push((
+                            String::new(),
+                            req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string(),
+                            String::new(),
+                        ));
+                        let mut resp = axum::response::Response::new(axum::body::Body::from(
+                            "{\"tcbInfo\":{\"id\":\"TDX\"}}",
+                        ));
+                        resp.headers_mut().insert(
+                            headers::SGX_TCB_INFO_ISSUER_CHAIN,
+                            HeaderValue::from_static("legacy-chain"),
+                        );
+                        resp
+                    }
+                }),
+            );
+        let base = spawn(app).await;
+        let client = client_for(&base);
+
+        // v3 is refused before any network call.
+        assert!(client.fetch_tcb(0, "00A067110000", 3, UpdateType::Standard).await.is_err());
+        assert_eq!(client.call_count(), 0);
+
+        let rec = client
+            .fetch_tcb(0, "00a067110000", 4, UpdateType::Early)
+            .await
+            .unwrap();
+        assert_eq!(rec.fmspc, "00A067110000");
+        assert_eq!(rec.update_type, "EARLY");
+        assert_eq!(rec.issuer_chain, "tcb-chain");
+        assert!(rec.raw_body.contains("SGX"));
+
+        // TDX swaps /sgx/ for /tdx/ and falls back to the legacy header name.
+        let rec = client
+            .fetch_tcb(1, "00A067110000", 4, UpdateType::Standard)
+            .await
+            .unwrap();
+        assert_eq!(rec.issuer_chain, "legacy-chain");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].1, "/sgx/certification/v4/tcb?fmspc=00a067110000&update=early");
+        assert_eq!(seen[1].1, "/tdx/certification/v4/tcb?fmspc=00A067110000&update=standard");
+    }
+
+    #[tokio::test]
+    async fn fetch_tcb_bad_responses_are_cache_misses() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/sgx/certification/v4/tcb", get(|| async {
+                axum::response::Response::new(axum::body::Body::from("not json"))
+            }));
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        assert!(client.fetch_tcb(0, "00A067110000", 4, UpdateType::Standard).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_identity_url_per_enclave_id() {
+        let (seen, app) = recorder();
+        let base = spawn(app).await;
+        let client = client_for(&base);
+
+        // 404s are cache misses, but the URLs are still observable.
+        assert!(client.fetch_identity(1, 4, UpdateType::Standard).await.is_err());
+        assert!(client.fetch_identity(2, 4, UpdateType::Early).await.is_err());
+        assert!(client.fetch_identity(3, 4, UpdateType::Standard).await.is_err());
+        assert!(client.fetch_identity(1, 3, UpdateType::Standard).await.is_err());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].1, "/sgx/certification/v4/qe/identity?update=standard");
+        assert_eq!(seen[1].1, "/sgx/certification/v4/qve/identity?update=early");
+        assert_eq!(seen[2].1, "/tdx/certification/v4/qe/identity?update=standard");
+        assert_eq!(seen.len(), 3, "v3 never reaches the network");
+    }
+
+    #[tokio::test]
+    async fn fetch_identity_success() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/qve/identity",
+            get(|| async {
+                let mut resp = axum::response::Response::new(axum::body::Body::from(
+                    "{\"enclaveIdentity\":{\"id\":\"QvE\"}}",
+                ));
+                resp.headers_mut().insert(
+                    headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
+                    HeaderValue::from_static("id-chain"),
+                );
+                resp
+            }),
+        );
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        let rec = client.fetch_identity(2, 4, UpdateType::Standard).await.unwrap();
+        assert_eq!(rec.enclave_id, 2);
+        assert_eq!(rec.issuer_chain, "id-chain");
+        assert!(rec.raw_body.contains("QvE"));
+    }
+
+    #[tokio::test]
+    async fn fetch_pckcrl_lowercases_ca() {
+        let (seen, app) = recorder();
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        assert!(client.fetch_pckcrl("PROCESSOR").await.is_err());
+        assert_eq!(
+            seen.lock().unwrap()[0].1,
+            "/sgx/certification/v4/pckcrl?ca=processor&encoding=der"
+        );
+
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/pckcrl",
+            get(|| async {
+                let mut resp = axum::response::Response::new(axum::body::Body::from(vec![1u8, 2]));
+                resp.headers_mut().insert(
+                    headers::SGX_PCK_CRL_ISSUER_CHAIN,
+                    HeaderValue::from_static("crl-chain"),
+                );
+                resp
+            }),
+        );
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        let rec = client.fetch_pckcrl("platform").await.unwrap();
+        assert_eq!(rec.ca, "PLATFORM");
+        assert_eq!(rec.pckcrl, vec![1, 2]);
+        assert_eq!(rec.issuer_chain, "crl-chain");
+    }
+
+    #[tokio::test]
+    async fn fetch_rootcacrl_hex_decodes_and_pccs_url() {
+        use axum::routing::get;
+        // Hex-text body is decoded to DER.
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/rootcacrl",
+            get(|| async {
+                axum::response::Response::new(axum::body::Body::from("30 03\n0a0b"))
+            }),
+        );
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        let der = client.fetch_rootcacrl().await.unwrap();
+        assert_eq!(der, vec![0x30, 0x03, 0x0a, 0x0b]);
+
+        // Binary body passes through untouched.
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/rootcacrl",
+            get(|| async {
+                axum::response::Response::new(axum::body::Body::from(vec![0x30u8, 0x82]))
+            }),
+        );
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        assert_eq!(client.fetch_rootcacrl().await.unwrap(), vec![0x30, 0x82]);
+
+        // Non-200 bubbles up as a 500.
+        let (seen, app) = recorder();
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        assert!(client.fetch_rootcacrl().await.is_err());
+        assert_eq!(seen.lock().unwrap()[0].1, "/sgx/certification/v4/rootcacrl");
+    }
+
+    #[tokio::test]
+    async fn fetch_crl_errors_and_v3_guard() {
+        let (seen, app) = recorder();
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        assert!(client
+            .fetch_crl("https://certificates.trustedservices.intel.com/x.crl")
+            .await
+            .is_err());
+        // v3 CRL URLs are refused before the network.
+        assert!(client.fetch_crl("https://x/v3/pckcrl?ca=processor").await.is_err());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn throttled_upstream_is_retried_at_most_twice() {
+        use axum::routing::get;
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls2 = calls.clone();
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/pckcrl",
+            get(move || {
+                let calls = calls2.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    hyper::Response::builder()
+                        .status(503)
+                        .header(hyper::header::RETRY_AFTER, "0")
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let cfg = Config {
+            uri: base,
+            upstream_max_attempts: 6,
+            ..Config::default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        let err = client.fetch_pckcrl("processor").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "final 503 surfaces as a miss");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            u64::from(MAX_THROTTLED_ATTEMPTS),
+            "a 429/503 storm is not amplified by the full retry budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_errors_use_the_full_retry_budget() {
+        // A listener that accepts and instantly drops every connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls2 = calls.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((sock, _)) => {
+                        calls2.fetch_add(1, Ordering::Relaxed);
+                        drop(sock);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let cfg = Config {
+            uri: format!("http://{addr}/sgx/certification/v4/"),
+            upstream_max_attempts: 2,
+            ..Config::default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        assert!(client.fetch_pckcrl("processor").await.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_is_refused() {
+        // Raw TCP: axum rewrites a bogus Content-Length, so the lie must be
+        // written straight onto the wire.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
+                        MAX_RESPONSE_BYTES + 1
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                });
+            }
+        });
+        let client = client_for(&format!("http://{addr}/sgx/certification/v4/"));
+        assert!(client.fetch_pckcrl("processor").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_rejects_v3_and_disabled_clients() {
+        let client = client_for("");
+        assert!(client.fetch_pckcrl("processor").await.is_err(), "disabled");
+
+        let client = client_for("http://127.0.0.1:1/sgx/certification/v4/");
+        let err = client
+            .get("http://127.0.0.1:1/sgx/certification/v3/pckcrl?ca=processor")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::GONE);
+    }
 }

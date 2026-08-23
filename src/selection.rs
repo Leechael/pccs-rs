@@ -936,6 +936,89 @@ mod tests {
     }
 
     #[test]
+    fn tlvs_survive_der_edge_cases() {
+        // Multi-byte tag: not produced by Intel certs, aborts the parse.
+        assert!(tlvs(&[0x1F, 0x01, 0x00]).is_empty());
+        // Indefinite length (0x80) and >4-byte lengths: abort.
+        assert!(tlvs(&[0x30, 0x80, 0x00]).is_empty());
+        assert!(tlvs(&[0x30, 0x85, 0, 0, 0, 0, 0]).is_empty());
+        // Declared length past the buffer end: abort.
+        assert!(tlvs(&[0x30, 0x10, 0x01]).is_empty());
+        // Truncated header.
+        assert!(tlvs(&[0x30]).is_empty());
+        // Long-form length that fits.
+        let tlv = tlvs(&[0x04, 0x81, 0x02, 0xAA, 0xBB]);
+        assert_eq!(tlv.len(), 1);
+        assert_eq!(tlv[0].1, &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn der_int_limits() {
+        assert_eq!(der_int(&[]), None);
+        assert_eq!(der_int(&[0x01]), Some(1));
+        assert_eq!(der_int(&[0xFF, 0xFF, 0xFF, 0xFF]), Some(u32::MAX));
+        // 5 bytes can still fit…
+        assert_eq!(der_int(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF]), Some(u32::MAX));
+        // …or overflow u32.
+        assert_eq!(der_int(&[0x01, 0x00, 0x00, 0x00, 0x00]), None);
+        assert_eq!(der_int(&[0; 6]), None);
+    }
+
+    #[test]
+    fn pem_to_der_variants() {
+        assert!(pem_to_der("no markers").is_none());
+        assert!(pem_to_der("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----").is_none());
+        let der = pem_to_der("-----BEGIN CERTIFICATE-----\naGVs bG8=\n-----END CERTIFICATE-----")
+            .unwrap();
+        assert_eq!(der, b"hello");
+    }
+
+    #[test]
+    fn level_cpusvn_shape_checks() {
+        // v4 style with the wrong component count is invalid.
+        let tcb = serde_json::json!({ "sgxtcbcomponents": [{ "svn": 1 }], "pcesvn": 1 });
+        assert_eq!(level_cpusvn(&tcb), None);
+        // A component above 255 is not a byte (v4 style).
+        let comps: Vec<Value> = (0..16).map(|_| serde_json::json!({ "svn": 300 })).collect();
+        let tcb = serde_json::json!({ "sgxtcbcomponents": comps, "pcesvn": 1 });
+        assert_eq!(level_cpusvn(&tcb), None);
+        // A missing svn field invalidates the level.
+        let comps: Vec<Value> = (0..16).map(|_| serde_json::json!({})).collect();
+        let tcb = serde_json::json!({ "sgxtcbcomponents": comps, "pcesvn": 1 });
+        assert_eq!(level_cpusvn(&tcb), None);
+    }
+
+    #[test]
+    fn find_insert_index_skips_non_comparable_certs() {
+        // `find_insert_index` only reads `tcb`; the rest is inert here.
+        let cert = |tcbm: &str, cpusvn: &str, pcesvn: u32| ParsedCert {
+            tcbm: tcbm.into(),
+            cert: String::new(),
+            info: PckCertInfo {
+                version: 3,
+                fmspc: String::new(),
+                pce_id: String::new(),
+                ppid: String::new(),
+                cpusvn: String::new(),
+                pcesvn: 0,
+                ca: String::new(),
+            },
+            tcb: Tcb::new(cpusvn, pcesvn).unwrap(),
+        };
+        let parsed = vec![cert("A", "02000000000000000000000000000000", 1)];
+        // Non-comparable with the bucket cert (lower cpusvn, higher pcesvn):
+        // skipped without advancing the index.
+        let candidate = cert("B", "01000000000000000000000000000000", 2);
+        assert_eq!(find_insert_index(&[0], &parsed, &candidate), -1);
+        // A candidate higher than the bucket cert inserts at 0.
+        let higher = cert("C", "03000000000000000000000000000000", 1);
+        assert_eq!(find_insert_index(&[0], &parsed, &higher), 0);
+        // …and a lower one goes past it.
+        let lower = cert("D", "01000000000000000000000000000000", 1);
+        assert_eq!(find_insert_index(&[0], &parsed, &lower), -1);
+    }
+
+    #[test]
     fn legacy_v3_sgxtcbcompnnsvn_levels_are_understood() {
         let mut tcb = serde_json::Map::new();
         for i in 1..=16u32 {

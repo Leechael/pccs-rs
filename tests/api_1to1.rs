@@ -1180,6 +1180,113 @@ async fn refresh_updates_value_from_mock() {
     assert_eq!(v["signature"], "after");
 }
 
+/// End-to-end: the real binary serves the seeded cache over plain HTTP, the
+/// load generator runs against it, and SIGTERM shuts it down cleanly.
+#[tokio::test]
+async fn binary_serves_seeded_cache_and_shuts_down_on_sigterm() {
+    // A free port: bind, release, reuse.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let db = std::env::temp_dir().join(format!("pccs-rs-e2e-{}", uuid::Uuid::new_v4()));
+    let mut server = std::process::Command::new(env!("CARGO_BIN_EXE_pccs-rs"))
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--db-path",
+            db.to_str().unwrap(),
+            "--dev-tokens",
+            "--no-seed",
+        ])
+        .env("PCCS_URI", "") // no upstream: pure OFFLINE-style serving
+        .arg("--cache-mode")
+        .arg("offline")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn pccs-rs");
+
+    // Wait until the port answers (or the server died).
+    let url = format!("http://127.0.0.1:{port}");
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<http_body_util::Empty<bytes::Bytes>>();
+    let mut up = false;
+    for _ in 0..100 {
+        if server.try_wait().unwrap().is_some() {
+            panic!("pccs-rs exited before serving");
+        }
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("{url}/no/such/route"))
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+        if let Ok(resp) = client.request(req).await {
+            // Even the 404 fallback carries a Request-ID: the app is up.
+            if resp.headers().get(headers::REQUEST_ID).is_some() {
+                up = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(up, "pccs-rs never came up");
+
+    // A cache miss in OFFLINE mode is a 404 with the Node body.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("{url}/sgx/certification/v4/tcb?fmspc=ABCDABCDABCD"))
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // The load generator runs its full main against this server.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_loadgen"))
+        .args([
+            "--url",
+            &url,
+            "--duration",
+            "1",
+            "--concurrency",
+            "2",
+            "--warmup",
+            "1",
+        ])
+        .output()
+        .expect("run loadgen");
+    assert!(
+        out.status.success(),
+        "loadgen failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("rps:"), "{stdout}");
+    assert!(stdout.contains("p99_ms:"), "{stdout}");
+
+    // SIGTERM → graceful shutdown, exit code 0.
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &server.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(15), async move {
+        loop {
+            if let Some(status) = server.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("server did not exit after SIGTERM");
+    assert!(waited.success(), "graceful shutdown must exit 0: {waited}");
+    let _ = std::fs::remove_dir_all(&db);
+}
+
 #[tokio::test]
 #[ignore]
 async fn live_phala_tcb_and_qe_identity() {
@@ -1477,6 +1584,60 @@ async fn query_parsing_matches_node() {
         h.get(headers::WARNING).is_some(),
         "unmatched v3 paths must carry the EOL Warning header"
     );
+}
+
+/// A v3 upstream means only v3 routes exist: the v4 nest is not mounted
+/// (Node's `pcs_version` gate).
+#[tokio::test]
+async fn v3_upstream_mounts_no_v4_routes() {
+    let mut cfg = Config::test_default();
+    cfg.uri = "https://example.test/sgx/certification/v3/".into();
+    cfg.cache_mode = CacheMode::Offline;
+    let router = app_cfg(cfg);
+
+    let (status, _, _) = send(router.clone(), get(TCB)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "v4 must not be mounted");
+
+    // v3 routes still answer (seeded TCB info).
+    let (status, h, _) = send(
+        router,
+        get("/sgx/certification/v3/tcb?fmspc=ABCDABCDABCD"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(h.get(headers::WARNING).is_some());
+}
+
+/// LAZY /pckcert miss against a PCCS upstream: filled, headers normalised,
+/// and the second identical GET is a pure store hit.
+#[tokio::test]
+async fn lazy_pckcert_fill_from_pccs_then_hit() {
+    let sig = Arc::new(RwLock::new("unused".to_string()));
+    let calls = Arc::new(AtomicU64::new(0));
+    let (uri, _h) = spawn_mock(sig, calls.clone()).await;
+    let mut cfg = cfg_empty();
+    cfg.uri = uri;
+    cfg.cache_mode = CacheMode::Lazy;
+    let router = app_cfg(cfg);
+    // A LAZY miss needs the encrypted PPID to fill from a PCCS upstream.
+    let path = format!(
+        "/sgx/certification/v4/pckcert?qeid=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&cpusvn=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB&pcesvn=CCCC&pceid=DDDD&encrypted_ppid={}",
+        "E".repeat(768)
+    );
+
+    let (status, h, body) = send(router.clone(), get(&path)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), "00A067110000");
+    // The mock sends "processor" in lowercase; the served header is the
+    // normalised uppercase form.
+    assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(), "PROCESSOR");
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBCCCC");
+    assert!(String::from_utf8_lossy(&body).contains("BEGIN CERTIFICATE"));
+    let pck_calls = calls.load(Ordering::Relaxed);
+
+    let (status, _, _) = send(router, get(&path)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), pck_calls, "second GET is a store hit");
 }
 
 /// A request body that delivers one chunk and then never completes, without

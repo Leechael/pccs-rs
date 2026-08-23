@@ -788,4 +788,291 @@ mod tests {
             3
         );
     }
+
+    #[test]
+    fn version_from_url_rejects_unknown_and_malformed() {
+        // Only v3 and v4 exist; v10 parses but is not a PCS API version.
+        assert!(api_version_from_url("/sgx/certification/v10/tcb").is_err());
+        // v0 is not a valid version token (no leading zero).
+        assert!(api_version_from_url("/sgx/certification/v0/tcb").is_err());
+        assert!(api_version_from_url("/sgx/certification/v04/tcb").is_err());
+        assert!(api_version_from_url("/sgx/certification/").is_err());
+        assert!(api_version_from_url("").is_err());
+        // The version segment must be followed by '/'.
+        assert!(api_version_from_url("/v4").is_err());
+    }
+
+    #[test]
+    fn update_type_parsing() {
+        assert_eq!(update_type(None, false).unwrap(), UpdateType::Standard);
+        assert_eq!(
+            update_type(Some("standard"), false).unwrap(),
+            UpdateType::Standard
+        );
+        assert_eq!(update_type(Some("early"), false).unwrap(), UpdateType::Early);
+        // ALL is only accepted where Node allows it (POST /platforms).
+        assert_eq!(update_type(Some("all"), true).unwrap(), UpdateType::All);
+        assert!(update_type(Some("all"), false).is_err());
+        assert!(update_type(Some("bogus"), true).is_err());
+        assert_eq!(UpdateType::Standard.as_str(), "STANDARD");
+        assert_eq!(UpdateType::Early.as_str(), "EARLY");
+        assert_eq!(UpdateType::All.as_str(), "ALL");
+    }
+
+    #[test]
+    fn qeid_rules() {
+        assert!(qeid(None).is_err());
+        assert!(qeid(Some("")).is_err());
+        assert!(qeid(Some(&"A".repeat(261))).is_err());
+        // Not required to be hex; uppercased like Node.
+        assert_eq!(qeid(Some("qeid-1")).unwrap(), "QEID-1");
+        assert_eq!(qeid(Some(&"a".repeat(260))).unwrap(), "A".repeat(260));
+    }
+
+    #[test]
+    fn hex_validators_require_presence_and_length() {
+        assert!(fmspc(None).is_err());
+        assert!(fmspc(Some("ABCD")).is_err());
+        assert_eq!(fmspc(Some("abcdabcdabcd")).unwrap(), "ABCDABCDABCD");
+        assert!(cpusvn(Some(&"0".repeat(31))).is_err());
+        assert_eq!(cpusvn(Some(&"a".repeat(32))).unwrap(), "A".repeat(32));
+        assert!(pcesvn(Some("12345")).is_err());
+        assert_eq!(pcesvn(Some("abcd")).unwrap(), "ABCD");
+        assert!(pceid(Some("zzzz")).is_err());
+        assert_eq!(pceid(Some("00ff")).unwrap(), "00FF");
+    }
+
+    #[test]
+    fn pck_ca_is_case_insensitive_processor_or_platform() {
+        assert_eq!(pck_ca(Some("processor")).unwrap(), "PROCESSOR");
+        assert_eq!(pck_ca(Some("Platform")).unwrap(), "PLATFORM");
+        assert!(pck_ca(Some("root")).is_err());
+        assert!(pck_ca(None).is_err());
+    }
+
+    #[test]
+    fn platforms_source_variants() {
+        assert!(matches!(platforms_source(None).unwrap(), PlatformsSource::Reg));
+        assert!(matches!(
+            platforms_source(Some("")).unwrap(),
+            PlatformsSource::Reg
+        ));
+        assert!(matches!(
+            platforms_source(Some("reg")).unwrap(),
+            PlatformsSource::Reg
+        ));
+        assert!(matches!(
+            platforms_source(Some("reg_na")).unwrap(),
+            PlatformsSource::RegNa
+        ));
+        // Empty list is allowed and matches nothing downstream.
+        match platforms_source(Some("[]")).unwrap() {
+            PlatformsSource::Fmspc(v) => assert!(v.is_empty()),
+            _ => panic!("[] must be an fmspc list"),
+        }
+        match platforms_source(Some("[abcdabcdabcd, 00906EA10000]")).unwrap() {
+            PlatformsSource::Fmspc(v) => {
+                assert_eq!(v, vec!["ABCDABCDABCD", "00906EA10000"])
+            }
+            _ => panic!("expected fmspc list"),
+        }
+        assert!(platforms_source(Some("ABCDABCDABCD")).is_err());
+        assert!(platforms_source(Some("[nothex]")).is_err());
+    }
+
+    #[test]
+    fn platform_reg_manifest_branch_and_length_limits() {
+        // With a platform manifest the raw-TCB fields are dropped, not required.
+        let reg = platform_reg(&json!({
+            "qe_id": "aa", "pce_id": "0000", "platform_manifest": "AB"
+        }))
+        .unwrap();
+        assert_eq!(reg.platform_manifest, "AB");
+        assert!(reg.cpu_svn.is_empty());
+        assert!(reg.enc_ppid.is_empty());
+
+        // Without one, cpu_svn / pce_svn / enc_ppid are all mandatory.
+        assert!(platform_reg(&json!({ "qe_id": "AA", "pce_id": "0000" })).is_err());
+        assert!(platform_reg(&json!({ "pce_id": "0000" })).is_err());
+        assert!(platform_reg(&json!({ "qe_id": "A".repeat(261), "pce_id": "0000" })).is_err());
+        assert!(platform_reg(&json!({
+            "qe_id": "AA", "pce_id": "0000",
+            "cpu_svn": "0".repeat(32), "pce_svn": "zzzz", "enc_ppid": "a".repeat(768)
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn platform_collateral_v3_and_field_edge_cases() {
+        // v3 has no `collaterals.version` check and uses the v3 field names.
+        let v3 = json!({
+            "platforms": [{ "qe_id": "AA", "pce_id": "0000" }],
+            "collaterals": {
+                "pck_certs": [{
+                    "qe_id": "AA", "pce_id": "0000", "enc_ppid": "",
+                    "certs": [{ "tcb": {}, "tcbm": "0".repeat(36), "cert": "x" }]
+                }],
+                "tcbinfos": [{ "fmspc": "ABCDABCDABCD", "tcbinfo": { "tcbInfo": {}, "signature": "s" } }],
+                "certificates": { "SGX-PCK-Certificate-Issuer-Chain": { "PROCESSOR": "c" } }
+            }
+        });
+        assert!(platform_collateral(&v3, 3).is_ok());
+        // The same body fails v4: `collaterals.version` must be 4.
+        assert!(platform_collateral(&v3, 4).is_err());
+
+        let mut bad = v3.clone();
+        bad["platforms"] = json!(["not-an-object"]);
+        assert!(platform_collateral(&bad, 3).is_err());
+
+        let mut bad = v3.clone();
+        bad["collaterals"]["pck_certs"] = json!(["not-an-object"]);
+        assert!(platform_collateral(&bad, 3).is_err());
+
+        let mut bad = v3.clone();
+        bad["collaterals"]["pck_certs"][0]["certs"] = json!([{ "tcbm": "0".repeat(36), "cert": "x" }]);
+        assert!(platform_collateral(&bad, 3).is_err());
+
+        // tcbinfos[].tcbinfo must be an object carrying tcbInfo + signature.
+        let mut bad = v3.clone();
+        bad["collaterals"]["tcbinfos"][0]["tcbinfo"] = json!("not-an-object");
+        assert!(platform_collateral(&bad, 3).is_err());
+        let mut bad = v3.clone();
+        bad["collaterals"]["tcbinfos"][0]["tcbinfo"] = json!({ "signature": "s" });
+        assert!(platform_collateral(&bad, 3).is_err());
+
+        // pckcacrl, when present, must be an object of strings.
+        let mut bad = v3.clone();
+        bad["collaterals"]["pckcacrl"] = json!("nope");
+        assert!(platform_collateral(&bad, 3).is_err());
+        let mut bad = v3.clone();
+        bad["collaterals"]["pckcacrl"] = json!({ "processorCrl": 42 });
+        assert!(platform_collateral(&bad, 3).is_err());
+
+        // rootcacrl is a plain string when present.
+        let mut bad = v3.clone();
+        bad["collaterals"]["rootcacrl"] = json!(42);
+        assert!(platform_collateral(&bad, 3).is_err());
+
+        // A non-object body is rejected before any key is read.
+        assert!(platform_collateral(&json!([]), 4).is_err());
+    }
+
+    #[test]
+    fn appraisal_policy_payload_branches() {
+        let jws = |inner: serde_json::Value| {
+            use base64::Engine;
+            let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(inner.to_string().as_bytes());
+            format!("aGVhZGVy.{seg}.c2ln")
+        };
+        let put = |policy: String| {
+            appraisal_policy(&json!({
+                "is_default": true, "fmspc": "ABCDABCDABCD", "policy": policy
+            }))
+        };
+
+        // Payload segment that is not JSON.
+        assert!(put(jws(json!("not an object"))).is_err());
+        // policy_payload must be a string containing JSON.
+        assert!(put(jws(json!({ "policy_payload": 42 }))).is_err());
+        assert!(put(jws(json!({ "policy_payload": "not json" }))).is_err());
+        // policy_array missing / entries without a class_id.
+        assert!(put(jws(json!({
+            "policy_payload": json!({ "nope": [] }).to_string()
+        })))
+        .is_err());
+        assert!(put(jws(json!({
+            "policy_payload": json!({ "policy_array": [{ "environment": {} }] }).to_string()
+        })))
+        .is_err());
+        // A TDQE entry alone never determines a policy type.
+        assert!(put(jws(json!({
+            "policy_payload": json!({
+                "policy_array": [{ "environment": { "class_id": CLASS_ID_TDQE } }]
+            }).to_string()
+        })))
+        .is_err());
+        // TDX 1.0 → 1, SGX → 0; a TDQE entry before a real one is skipped.
+        let tdx10 = put(jws(json!({
+            "policy_payload": json!({
+                "policy_array": [
+                    { "environment": { "class_id": CLASS_ID_TDQE } },
+                    { "environment": { "class_id": CLASS_ID_TDX_10 } }
+                ]
+            }).to_string()
+        })))
+        .unwrap();
+        assert_eq!(tdx10.policy_type, 1);
+        let sgx = put(jws(json!({
+            "policy_payload": json!({
+                "policy_array": [{ "environment": { "class_id": CLASS_ID_SGX } }]
+            }).to_string()
+        })))
+        .unwrap();
+        assert_eq!(sgx.policy_type, 0);
+
+        // is_default must be a bool; policy must be a non-empty string.
+        assert!(appraisal_policy(&json!({
+            "is_default": "yes", "fmspc": "ABCDABCDABCD", "policy": "a.b.c"
+        }))
+        .is_err());
+        assert!(appraisal_policy(&json!({
+            "is_default": true, "fmspc": "ABCDABCDABCD", "policy": ""
+        }))
+        .is_err());
+        assert!(appraisal_policy(&json!([])).is_err());
+    }
+
+    #[test]
+    fn crl_uri_more_variants() {
+        // Empty / oversized URIs are rejected up front.
+        assert!(!is_valid_crl_uri(""));
+        assert!(!is_valid_crl_uri(&format!(
+            "https://certificates.trustedservices.intel.com/IntelSGXRootCA.{}",
+            "a".repeat(2048)
+        )));
+        // Node's prefix class is `[a-zA-Z0-9-]*` — no dot, so only a direct
+        // alphanumeric prefix of the certificates host matches, never a
+        // subdomain or a lookalike.
+        assert!(is_valid_crl_uri(
+            "https://sbcertificates.trustedservices.intel.com/IntelSGXRootCA.der.crl"
+        ));
+        assert!(!is_valid_crl_uri(
+            "https://sb.certificates.trustedservices.intel.com/IntelSGXRootCA.crl"
+        ));
+        assert!(!is_valid_crl_uri(
+            "https://evil_certificates.trustedservices.intel.com/IntelSGXRootCA.crl"
+        ));
+        // The alternate root-CRL host from Node's regex.
+        assert!(is_valid_crl_uri(
+            "https://certprx.adsdcsp.com/IntelSGXRootCA.crl"
+        ));
+        // Root CA path must have something after `IntelSGXRootCA.`.
+        assert!(!is_valid_crl_uri(
+            "https://certificates.trustedservices.intel.com/IntelSGXRootCA."
+        ));
+        // Intermediate: the az.sgxprod / az.sgxnp hosts from Node's regex.
+        assert!(is_valid_crl_uri(
+            "https://uswest.az.sgxprod.adsdcsp.com/sgx/certification/v4/pckcrl?ca=processor"
+        ));
+        assert!(is_valid_crl_uri(
+            "https://uswest.az.sgxnp.adsdcsp.com/sgx/certification/v3/pckcrl?ca=platform"
+        ));
+        assert!(!is_valid_crl_uri(
+            "https://.az.sgxprod.adsdcsp.com/sgx/certification/v4/pckcrl?ca=processor"
+        ));
+        // A query string is mandatory, and the path must end at pckcrl.
+        assert!(!is_valid_crl_uri(
+            "https://api.trustedservices.intel.com/sgx/certification/v4/pckcrl"
+        ));
+        assert!(!is_valid_crl_uri(
+            "https://api.trustedservices.intel.com/sgx/certification/v4/pckcrl?"
+        ));
+        assert!(!is_valid_crl_uri(
+            "https://api.trustedservices.intel.com/sgx/certification/v4/pckcrlx?ca=processor"
+        ));
+        assert!(!is_valid_crl_uri(
+            "https://api.trustedservices.intel.com/sgx/certification/vX/pckcrl?ca=processor"
+        ));
+    }
 }
