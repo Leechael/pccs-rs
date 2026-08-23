@@ -1007,4 +1007,889 @@ mod tests {
         );
         assert_eq!(raw_cpusvn_from_tcb(&serde_json::json!({})), None);
     }
+
+    #[test]
+    fn raw_cpusvn_rejects_out_of_range_and_partial_levels() {
+        // A component above 255 is not a byte.
+        let mut tcb = serde_json::Map::new();
+        for i in 1..=16u32 {
+            tcb.insert(format!("sgxtcbcomp{i:02}svn"), serde_json::json!(300));
+        }
+        assert_eq!(raw_cpusvn_from_tcb(&serde_json::Value::Object(tcb)), None);
+        // Missing component 16.
+        let mut tcb = serde_json::Map::new();
+        for i in 1..=15u32 {
+            tcb.insert(format!("sgxtcbcomp{i:02}svn"), serde_json::json!(1));
+        }
+        assert_eq!(raw_cpusvn_from_tcb(&serde_json::Value::Object(tcb)), None);
+    }
+
+    #[test]
+    fn miss_v3_is_eol_only_in_lazy_mode() {
+        for (mode, version, want) in [
+            (CacheMode::Lazy, 3, error::PCS_V3_REACHED_EOL),
+            (CacheMode::Lazy, 4, error::NO_CACHE_DATA),
+            (CacheMode::Offline, 3, error::NO_CACHE_DATA),
+        ] {
+            let (_dir, cache) = cache_with("", mode);
+            assert_err(&cache.miss_v3(version), &want);
+        }
+    }
+
+    #[test]
+    fn cacheable_requires_a_chain() {
+        assert!(!Cache::cacheable("X-Chain", ""));
+        assert!(!Cache::cacheable("X-Chain", "   "));
+        assert!(Cache::cacheable("X-Chain", "chain"));
+    }
+
+    // ---- Cache against a loopback mock PCS (never Intel) ----
+
+    use crate::store::RawTcb;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// PccsError has no PartialEq; compare what the wire sees.
+    fn assert_err(got: &PccsError, want: &PccsError) {
+        assert_eq!((got.status, got.message), (want.status, want.message));
+    }
+
+    /// Removes the RocksDB directory once the cache is dropped.
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Bind as `let (_dir, cache) = cache_with(..);` — locals drop in reverse
+    /// declaration order, so the cache closes before the directory is removed.
+    fn cache_with(base: &str, mode: CacheMode) -> (TestDir, Arc<Cache>) {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-cache-{}", uuid::Uuid::new_v4()));
+        let cfg = Config {
+            uri: base.into(),
+            cache_mode: mode,
+            db_path: dir.clone(),
+            upstream_max_attempts: 1,
+            ..Config::default()
+        };
+        let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
+        let pcs = PcsClient::new(&cfg).unwrap();
+        (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
+    }
+
+    async fn spawn(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}/sgx/certification/v4/")
+    }
+
+    /// A PCCS-shaped mock serving every collateral kind `fill_qv_collateral`
+    /// and the LAZY miss paths ask for.
+    async fn spawn_pccs(calls: Arc<AtomicU64>) -> String {
+        use axum::routing::get;
+        let count = move |calls: &Arc<AtomicU64>| calls.fetch_add(1, Ordering::Relaxed);
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+        let c3 = calls.clone();
+        let c4 = calls.clone();
+        let c5 = calls.clone();
+        let c6 = calls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/sgx/certification/v4/pckcert",
+                get(move || {
+                    let c = c1.clone();
+                    async move {
+                        count(&c);
+                        let mut resp = axum::response::Response::new(axum::body::Body::from(
+                            "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----\n",
+                        ));
+                        let h = resp.headers_mut();
+                        h.insert(
+                            crate::headers::SGX_TCBM,
+                            axum::http::HeaderValue::from_static("TM"),
+                        );
+                        h.insert(
+                            crate::headers::SGX_FMSPC,
+                            axum::http::HeaderValue::from_static("00A067110000"),
+                        );
+                        h.insert(
+                            crate::headers::SGX_PCK_CERTIFICATE_CA_TYPE,
+                            axum::http::HeaderValue::from_static("PROCESSOR"),
+                        );
+                        h.insert(
+                            crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                            axum::http::HeaderValue::from_static("pck-chain"),
+                        );
+                        resp
+                    }
+                }),
+            )
+            .route(
+                "/sgx/certification/v4/pckcrl",
+                get(move || {
+                    let c = c2.clone();
+                    async move {
+                        count(&c);
+                        let mut resp = axum::response::Response::new(axum::body::Body::from(
+                            vec![0x30u8, 0x03],
+                        ));
+                        resp.headers_mut().insert(
+                            crate::headers::SGX_PCK_CRL_ISSUER_CHAIN,
+                            axum::http::HeaderValue::from_static("crl-chain"),
+                        );
+                        resp
+                    }
+                }),
+            )
+            .route(
+                "/sgx/certification/v4/qe/identity",
+                get(move || {
+                    let c = c3.clone();
+                    async move {
+                        count(&c);
+                        let mut resp = axum::response::Response::new(axum::body::Body::from(
+                            "{\"enclaveIdentity\":{\"id\":\"QE\"}}",
+                        ));
+                        resp.headers_mut().insert(
+                            crate::headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
+                            axum::http::HeaderValue::from_static("id-chain"),
+                        );
+                        resp
+                    }
+                }),
+            )
+            .route(
+                "/sgx/certification/v4/qve/identity",
+                get(move || {
+                    let c = c4.clone();
+                    async move {
+                        count(&c);
+                        let mut resp = axum::response::Response::new(axum::body::Body::from(
+                            "{\"enclaveIdentity\":{\"id\":\"QVE\"}}",
+                        ));
+                        resp.headers_mut().insert(
+                            crate::headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
+                            axum::http::HeaderValue::from_static("id-chain"),
+                        );
+                        resp
+                    }
+                }),
+            )
+            .route(
+                "/tdx/certification/v4/qe/identity",
+                get(move || {
+                    let c = c5.clone();
+                    async move {
+                        count(&c);
+                        let mut resp = axum::response::Response::new(axum::body::Body::from(
+                            "{\"enclaveIdentity\":{\"id\":\"TDQE\"}}",
+                        ));
+                        resp.headers_mut().insert(
+                            crate::headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
+                            axum::http::HeaderValue::from_static("id-chain"),
+                        );
+                        resp
+                    }
+                }),
+            )
+            .route(
+                "/sgx/certification/v4/rootcacrl",
+                get(move || {
+                    let c = c6.clone();
+                    async move {
+                        count(&c);
+                        axum::response::Response::new(axum::body::Body::from(vec![0x30u8, 0x82]))
+                    }
+                }),
+            );
+        spawn(app).await
+    }
+
+    fn platform(qe: &str) -> RegisteredPlatform {
+        RegisteredPlatform {
+            qe_id: qe.into(),
+            pce_id: "0001".into(),
+            cpu_svn: "AB".repeat(16),
+            pce_svn: "00FF".into(),
+            enc_ppid: "E".repeat(768),
+            platform_manifest: String::new(),
+            state: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_register_fills_cert_and_qv_collateral() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let base = spawn_pccs(calls.clone()).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+
+        cache
+            .register_platform(platform("QE1"), UpdateType::All)
+            .await
+            .unwrap();
+
+        // The cert itself, plus one pool so later raw TCBs select locally.
+        let rec = cache
+            .store
+            .get_pckcert("QE1", &"AB".repeat(16), "00FF", "0001")
+            .unwrap();
+        assert_eq!(rec.ca, "PROCESSOR");
+        assert!(cache.store.has_platform("QE1", "0001"));
+        let pool = cache.store.get_platform_pool("QE1", "0001").unwrap();
+        assert_eq!(pool.enc_ppid, "E".repeat(768));
+
+        // QV collateral for both update types and both CAs.
+        for ca in ["PROCESSOR", "PLATFORM"] {
+            assert!(cache.store.get_pckcrl(ca).is_some(), "{ca}");
+        }
+        for id in [1u8, 2, 3] {
+            for update in [UpdateType::Standard, UpdateType::Early] {
+                assert!(cache.store.get_identity(id, 4, update).is_some());
+            }
+        }
+        assert!(cache.store.get_rootcacrl().is_some());
+
+        // A second registration of the same platform is a cache hit: no new
+        // upstream calls at all. (The mock's counter, not `upstream_fetches`
+        // — the direct QV-collateral fetches bypass that metric.)
+        let before = calls.load(Ordering::Relaxed);
+        cache
+            .register_platform(platform("QE1"), UpdateType::Standard)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), before);
+    }
+
+    #[tokio::test]
+    async fn req_register_failure_leaves_the_row_queued() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/pckcert",
+            get(|| async { axum::http::StatusCode::NOT_FOUND }),
+        );
+        let base = spawn(app).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Req);
+
+        let err = cache
+            .register_platform(platform("QE2"), UpdateType::Standard)
+            .await
+            .unwrap_err();
+        assert_err(&err, &error::NO_CACHE_DATA);
+        // Node leaves the NEW row in the queue when the fill fails.
+        let queued = cache.store.take_registered(0).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].qe_id, "QE2");
+    }
+
+    #[tokio::test]
+    async fn lazy_pckcert_without_ppid_or_manifest_is_a_400() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let base = spawn_pccs(calls.clone()).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        let err = cache
+            .get_pckcert("QE9", &"AB".repeat(16), "00FF", "0001", None, 4)
+            .await
+            .unwrap_err();
+        assert_err(&err, &error::INVALID_REQ);
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "rejected before upstream");
+    }
+
+    #[tokio::test]
+    async fn offline_and_req_pckcert_miss_is_platform_unknown() {
+        for mode in [CacheMode::Offline, CacheMode::Req] {
+            let (_dir, cache) = cache_with("", mode);
+            let err = cache
+                .get_pckcert("QE9", &"AB".repeat(16), "00FF", "0001", None, 4)
+                .await
+                .unwrap_err();
+            assert_err(&err, &error::platform_unknown());
+        }
+    }
+
+    #[tokio::test]
+    async fn chained_pckcert_is_cached_unchained_is_not() {
+        use axum::routing::get;
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = calls.clone();
+        // No issuer-chain header: the response is served but never persisted.
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/pckcrl",
+            get(move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    axum::response::Response::new(axum::body::Body::from(vec![0x30u8]))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+
+        let rec = cache.get_pckcrl("PROCESSOR", 4).await.unwrap();
+        assert_eq!(rec.pckcrl, vec![0x30]);
+        assert!(cache.store.get_pckcrl("PROCESSOR").is_none(), "chain-less CRL is not cached");
+        cache.get_pckcrl("PROCESSOR", 4).await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "every request retries upstream");
+    }
+
+    #[tokio::test]
+    async fn rootcacrl_and_crl_fill_through_cache() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let base = spawn_pccs(calls.clone()).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+
+        // PCCS upstream: {base}rootcacrl, cached after the first fetch.
+        let crl_calls = calls.load(Ordering::Relaxed);
+        let der = cache.get_rootcacrl(4).await.unwrap();
+        assert_eq!(der, vec![0x30, 0x82]);
+        cache.get_rootcacrl(4).await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), crl_calls + 1, "second GET is a store hit");
+
+        // A v3 *miss* is EOL, never a network call (a cached record is still
+        // served — the store hit above comes first, as in Node).
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        let err = cache.get_rootcacrl(3).await.unwrap_err();
+        assert_err(&err, &error::PCS_V3_REACHED_EOL);
+    }
+
+    #[tokio::test]
+    async fn crl_fill_uses_the_given_uri() {
+        use axum::routing::get;
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = calls.clone();
+        let app = axum::Router::new().route(
+            "/IntelSGXRootCA.crl",
+            get(move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    axum::response::Response::new(axum::body::Body::from(vec![0xAAu8]))
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        // `get_crl` takes the URI verbatim; the handler layer is what
+        // restricts it to Intel hosts.
+        let host = base.trim_end_matches("/sgx/certification/v4/");
+        let uri = format!("{host}/IntelSGXRootCA.crl");
+        let der = cache.get_crl(&uri, 4).await.unwrap();
+        assert_eq!(der, vec![0xAA]);
+        cache.get_crl(&uri, 4).await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_reused_by_the_waiters_behind_it() {
+        use axum::routing::get;
+        let calls = Arc::new(AtomicU64::new(0));
+        // The mock signals when the first fetch arrives and then blocks until
+        // the test releases it, so the second request is deterministically
+        // queued behind the first one's key lock when the failure lands.
+        let received = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let c = calls.clone();
+        let r = received.clone();
+        let g = release.clone();
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/tcb",
+            get(move || {
+                let c = c.clone();
+                let r = r.clone();
+                let g = g.clone();
+                async move {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    r.notify_one();
+                    g.notified().await;
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let base = spawn(app).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+
+        let first = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
+        });
+        // The first request has taken the key lock and reached the upstream.
+        received.notified().await;
+        let second = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
+        });
+        // Wait until the second request is deterministically queued on the
+        // key lock: the first request holds the lock Arc plus its guard, so a
+        // third strong reference is the second request inside `key_lock`.
+        let key = keys::tcb(keys::prod_name(0), 4, "00A067110000", UpdateType::Standard.as_str());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let strong = {
+                    let map = cache.inflight.lock().await;
+                    map.get(&key)
+                        .and_then(Weak::upgrade)
+                        .map(|lock| Arc::strong_count(&lock))
+                        .unwrap_or(0)
+                };
+                if strong >= 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second request never queued on the key lock");
+        // The waiter is in place; let the first fetch fail.
+        release.notify_one();
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+
+        assert_err(&first.unwrap_err(), &error::NO_CACHE_DATA);
+        // The waiter was queued behind the failing fetch and reuses its error
+        // instead of issuing a second upstream call.
+        assert_err(&second.unwrap_err(), &error::NO_CACHE_DATA);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_certs_pccs_refetches_every_known_raw_tcb() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let base = spawn_pccs(calls.clone()).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+
+        let mut pool = crate::store::PlatformPool {
+            qe_id: "QE3".into(),
+            pce_id: "0001".into(),
+            enc_ppid: "E".repeat(768),
+            fmspc: "00A067110000".into(),
+            ..Default::default()
+        };
+        pool.raw_tcbs.push(RawTcb {
+            cpu_svn: "AB".repeat(16),
+            pce_svn: "00FF".into(),
+            tcbm: "TM".into(),
+        });
+        pool.raw_tcbs.push(RawTcb {
+            cpu_svn: "CD".repeat(16),
+            pce_svn: "00FE".into(),
+            tcbm: "TM".into(),
+        });
+        cache.store.put_platform_pool(&pool).unwrap();
+
+        let before = calls.load(Ordering::Relaxed);
+        cache
+            .refresh(Some("certs"), Some("00a067110000"))
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            before + 2,
+            "one re-fetch per raw TCB"
+        );
+
+        // A non-matching fmspc is skipped entirely.
+        cache
+            .refresh(Some("certs"), Some("FFFFFFFFFFFF"))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), before + 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_pckcrl_failure_is_a_503() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/pckcrl",
+            get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let base = spawn(app).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        cache
+            .store
+            .put_pckcrl(&PckCrlRecord {
+                ca: "PROCESSOR".into(),
+                pckcrl: vec![1],
+                issuer_chain: "c".into(),
+            })
+            .unwrap();
+        let err = cache.refresh(None, None).await.unwrap_err();
+        assert_err(&err, &error::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn refresh_rootcacrl_failure_is_a_500_when_cached() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/rootcacrl",
+            get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let base = spawn(app).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        cache.store.put_rootcacrl(&[1]).unwrap();
+        let err = cache.refresh(None, None).await.unwrap_err();
+        assert_err(&err, &error::INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn refresh_without_upstream_is_a_noop() {
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
+        cache.refresh(None, None).await.unwrap();
+        cache.refresh(Some("certs"), Some("00A067110000")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_not_available_queues_na_rows_in_req_mode() {
+        let (_dir, cache) = cache_with("", CacheMode::Req);
+        let mut tcb = serde_json::Map::new();
+        for i in 1..=16u32 {
+            tcb.insert(format!("sgxtcbcomp{i:02}svn"), serde_json::json!(i));
+        }
+        tcb.insert("pcesvn".into(), serde_json::json!(7));
+        let resp = PckCertsResponse {
+            certs: Vec::new(),
+            not_available: vec![
+                serde_json::Value::Object(tcb),
+                // Missing svn fields: skipped, not an error.
+                serde_json::json!({ "pcesvn": 1 }),
+                // Missing pcesvn: skipped.
+                serde_json::json!({ "sgxtcbcomp01svn": 1 }),
+            ],
+            fmspc: "00A067110000".into(),
+            ca: "PROCESSOR".into(),
+            issuer_chain: "chain".into(),
+        };
+        cache
+            .process_not_available("QE4", "0001", "PP", "", &resp)
+            .unwrap();
+        let queued = cache.store.take_registered(1).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].qe_id, "QE4");
+        assert_eq!(queued[0].cpu_svn, "0102030405060708090A0B0C0D0E0F10");
+        assert_eq!(queued[0].pce_svn, "7");
+        assert_eq!(queued[0].state, PLATF_REG_NOT_AVAILABLE);
+
+        // LAZY / OFFLINE never queue these rows.
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
+        cache
+            .process_not_available("QE4", "0001", "PP", "", &resp)
+            .unwrap();
+        assert!(cache.store.take_registered(1).unwrap().is_empty());
+    }
+
+    /// A synthetic PCK certificate (Platform CA): PPID 0x11*16, PCEID 4444,
+    /// FMSPC 1234567890AB, CPUSVN 0x22*16, PCESVN 0x3333.
+    const PCK_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIICPDCCAjOgAwIBAgIBATAKBggqhkjOPQQDAjAkMSIwIAYDVQQDDBlJbnRlbCBT
+R1ggUENLIFBsYXRmb3JtIENBMAAwJDEiMCAGA1UEAwwZSW50ZWwgU0dYIFBDSyBD
+ZXJ0aWZpY2F0ZTAAo4IByzCCAccwggHDBgkqhkiG+E0BDQEEggG0MIIBsDAeBgoq
+hkiG+E0BDQEBBBARERERERERERERERERERERMBAGCiqGSIb4TQENAQMEAkREMBQG
+CiqGSIb4TQENAQQEBhI0VniQqzCCAWQGCiqGSIb4TQENAQIwggFUMBAGCyqGSIb4
+TQENAQIBAgEiMBAGCyqGSIb4TQENAQICAgEiMBAGCyqGSIb4TQENAQIDAgEiMBAG
+CyqGSIb4TQENAQIEAgEiMBAGCyqGSIb4TQENAQIFAgEiMBAGCyqGSIb4TQENAQIG
+AgEiMBAGCyqGSIb4TQENAQIHAgEiMBAGCyqGSIb4TQENAQIIAgEiMBAGCyqGSIb4
+TQENAQIJAgEiMBAGCyqGSIb4TQENAQIKAgEiMBAGCyqGSIb4TQENAQILAgEiMBAG
+CyqGSIb4TQENAQIMAgEiMBAGCyqGSIb4TQENAQINAgEiMBAGCyqGSIb4TQENAQIO
+AgEiMBAGCyqGSIb4TQENAQIPAgEiMBAGCyqGSIb4TQENAQIQAgEiMBEGCyqGSIb4
+TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
+-----END CERTIFICATE-----
+";
+
+    fn pck_tcb_info() -> serde_json::Value {
+        let comps: Vec<serde_json::Value> =
+            (0..16).map(|_| serde_json::json!({ "svn": 0x22 })).collect();
+        serde_json::json!({
+            "id": "SGX", "fmspc": "1234567890AB", "pceId": "4444", "tcbType": 0,
+            "tcbLevels": [{
+                "tcb": { "sgxtcbcomponents": comps, "pcesvn": 0x3333 },
+                "tcbStatus": "UpToDate"
+            }]
+        })
+    }
+
+    /// Mock serving the manifest `pckcerts` POST plus the SGX TCB info the
+    /// fill then requires. The response also carries one `"Not available"`
+    /// level, so LAZY mode drops the raw TCB again (Node `needUpdatePlatformTcbs`).
+    async fn spawn_intel_pckcerts_mock(not_available: bool) -> String {
+        use axum::routing::{get, post};
+        let cert = PCK_PEM.replace('\n', "%0A").replace('-', "%2D");
+        let mut entries = format!(
+            "{{\"tcbm\":\"{}3333\",\"cert\":\"{cert}\"}}",
+            "22".repeat(16)
+        );
+        if not_available {
+            entries.push_str(
+                ", {\"tcbm\":\"00\",\"cert\":\"Not%20available\",\"tcb\":{\"pcesvn\":1}}",
+            );
+        }
+        let body = format!("[{entries}]");
+        let app = axum::Router::new()
+            .route(
+                "/sgx/certification/v4/pckcerts",
+                post(move || {
+                    let body = body.clone();
+                    async move {
+                        let mut resp = axum::response::Response::new(axum::body::Body::from(body));
+                        let h = resp.headers_mut();
+                        h.insert(
+                            crate::headers::SGX_FMSPC,
+                            axum::http::HeaderValue::from_static("1234567890ab"),
+                        );
+                        h.insert(
+                            crate::headers::SGX_PCK_CERTIFICATE_CA_TYPE,
+                            axum::http::HeaderValue::from_static("platform"),
+                        );
+                        h.insert(
+                            crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                            axum::http::HeaderValue::from_static("pck-chain"),
+                        );
+                        resp
+                    }
+                }),
+            )
+            .route(
+                "/sgx/certification/v4/tcb",
+                get(|| async {
+                    let mut resp = axum::response::Response::new(axum::body::Body::from(
+                        serde_json::json!({ "tcbInfo": pck_tcb_info(), "signature": "s" })
+                            .to_string(),
+                    ));
+                    resp.headers_mut().insert(
+                        crate::headers::TCB_INFO_ISSUER_CHAIN,
+                        axum::http::HeaderValue::from_static("tcb-chain"),
+                    );
+                    resp
+                }),
+            );
+        spawn(app).await
+    }
+
+    #[tokio::test]
+    async fn lazy_pckcert_with_manifest_fills_via_pckcerts_post() {
+        let base = spawn_intel_pckcerts_mock(false).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        // A platform known only by its manifest; the local pool has no certs,
+        // so selection fails and LAZY falls back to the upstream.
+        cache
+            .store
+            .put_platform_pool(&crate::store::PlatformPool {
+                qe_id: "QEM".into(),
+                pce_id: "4444".into(),
+                platform_manifest: "MANIFEST".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let rec = cache
+            .get_pckcert("QEM", &"22".repeat(16), "3333", "4444", None, 4)
+            .await
+            .unwrap();
+        assert_eq!(rec.cert, PCK_PEM);
+        assert_eq!(rec.fmspc, "1234567890AB");
+        assert_eq!(rec.ca, "PLATFORM");
+        assert_eq!(rec.issuer_chain, "pck-chain");
+        // The pool now holds the fetched certs, and the raw TCB is known.
+        let pool = cache.store.get_platform_pool("QEM", "4444").unwrap();
+        assert_eq!(pool.certs.len(), 1);
+        assert_eq!(pool.raw_tcbs.len(), 1);
+        // The SGX standard TCB info was fetched as part of the fill.
+        assert!(cache
+            .store
+            .get_tcb(0, "1234567890AB", 4, UpdateType::Standard)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn lazy_fill_with_not_available_levels_forgets_the_raw_tcb() {
+        let base = spawn_intel_pckcerts_mock(true).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        cache
+            .store
+            .put_platform_pool(&crate::store::PlatformPool {
+                qe_id: "QEN".into(),
+                pce_id: "4444".into(),
+                platform_manifest: "MANIFEST".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let rec = cache
+            .get_pckcert("QEN", &"22".repeat(16), "3333", "4444", None, 4)
+            .await
+            .unwrap();
+        assert_eq!(rec.cert, PCK_PEM);
+        let pool = cache.store.get_platform_pool("QEN", "4444").unwrap();
+        assert!(
+            pool.raw_tcbs.is_empty(),
+            "LAZY does not record the raw TCB when levels were Not available"
+        );
+    }
+
+    #[tokio::test]
+    async fn req_register_success_clears_the_queue_row() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let base = spawn_pccs(calls.clone()).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Req);
+        cache
+            .register_platform(platform("QER"), UpdateType::Standard)
+            .await
+            .unwrap();
+        // Filled, and the registration row is gone (Node PLATF_REG_DELETED).
+        assert!(cache
+            .store
+            .get_pckcert("QER", &"AB".repeat(16), "00FF", "0001")
+            .is_some());
+        assert!(cache.store.take_registered(0).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_pckcerts_fails_without_sgx_standard_tcb() {
+        use axum::routing::get;
+        // Every TCB fetch 404s: the mandatory SGX standard info is missing.
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/tcb",
+            get(|| async { axum::http::StatusCode::NOT_FOUND }),
+        );
+        let base = spawn(app).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Req);
+        let resp = PckCertsResponse {
+            certs: vec![("TM".into(), "cert-pem".into())],
+            not_available: Vec::new(),
+            fmspc: "00A067110000".into(),
+            ca: "PROCESSOR".into(),
+            issuer_chain: "pck-chain".into(),
+        };
+        let err = cache
+            .store_pckcerts("QET", "0001", "PP", "", &resp)
+            .await
+            .unwrap_err();
+        assert_err(&err, &error::NO_CACHE_DATA);
+        assert!(cache.store.get_platform_pool("QET", "0001").is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_tolerates_identity_errors_and_skips_bad_crl_uris() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            // Identity refresh 404s: tolerated, refresh continues.
+            .route(
+                "/sgx/certification/v4/qe/identity",
+                get(|| async { axum::http::StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/sgx/certification/v4/rootcacrl",
+                get(|| async {
+                    axum::response::Response::new(axum::body::Body::from(vec![0x0Au8]))
+                }),
+            );
+        let base = spawn(app).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        cache
+            .store
+            .put_identity(&IdentityRecord {
+                enclave_id: 1,
+                version: 4,
+                update_type: "STANDARD".into(),
+                identity: serde_json::json!({"id": "QE"}),
+                raw_body: String::new(),
+                issuer_chain: "c".into(),
+            })
+            .unwrap();
+        cache.store.put_rootcacrl(&[1]).unwrap();
+        // Not an Intel CRL URI: skipped, never fetched.
+        cache.store.put_crl("https://evil.test/x.crl", &[2]).unwrap();
+
+        cache.refresh(None, None).await.unwrap();
+        assert_eq!(cache.store.get_rootcacrl().unwrap(), vec![0x0A]);
+        assert_eq!(cache.store.get_crl("https://evil.test/x.crl").unwrap(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn v3_and_non_lazy_short_circuits() {
+        let (_dir, cache) = cache_with("", CacheMode::Req);
+        let err = cache
+            .get_identity(1, 4, UpdateType::Standard)
+            .await
+            .unwrap_err();
+        assert_err(&err, &error::NO_CACHE_DATA);
+        let err = cache.get_pckcrl("PROCESSOR", 4).await.unwrap_err();
+        assert_err(&err, &error::NO_CACHE_DATA);
+        let err = cache.get_crl("https://x/y.crl", 4).await.unwrap_err();
+        assert_err(&err, &error::NO_CACHE_DATA);
+
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
+        let err = cache
+            .get_identity(1, 3, UpdateType::Standard)
+            .await
+            .unwrap_err();
+        assert_err(&err, &error::PCS_V3_REACHED_EOL);
+        let err = cache.get_pckcrl("PROCESSOR", 3).await.unwrap_err();
+        assert_err(&err, &error::PCS_V3_REACHED_EOL);
+    }
+
+    #[tokio::test]
+    async fn store_pckcerts_writes_pool_and_fetches_tcb_infos() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/tcb",
+            get(|| async {
+                let mut resp = axum::response::Response::new(axum::body::Body::from(
+                    "{\"tcbInfo\":{\"id\":\"SGX\"}}",
+                ));
+                resp.headers_mut().insert(
+                    crate::headers::TCB_INFO_ISSUER_CHAIN,
+                    axum::http::HeaderValue::from_static("tcb-chain"),
+                );
+                resp
+            }),
+        );
+        let base = spawn(app).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Req);
+        let resp = PckCertsResponse {
+            certs: vec![("TM".into(), "cert-pem".into())],
+            not_available: Vec::new(),
+            fmspc: "00A067110000".into(),
+            ca: "PROCESSOR".into(),
+            issuer_chain: "pck-chain".into(),
+        };
+        cache
+            .store_pckcerts("QE5", "0001", "PP", "", &resp)
+            .await
+            .unwrap();
+        let pool = cache.store.get_platform_pool("QE5", "0001").unwrap();
+        assert_eq!(pool.certs.len(), 1);
+        assert_eq!(pool.issuer_chain, "pck-chain");
+        // SGX standard TCB info is mandatory and was stored.
+        assert!(cache
+            .store
+            .get_tcb(0, "00A067110000", 4, UpdateType::Standard)
+            .is_some());
+
+        // No certs at all is an error.
+        let empty = PckCertsResponse {
+            certs: Vec::new(),
+            not_available: Vec::new(),
+            fmspc: "00A067110000".into(),
+            ca: "PROCESSOR".into(),
+            issuer_chain: "pck-chain".into(),
+        };
+        assert!(cache
+            .store_pckcerts("QE5", "0001", "PP", "", &empty)
+            .await
+            .is_err());
+
+        // A chain-less response is not persisted.
+        let chainless = PckCertsResponse {
+            issuer_chain: String::new(),
+            ..resp.clone()
+        };
+        assert!(cache
+            .store_pckcerts("QE6", "0001", "PP", "", &chainless)
+            .await
+            .is_err());
+    }
 }

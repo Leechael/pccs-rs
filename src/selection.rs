@@ -177,7 +177,9 @@ fn find_extension<'a>(buf: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
 }
 
 fn der_int(bytes: &[u8]) -> Option<u32> {
-    if bytes.is_empty() || bytes.len() > 5 {
+    // A DER INTEGER is signed: a set top bit without a leading 0x00 pad is a
+    // negative value, meaningless for a cert version or PCESVN.
+    if bytes.is_empty() || bytes.len() > 5 || bytes[0] & 0x80 != 0 {
         return None;
     }
     let mut v = 0u64;
@@ -933,6 +935,97 @@ mod tests {
             .map(|b| b.tcb.as_ref().unwrap().pcesvn)
             .collect();
         assert_eq!(svns, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn tlvs_survive_der_edge_cases() {
+        // Multi-byte tag: not produced by Intel certs, aborts the parse.
+        assert!(tlvs(&[0x1F, 0x01, 0x00]).is_empty());
+        // Indefinite length (0x80) and >4-byte lengths: abort.
+        assert!(tlvs(&[0x30, 0x80, 0x00]).is_empty());
+        assert!(tlvs(&[0x30, 0x85, 0, 0, 0, 0, 0]).is_empty());
+        // Declared length past the buffer end: abort.
+        assert!(tlvs(&[0x30, 0x10, 0x01]).is_empty());
+        // Truncated header.
+        assert!(tlvs(&[0x30]).is_empty());
+        // Long-form length that fits.
+        let tlv = tlvs(&[0x04, 0x81, 0x02, 0xAA, 0xBB]);
+        assert_eq!(tlv.len(), 1);
+        assert_eq!(tlv[0].1, &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn der_int_limits() {
+        assert_eq!(der_int(&[]), None);
+        assert_eq!(der_int(&[0x01]), Some(1));
+        // DER INTEGERs are signed: 0xFFFFFFFF is -1, not u32::MAX.
+        assert_eq!(der_int(&[0xFF, 0xFF, 0xFF, 0xFF]), None);
+        // A leading 0x00 pad keeps it positive, and 5 bytes can still fit…
+        assert_eq!(der_int(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF]), Some(u32::MAX));
+        // …or overflow u32.
+        assert_eq!(der_int(&[0x01, 0x00, 0x00, 0x00, 0x00]), None);
+        assert_eq!(der_int(&[0; 6]), None);
+    }
+
+    #[test]
+    fn pem_to_der_variants() {
+        assert!(pem_to_der("no markers").is_none());
+        assert!(pem_to_der("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----").is_none());
+        let der = pem_to_der("-----BEGIN CERTIFICATE-----\naGVs bG8=\n-----END CERTIFICATE-----")
+            .unwrap();
+        assert_eq!(der, b"hello");
+    }
+
+    #[test]
+    fn level_cpusvn_shape_checks() {
+        // v4 style with the wrong component count is invalid.
+        let tcb = serde_json::json!({ "sgxtcbcomponents": [{ "svn": 1 }], "pcesvn": 1 });
+        assert_eq!(level_cpusvn(&tcb), None);
+        // A component above 255 is not a byte (v4 style).
+        let comps: Vec<Value> = (0..16).map(|_| serde_json::json!({ "svn": 300 })).collect();
+        let tcb = serde_json::json!({ "sgxtcbcomponents": comps, "pcesvn": 1 });
+        assert_eq!(level_cpusvn(&tcb), None);
+        // A missing svn field invalidates the level.
+        let comps: Vec<Value> = (0..16).map(|_| serde_json::json!({})).collect();
+        let tcb = serde_json::json!({ "sgxtcbcomponents": comps, "pcesvn": 1 });
+        assert_eq!(level_cpusvn(&tcb), None);
+    }
+
+    #[test]
+    fn find_insert_index_skips_non_comparable_certs() {
+        // `find_insert_index` only reads `tcb`; the rest is inert here.
+        let cert = |tcbm: &str, cpusvn: &str, pcesvn: u32| ParsedCert {
+            tcbm: tcbm.into(),
+            cert: String::new(),
+            info: PckCertInfo {
+                version: 3,
+                fmspc: String::new(),
+                pce_id: String::new(),
+                ppid: String::new(),
+                cpusvn: String::new(),
+                pcesvn: 0,
+                ca: String::new(),
+            },
+            tcb: Tcb::new(cpusvn, pcesvn).unwrap(),
+        };
+        // Two bucket entries: A non-comparable with the candidate, C lower
+        // than it. The candidate must skip A *without advancing the index*
+        // and insert at 0, before C. An implementation that advanced the
+        // index on the non-comparable entry would answer 1 here.
+        let parsed = vec![
+            cert("A", "02000000000000000000000000000000", 3),
+            cert("C", "01000000000000000000000000000000", 1),
+        ];
+        // Non-comparable with A (higher cpusvn, lower pcesvn), above C.
+        let candidate = cert("B", "03000000000000000000000000000000", 2);
+        assert_eq!(find_insert_index(&[0, 1], &parsed, &candidate), 0);
+        // Non-comparable with every entry (higher cpusvn, lower pcesvn):
+        // never inserted (-1).
+        let non_comparable = cert("D", "03000000000000000000000000000000", 0);
+        assert_eq!(find_insert_index(&[0, 1], &parsed, &non_comparable), -1);
+        // Lower than everything comparable: goes past the end.
+        let lower = cert("E", "00000000000000000000000000000000", 0);
+        assert_eq!(find_insert_index(&[0, 1], &parsed, &lower), -1);
     }
 
     #[test]

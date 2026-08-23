@@ -274,3 +274,133 @@ fn percentile_ms(sorted_us: &[u64], p: f64) -> f64 {
     let idx = ((sorted_us.len() as f64 - 1.0) * p).round() as usize;
     sorted_us[idx] as f64 / 1000.0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn args_defaults_match_the_readme() {
+        let args = Args::parse_from(["loadgen"]);
+        assert_eq!(args.url, "http://127.0.0.1:8081");
+        assert_eq!(args.duration, 5);
+        assert_eq!(args.concurrency, 32);
+        assert!(!args.insecure);
+        assert_eq!(args.warmup, 0);
+
+        let args = Args::parse_from([
+            "loadgen",
+            "--url",
+            "https://pccs.test",
+            "--duration",
+            "10",
+            "--concurrency",
+            "4",
+            "--insecure",
+            "--warmup",
+            "2",
+        ]);
+        assert_eq!(args.url, "https://pccs.test");
+        assert_eq!(args.duration, 10);
+        assert_eq!(args.concurrency, 4);
+        assert!(args.insecure);
+        assert_eq!(args.warmup, 2);
+    }
+
+    #[test]
+    fn pick_path_is_the_documented_70_20_10_mix() {
+        let args = Args::parse_from(["loadgen"]);
+        let mut pckcert = 0;
+        let mut tcb = 0;
+        let mut identity = 0;
+        for i in 0..10u64 {
+            let path = pick_path(&args, i);
+            if path.contains("/pckcert?") {
+                pckcert += 1;
+                assert!(path.contains("qeid=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+            } else if path.contains("/tcb?") {
+                tcb += 1;
+                assert!(path.contains("fmspc=ABCDABCDABCD"));
+            } else {
+                identity += 1;
+                assert_eq!(path, "/sgx/certification/v4/qe/identity");
+            }
+        }
+        assert_eq!((pckcert, tcb, identity), (7, 2, 1));
+    }
+
+    #[test]
+    fn percentile_ms_edges() {
+        assert_eq!(percentile_ms(&[], 0.5), 0.0);
+        assert_eq!(percentile_ms(&[1000], 0.99), 1.0);
+        let samples: Vec<u64> = (1..=100).map(|i| i * 1000).collect();
+        // idx = round(99 * 0.5) = 50 → the 51st sample.
+        assert_eq!(percentile_ms(&samples, 0.50), 51.0);
+        assert_eq!(percentile_ms(&samples, 0.99), 99.0);
+        assert_eq!(percentile_ms(&samples, 0.0), 1.0);
+    }
+
+    #[test]
+    fn counters_reset_clears_everything() {
+        let c = Counters::new();
+        c.ok.fetch_add(3, Ordering::Relaxed);
+        c.err.fetch_add(1, Ordering::Relaxed);
+        c.lat_us.lock().unwrap().push(42);
+        c.reset();
+        assert_eq!(c.ok.load(Ordering::Relaxed), 0);
+        assert_eq!(c.err.load(Ordering::Relaxed), 0);
+        assert!(c.lat_us.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_client_http_and_https() {
+        assert!(matches!(build_client(false, false), AnyClient::Http(_)));
+        assert!(matches!(build_client(true, true), AnyClient::Https(_)));
+    }
+
+    #[tokio::test]
+    async fn workers_count_ok_and_err_against_a_live_server() {
+        use axum::routing::get;
+        // /tcb and /qe/identity 200; /pckcert 404 (errors are counted, not fatal).
+        let app = axum::Router::new()
+            .route(
+                "/sgx/certification/v4/tcb",
+                get(|| async { axum::body::Body::from("{}") }),
+            )
+            .route(
+                "/sgx/certification/v4/qe/identity",
+                get(|| async { axum::body::Body::from("{}") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let args = Args {
+            url: format!("http://{addr}"),
+            concurrency: 2,
+            ..Args::parse_from(["loadgen"])
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(Counters::new());
+        let handles = run_workers(
+            args,
+            format!("http://{addr}"),
+            false,
+            stop.clone(),
+            counters.clone(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.await.unwrap();
+        }
+        let ok = counters.ok.load(Ordering::Relaxed);
+        let err = counters.err.load(Ordering::Relaxed);
+        assert!(ok > 0, "tcb/identity responses count as ok");
+        assert!(err > 0, "pckcert 404s count as err");
+        assert!(!counters.lat_us.lock().unwrap().is_empty());
+    }
+}

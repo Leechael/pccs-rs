@@ -633,6 +633,21 @@ impl From<Cli> for Config {
 mod tests {
     use super::*;
 
+    /// `Cli` reads `PCCS_*` env vars for any flag not given inline; drop them
+    /// so the process environment cannot leak into these tests. The
+    /// environment is process-global and tests run in parallel, so the whole
+    /// clear-and-parse sequence is serialised behind a lock.
+    fn clear_pccs_env() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, _) in std::env::vars() {
+            if key.starts_with("PCCS_") {
+                std::env::remove_var(key);
+            }
+        }
+        guard
+    }
+
     #[test]
     fn rocksdb_opts_presets_differ() {
         let default = RocksDbOpts::default();
@@ -701,7 +716,237 @@ mod tests {
     }
 
     #[test]
+    fn cache_mode_parse_and_as_str() {
+        assert_eq!(CacheMode::parse("LAZY"), Some(CacheMode::Lazy));
+        assert_eq!(CacheMode::parse("offline"), Some(CacheMode::Offline));
+        assert_eq!(CacheMode::parse("Req"), Some(CacheMode::Req));
+        assert_eq!(CacheMode::parse("bogus"), None);
+        assert_eq!(CacheMode::Lazy.as_str(), "LAZY");
+        assert_eq!(CacheMode::Offline.as_str(), "OFFLINE");
+        assert_eq!(CacheMode::Req.as_str(), "REQ");
+    }
+
+    #[test]
+    fn uri_host_variants() {
+        assert_eq!(
+            uri_host("https://API.Example.COM:8443/sgx/").as_deref(),
+            Some("api.example.com")
+        );
+        // No scheme is tolerated (`host:port/path`).
+        assert_eq!(uri_host("example.com:8081/x").as_deref(), Some("example.com"));
+        // Userinfo is stripped.
+        assert_eq!(
+            uri_host("https://user:pass@example.com/x").as_deref(),
+            Some("example.com")
+        );
+        // IPv6 literal in brackets.
+        assert_eq!(uri_host("http://[::1]:8081/").as_deref(), Some("::1"));
+        assert_eq!(uri_host(""), None);
+        assert_eq!(uri_host("https:///path"), None);
+    }
+
+    #[test]
+    fn derived_values() {
+        let cfg = Config {
+            host: "0.0.0.0".into(),
+            port: 9999,
+            uri: "https://example.test/sgx/certification/v3/".into(),
+            ..Config::default()
+        };
+        assert_eq!(cfg.bind_addr(), "0.0.0.0:9999");
+        assert_eq!(cfg.pcs_version(), 3);
+        assert!(cfg.has_upstream());
+        // A URI without a version segment falls back to v4.
+        assert_eq!(Config::default().pcs_version(), 4);
+        let empty = Config {
+            uri: "  ".into(),
+            ..Config::default()
+        };
+        assert!(!empty.has_upstream());
+    }
+
+    #[test]
+    fn sha512_hex_check() {
+        assert!(is_sha512_hex(&"a".repeat(128)));
+        assert!(is_sha512_hex(&"A0".repeat(64)));
+        assert!(!is_sha512_hex(&"a".repeat(127)));
+        assert!(!is_sha512_hex(&"g".repeat(128)));
+    }
+
+    #[test]
+    fn validate_token_hashes_only_logs() {
+        // Must not panic or mutate; it only logs which endpoints are disabled.
+        Config::default().validate_token_hashes();
+        Config::test_default().validate_token_hashes();
+    }
+
+    #[test]
+    fn file_then_cli_precedence() {
+        let _env = clear_pccs_env();
+        let dir = std::env::temp_dir().join(format!("pccs-rs-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "HTTPS_PORT": 8443,
+                "hosts": "0.0.0.0",
+                "uri": "https://file.example/sgx/certification/v4/",
+                "ApiKey": "file-key",
+                "proxy": "http://proxy.example:8080",
+                "RefreshSchedule": "0 0 2 * * *",
+                "UserTokenHash": "file-user-hash",
+                "AdminTokenHash": "file-admin-hash",
+                "CachingFillMode": "OFFLINE",
+                "LogLevel": "debug",
+                "DB_PATH": "/tmp/file-db",
+                "MaxRequestBodySize": "1MB",
+                "RequestTimeoutSeconds": 5,
+                "HeadersTimeoutSeconds": 6,
+                "KeepAliveTimeoutSeconds": 7,
+                "UpstreamMaxConcurrent": 8,
+                "UpstreamMaxAttempts": 9,
+                "UpstreamPoolIdleSeconds": 10
+            }"#,
+        )
+        .unwrap();
+
+        // File values apply where the CLI is silent.
+        let cli = Cli::parse_from(["pccs-rs", "--config", path.to_str().unwrap()]);
+        let cfg = Config::from(cli);
+        assert_eq!(cfg.port, 8443);
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.uri, "https://file.example/sgx/certification/v4/");
+        assert_eq!(cfg.api_key, "file-key");
+        assert_eq!(cfg.proxy, "http://proxy.example:8080");
+        assert_eq!(cfg.refresh_schedule, "0 0 2 * * *");
+        assert_eq!(cfg.user_token_hash, "file-user-hash");
+        assert_eq!(cfg.admin_token_hash, "file-admin-hash");
+        assert_eq!(cfg.cache_mode, CacheMode::Offline);
+        assert_eq!(cfg.log_level, "debug");
+        assert_eq!(cfg.db_path, PathBuf::from("/tmp/file-db"));
+        assert_eq!(cfg.max_body_size, 1024 * 1024);
+        assert_eq!(cfg.request_timeout_secs, 5);
+        assert_eq!(cfg.headers_timeout_secs, 6);
+        assert_eq!(cfg.keepalive_timeout_secs, 7);
+        assert_eq!(cfg.upstream_max_concurrent, 8);
+        assert_eq!(cfg.upstream_max_attempts, 9);
+        assert_eq!(cfg.upstream_pool_idle_secs, 10);
+
+        // CLI wins over the file.
+        let cli = Cli::parse_from([
+            "pccs-rs",
+            "--config",
+            path.to_str().unwrap(),
+            "--host",
+            "127.0.0.2",
+            "--port",
+            "9000",
+            "--cache-mode",
+            "req",
+            "--user-token-hash",
+            "cli-user",
+            "--admin-token-hash",
+            "cli-admin",
+            "--uri",
+            "https://cli.example/",
+            "--api-key",
+            "cli-key",
+            "--proxy",
+            "http://cli-proxy:1",
+            "--refresh-schedule",
+            "0 0 3 * * *",
+            "--db-path",
+            "/tmp/cli-db",
+            "--log-level",
+            "trace",
+            "--max-body-size",
+            "4MB",
+            "--request-timeout-seconds",
+            "15",
+            "--headers-timeout-seconds",
+            "16",
+            "--keepalive-timeout-seconds",
+            "17",
+            "--upstream-max-concurrent",
+            "18",
+            "--upstream-max-attempts",
+            "19",
+            "--upstream-pool-idle-seconds",
+            "20",
+            "--seed",
+            "/tmp/seed.json",
+            "--no-seed",
+            "--https",
+            "--cert",
+            "/tmp/c.crt",
+            "--key",
+            "/tmp/k.pem",
+        ]);
+        let cfg = Config::from(cli);
+        assert_eq!(cfg.host, "127.0.0.2");
+        assert_eq!(cfg.port, 9000);
+        assert_eq!(cfg.cache_mode, CacheMode::Req);
+        assert_eq!(cfg.user_token_hash, "cli-user");
+        assert_eq!(cfg.admin_token_hash, "cli-admin");
+        assert_eq!(cfg.uri, "https://cli.example/");
+        assert_eq!(cfg.api_key, "cli-key");
+        assert_eq!(cfg.proxy, "http://cli-proxy:1");
+        assert_eq!(cfg.refresh_schedule, "0 0 3 * * *");
+        assert_eq!(cfg.db_path, PathBuf::from("/tmp/cli-db"));
+        assert_eq!(cfg.log_level, "trace");
+        assert_eq!(cfg.max_body_size, 4 * 1024 * 1024);
+        assert_eq!(cfg.request_timeout_secs, 15);
+        assert_eq!(cfg.headers_timeout_secs, 16);
+        assert_eq!(cfg.keepalive_timeout_secs, 17);
+        assert_eq!(cfg.upstream_max_concurrent, 18);
+        assert_eq!(cfg.upstream_max_attempts, 19);
+        assert_eq!(cfg.upstream_pool_idle_secs, 20);
+        assert_eq!(cfg.seed, Some(PathBuf::from("/tmp/seed.json")));
+        assert!(cfg.no_seed);
+        assert!(cfg.https);
+        assert!(!cfg.http, "--https turns plain HTTP off");
+        assert_eq!(cfg.cert, PathBuf::from("/tmp/c.crt"));
+        assert_eq!(cfg.key, PathBuf::from("/tmp/k.pem"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn http_flag_and_dev_tokens() {
+        let _env = clear_pccs_env();
+        let cli = Cli::parse_from(["pccs-rs", "--http", "--dev-tokens"]);
+        let cfg = Config::from(cli);
+        assert!(cfg.http);
+        assert!(!cfg.https);
+        assert_eq!(cfg.user_token_hash, DEFAULT_USER_TOKEN_HASH);
+        assert_eq!(cfg.admin_token_hash, DEFAULT_ADMIN_TOKEN_HASH);
+
+        // --dev-tokens never overwrites an explicit hash.
+        let cli = Cli::parse_from([
+            "pccs-rs",
+            "--dev-tokens",
+            "--user-token-hash",
+            "custom",
+        ]);
+        let cfg = Config::from(cli);
+        assert_eq!(cfg.user_token_hash, "custom");
+        assert_eq!(cfg.admin_token_hash, DEFAULT_ADMIN_TOKEN_HASH);
+    }
+
+    #[test]
+    fn bad_max_body_warns_instead_of_panicking() {
+        let _env = clear_pccs_env();
+        let cli = Cli::parse_from(["pccs-rs", "--max-body-size", "huge"]);
+        let cfg = Config::from(cli);
+        assert_eq!(cfg.max_body_size, DEFAULT_MAX_BODY_SIZE);
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(cfg.warnings[0].contains("huge"));
+    }
+
+    #[test]
     fn file_and_cli_override_rocksdb_knobs() {
+        let _env = clear_pccs_env();
         let json = r#"{
             "RocksDbBlockCacheMb": 2,
             "RocksDbWriteBufferMb": 8,

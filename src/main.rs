@@ -377,3 +377,180 @@ fn spawn_refresh_scheduler(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Process-global log capture: tracing allows one global subscriber, so
+    /// every test in this binary shares the buffer and asserts with `contains`.
+    fn captured_logs() -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        use std::sync::{Mutex, OnceLock};
+        static LOGS: OnceLock<std::sync::Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+        LOGS.get_or_init(|| {
+            let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+            struct Writer(std::sync::Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for Writer {
+                fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(data);
+                    Ok(data.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl tracing_subscriber::fmt::MakeWriter<'_> for Writer {
+                type Writer = Self;
+                fn make_writer(&self) -> Self::Writer {
+                    Writer(self.0.clone())
+                }
+            }
+            let _ = tracing_subscriber::fmt()
+                .with_writer(Writer(buf.clone()))
+                .with_ansi(false)
+                .try_init();
+            buf
+        })
+        .clone()
+    }
+
+    fn logs_contain(buf: &std::sync::Mutex<Vec<u8>>, needle: &str) -> bool {
+        String::from_utf8_lossy(&buf.lock().unwrap()).contains(needle)
+    }
+
+    #[test]
+    fn resolve_bind_addr_accepts_hosts_and_ips() {
+        let addr = resolve_bind_addr("127.0.0.1:8081");
+        assert_eq!(addr.port(), 8081);
+        let addr = resolve_bind_addr("localhost:9090");
+        assert_eq!(addr.port(), 9090);
+    }
+
+    #[test]
+    fn configure_http_both_keepalive_modes() {
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        let mut cfg = Config::default();
+        configure_http(&mut builder, &cfg);
+        cfg.keepalive_timeout_secs = 0;
+        configure_http(&mut builder, &cfg);
+    }
+
+    /// Occurrences of `needle` in the shared log stream. The stream is
+    /// process-global and tests run in parallel, so every assertion is a
+    /// before/after count on a needle only this test can produce.
+    fn log_count(logs: &std::sync::Mutex<Vec<u8>>, needle: &str) -> usize {
+        String::from_utf8_lossy(&logs.lock().unwrap())
+            .matches(needle)
+            .count()
+    }
+
+    #[test]
+    fn warn_helpers_log_exactly_when_they_should() {
+        let logs = captured_logs();
+        let dev_tokens = "built-in dev token hashes are in use";
+        let self_upstream = "looks like this service";
+        let mut cfg = Config::default();
+
+        let before = log_count(&logs, dev_tokens);
+        warn_on_dev_tokens(&cfg);
+        assert_eq!(
+            log_count(&logs, dev_tokens),
+            before,
+            "no dev tokens configured: no warning"
+        );
+        cfg.user_token_hash = DEFAULT_USER_TOKEN_HASH.into();
+        warn_on_dev_tokens(&cfg);
+        assert_eq!(log_count(&logs, dev_tokens), before + 1);
+
+        // No URI host at all: nothing to compare.
+        let before = log_count(&logs, self_upstream);
+        cfg.uri = String::new();
+        warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        assert_eq!(
+            log_count(&logs, self_upstream),
+            before,
+            "empty upstream must not warn"
+        );
+        // Upstream on this very address: warns.
+        cfg.uri = "http://127.0.0.1:8081/sgx/certification/v4/".into();
+        warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        assert_eq!(log_count(&logs, self_upstream), before + 1);
+        // Unresolvable upstream host: no warning, no panic.
+        cfg.uri = "https://nonexistent.invalid/sgx/".into();
+        warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        assert_eq!(log_count(&logs, self_upstream), before + 1);
+    }
+
+    #[tokio::test]
+    async fn tune_tcp_and_acceptor_survive_a_live_socket() {
+        use axum_server::accept::Accept;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr).await.unwrap()
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        tune_tcp(&stream);
+        let (stream, _service) = TunedAcceptor.accept(stream, ()).await.unwrap();
+        drop(stream);
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn await_first_byte_peeks_without_consuming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A client that sends a byte: true, and the byte is still there.
+        // (Connect before accept: the backlog completes the handshake.)
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        client.write_all(b"G").await.unwrap();
+        assert!(await_first_byte(&stream, Duration::from_secs(5)).await);
+        let mut buf = [0u8; 1];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"G", "peek must not consume the request head");
+
+        // A client that hangs up immediately: false.
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(client);
+        assert!(!await_first_byte(&stream, Duration::from_secs(5)).await);
+
+        // A silent client past the deadline: false.
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(!await_first_byte(&stream, Duration::from_millis(50)).await);
+
+        // A zero deadline disables the check.
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(await_first_byte(&stream, Duration::ZERO).await);
+    }
+
+    #[tokio::test]
+    async fn invalid_refresh_schedule_falls_back_to_the_default() {
+        let logs = captured_logs();
+        let cfg = Config::test_default();
+        let cache = pccs_rs::cache::build_cache(&cfg).unwrap();
+        let handle = spawn_refresh_scheduler(cache, "not a cron".to_string());
+        // The fallback logs both the parse failure and the next run computed
+        // from the daily-01:00 default.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if logs_contain(&logs, "invalid RefreshSchedule")
+                    && logs_contain(&logs, "using daily 01:00")
+                    && logs_contain(&logs, "next scheduled refresh at")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("scheduler never logged the fallback");
+        assert!(!handle.is_finished(), "the task keeps scheduling");
+        handle.abort();
+    }
+}

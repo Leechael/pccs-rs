@@ -141,3 +141,62 @@ pub fn success_response() -> Response {
 pub fn success_body() -> &'static str {
     SUCCESS.1
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_codes_match_node_pccs_status() {
+        assert_eq!(INVALID_REQ.status, StatusCode::BAD_REQUEST);
+        assert_eq!(UNAUTHORIZED.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(NO_CACHE_DATA.status, StatusCode::NOT_FOUND);
+        assert_eq!(CONTENT_TOO_LARGE.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(REQUEST_TIMEOUT.status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(PCS_V3_REACHED_EOL.status, StatusCode::GONE);
+        assert_eq!(INTERNAL_ERROR.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(SERVICE_UNAVAILABLE.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(PCS_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(integrity_error().status.as_u16(), 460);
+        assert_eq!(platform_unknown().status.as_u16(), 461);
+        assert_eq!(certs_unavailable().status.as_u16(), 462);
+        assert_eq!(
+            platform_unknown().message,
+            "The platform was not found in the cache."
+        );
+    }
+
+    #[test]
+    fn display_and_error_trait() {
+        let e: &dyn std::error::Error = &INVALID_REQ;
+        assert_eq!(e.to_string(), "Invalid request parameters.");
+        assert_eq!(format!("{INVALID_REQ}"), "Invalid request parameters.");
+    }
+
+    #[test]
+    fn responses_are_text_html_like_express() {
+        let resp = INVALID_REQ.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            ERROR_CONTENT_TYPE
+        );
+
+        let resp = success_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            ERROR_CONTENT_TYPE
+        );
+
+        let resp = text_html(StatusCode::ACCEPTED, "body");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            ERROR_CONTENT_TYPE
+        );
+
+        assert_eq!(success_body(), "Operation successful.");
+        assert_eq!(SUCCESS.0, 200);
+    }
+}
