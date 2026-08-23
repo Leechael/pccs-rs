@@ -262,13 +262,14 @@ cargo build --release --bin pccs-rs --bin loadgen
 ./target/release/loadgen --url http://127.0.0.1:18081 --duration 5 --concurrency 32
 ```
 
-Results: `bench-results.txt`. Mix is 70% `/pckcert` / 20% `/tcb` /
-10% `/qe/identity` against seeded v4 data (cache-hit, no Intel network).
+Local dumps go to `compare/out/` (gitignored). Mix is 70% `/pckcert` /
+20% `/tcb` / 10% `/qe/identity` against seeded v4 data (cache-hit, no Intel
+network).
 
 RocksDB RSS measured **27.1 MiB** on a 5s HTTP cache-hit bench (32 conc,
 135k rps) with the shipped defaults (8 / 64 / 2 / -1). Higher than the old
-in-memory DashMap (~8 MiB), far below Node PCCS (~112 MiB). See
-`bench-results.txt` and `rocksdb-tune-results.md`.
+in-memory DashMap (~8 MiB), far below Node PCCS (~112 MiB). Node vs Rust
+compare summary: [`docs/compare-results.md`](docs/compare-results.md).
 
 ### RocksDB memory flags
 

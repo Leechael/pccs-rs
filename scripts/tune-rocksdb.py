@@ -301,7 +301,9 @@ Ports 18181–18185, one server at a time, killed after each run.
 --rocksdb-max-open-files / RocksDbMaxOpenFiles                                 default -1
 ```
 """
-    (ROOT / "rocksdb-tune-results.md").write_text(md, encoding="utf-8")
+    out_dir = ROOT / "compare" / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "rocksdb-tune-results.md").write_text(md, encoding="utf-8")
 
     txt_lines = [
         "pccs-rs RocksDB memory-knob tune",
@@ -320,8 +322,8 @@ Ports 18181–18185, one server at a time, killed after each run.
             f"{kib_to_mib(r['after_kb']):>9} {r['rps']:>8.1f} {r['p50_ms']:>7.3f} {r['p99_ms']:>7.3f} {r['err']:>4}"
         )
     txt_lines += ["", "takeaway:", para, ""]
-    (ROOT / "rocksdb-tune-results.txt").write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
-    print("wrote rocksdb-tune-results.md and .txt", flush=True)
+    (out_dir / "rocksdb-tune-results.txt").write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
+    print("wrote", out_dir / "rocksdb-tune-results.md", "and .txt", flush=True)
     print(table)
     print(para)
     return 0

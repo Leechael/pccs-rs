@@ -7,5 +7,13 @@ certs/
 *.log
 compare/node-run/
 compare/*.pid
+compare/out/
 pccs-db/
 *.db
+
+# local benchmark / compare dumps (curated summaries live under docs/)
+/bench-results.txt
+/compare-results.md
+/compare-results.txt
+/rocksdb-tune-results.md
+/rocksdb-tune-results.txt

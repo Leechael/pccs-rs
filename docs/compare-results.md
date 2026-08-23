@@ -1,5 +1,9 @@
 # Intel Node PCCS vs pccs-rs — throughput and memory
 
+Curated snapshot from the 2026-08-21 compare run. Re-running
+`compare/run_compare.py` writes fresh artifacts under `compare/out/` (gitignored);
+update this page only when you want a committed summary.
+
 Measured: 2026-08-21 21:01 CST (UTC+8) on this box (8 CPUs, 15 GiB RAM).
 
 **Node served HTTP 200s for all three cache-hit GETs: yes.**

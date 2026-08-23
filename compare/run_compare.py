@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path("/workspace/pccs-rs")
 COMPARE = ROOT / "compare"
+OUT = COMPARE / "out"
 NODE_RUN = COMPARE / "node-run"
 INTEL = Path("/workspace/confidential-computing.tee.dcap.pccs/service")
 BIN = ROOT / "target/release/pccs-rs"
@@ -22,6 +23,10 @@ LOAD = ROOT / "target/release/loadgen"
 SEED = COMPARE / "seed.json"
 PARAMS = json.loads((COMPARE / "query_params.json").read_text())
 RESULTS = {}
+
+
+def ensure_out():
+    OUT.mkdir(parents=True, exist_ok=True)
 
 USER_HASH = "b14361404c078ffd549c03db443c3fede2f3e534d73f78f77301ed97d4a436a9fd9db05ee8b325c0ad36438b43fec8510c204fc1c1edb21d0941c00e9e2c1ce2"
 ADMIN_HASH = "c7ad44cbad762a5da0a452f9e854fdc1e0e7a52a38015f23f3eab1d80b931dd472634dfac71cd34ebc35d16ab7fb8a90c81f975113d6c7538dc69dd8de9077ec"
@@ -263,7 +268,7 @@ def measure_server(label, pid, base, duration=5, warmup=2):
             "--interval",
             "0.2",
             "--out",
-            str(COMPARE / f"rss_{label}.json"),
+            str(OUT / f"rss_{label}.json"),
         ]
     )
     bench = loadgen(base, duration, warmup)
@@ -271,7 +276,7 @@ def measure_server(label, pid, base, duration=5, warmup=2):
     after = read_status(pid)
     after_ps = ps_snapshot(pid)
     rss = None
-    rss_path = COMPARE / f"rss_{label}.json"
+    rss_path = OUT / f"rss_{label}.json"
     if rss_path.exists():
         rss = json.loads(rss_path.read_text())
     return {
@@ -337,6 +342,7 @@ def start_rust(port, https):
 
 
 def main():
+    ensure_out()
     out = {
         "when": time.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "query": PARAMS,
@@ -420,7 +426,8 @@ def main():
     finally:
         stop_proc(rusts)
 
-    (COMPARE / "compare-raw.json").write_text(json.dumps(out, indent=2, default=str))
+    ensure_out()
+    (OUT / "compare-raw.json").write_text(json.dumps(out, indent=2, default=str))
     write_reports(out)
     print("DONE node_served_200s=", out["node_served_200s"])
 
@@ -576,8 +583,9 @@ def write_reports(out):
     for n in out.get("notes", []):
         lines.append(f"- {n}")
     lines.append("")
+    ensure_out()
     md = "\n".join(lines)
-    (ROOT / "compare-results.md").write_text(md)
+    (OUT / "compare-results.md").write_text(md)
     # also write txt
     txt = []
     txt.append("pccs-rs vs Intel Node PCCS compare")
@@ -589,9 +597,10 @@ def write_reports(out):
             f"{r['name']}: idle_rss_kib={r['idle_rss']} load_rss={r['load_min']}/{r['load_med']}/{r['load_max']} "
             f"rps={r['rps']} p50={r['p50']} p99={r['p99']} reqs={r['reqs']} served200={r['served']}"
         )
-    (ROOT / "compare-results.txt").write_text("\n".join(txt) + "\n")
-    print("wrote", ROOT / "compare-results.md")
-    print("wrote", ROOT / "compare-results.txt")
+    (OUT / "compare-results.txt").write_text("\n".join(txt) + "\n")
+    print("wrote", OUT / "compare-results.md")
+    print("wrote", OUT / "compare-results.txt")
+    print("(curated committed summary: docs/compare-results.md)")
 
 
 if __name__ == "__main__":
