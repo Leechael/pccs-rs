@@ -1,13 +1,17 @@
 # pccs-rs
 
-Production **Rust + Tokio** replacement for [Intel PCCS](https://github.com/intel/confidential-computing.tee.dcap.pccs)
+Production **Rust + Tokio** replacement for
+[Intel PCCS](https://github.com/intel/confidential-computing.tee.dcap.pccs)
 (Provisioning Certificate Caching Service). Intended to sit behind Caddy as
 `pccs.phala.network`.
 
-HTTP API is 1:1 with Intel Node PCCS. The cache is **RocksDB** (survives restart).
-A cache-hit GET is one RocksDB get: the value is the response body plus Intel headers.
+- HTTP API is 1:1 with Intel Node PCCS (all 30 default v4 routes: SGX v3 + v4,
+  TDX v4).
+- The cache is **RocksDB** and survives restart. A cache-hit GET is one RocksDB
+  get: the value is the response body plus Intel headers.
+- Licensed under [Apache 2.0](#license).
 
-## How Phala would run it (Caddy)
+## Running behind Caddy
 
 Caddy terminates TLS. pccs-rs listens on HTTP:
 
@@ -30,8 +34,16 @@ when that name resolves back here): every cache miss would then call back into
 pccs-rs and recurse. Startup logs a warning when the `uri` host looks like the
 address we bind.
 
-Or a JSON config file (`--config /etc/pccs/config.json`) using the same field
-names as Intel `service/config/default.json`, plus `DB_PATH` instead of sqlite:
+Direct TLS is also supported: `--https --cert certs/file.crt --key certs/private.pem`.
+
+## Configuration
+
+CLI overrides JSON config file, which overrides built-in defaults. A named
+`--config` file that is unreadable or invalid JSON is a fatal error, not a
+silent fall-back to defaults.
+
+`--config /etc/pccs/config.json` uses the same field names as Intel
+`service/config/default.json`, plus `DB_PATH` instead of sqlite:
 
 ```json
 {
@@ -60,72 +72,39 @@ names as Intel `service/config/default.json`, plus `DB_PATH` instead of sqlite:
 }
 ```
 
+Notes:
+
 - Default upstream is Intel PCS, the same as Node `config/default.json`.
 - `ApiKey` (`Ocp-Apim-Subscription-Key`) is sent exactly where Node sends it:
   on `pckcerts` requests, and on every request to the early-access portal
   (`https://validation.api.trustedservices.intel.com/`). Never on CRL downloads.
 - `proxy` is **not supported**; startup fails if it is set. Remove it and run
   pccs-rs on a host with direct outbound access.
-- A named `--config` file that is unreadable or not valid JSON is a fatal error,
-  not a silent fall-back to the built-in defaults.
-- `--https --cert certs/file.crt --key certs/private.pem` is also supported.
 - `RefreshSchedule` is a 6-field cron (seconds first). Default: daily 01:00.
-- `RequestTimeoutSeconds` / `HeadersTimeoutSeconds` / `KeepAliveTimeoutSeconds`
-  mirror the Node HTTP server timeouts. SIGINT / SIGTERM shuts down gracefully
-  (10s for in-flight requests) and closes RocksDB.
-- Upstream requests: 120s total timeout, 10s connect timeout, 16 MiB response
-  cap, at most `UpstreamMaxConcurrent` in flight, `UpstreamMaxAttempts` tries
-  (429/503 retried at most twice, honouring `Retry-After`). Connections are
-  pooled and reused for `UpstreamPoolIdleSeconds`.
+- SIGINT / SIGTERM shuts down gracefully (10s for in-flight requests) and
+  closes RocksDB.
 
-CLI overrides the file. Tokens are SHA-512 hex of the raw `user-token` /
-`admin-token` header (timing-safe compare).
+### Tokens
 
 **There is no default token.** `UserTokenHash` / `AdminTokenHash` are empty out
-of the box; an empty or malformed hash logs an ERROR at startup and makes every
-request to the endpoints guarded by that token answer `401`. Generate one with
-`printf '%s' '<token>' | shasum -a 512`.
+of the box; an empty or malformed hash logs an ERROR at startup and every
+request to an endpoint guarded by that token answers `401`. Tokens are SHA-512
+hex of the raw header value (timing-safe compare):
 
-| Header         | Used for |
-|----------------|----------|
-| `user-token`   | `POST /platforms` |
-| `admin-token`  | `GET /platforms`, `PUT /platformcollateral`, `GET\|POST /refresh`, `PUT /appraisalpolicy` |
+```bash
+printf '%s' '<token>' | shasum -a 512
+```
 
-For local development and benchmarking, `--dev-tokens` enables built-in hashes
-for the raw tokens `user` / `admin` and logs a loud warning. Never in production.
+| Header        | Guards |
+|---------------|--------|
+| `user-token`  | `POST /platforms` |
+| `admin-token` | `GET /platforms`, `PUT /platformcollateral`, `GET\|POST /refresh`, `PUT /appraisalpolicy` |
 
-## Caching modes
+Collateral GETs are unauthenticated. For local development and benchmarking,
+`--dev-tokens` enables built-in hashes for the raw tokens `user` / `admin` and
+logs a loud warning. Never in production.
 
-| Mode | GET miss | POST /platforms | Refresh |
-|------|----------|-----------------|---------|
-| **LAZY** | Fetch upstream, store, return. v3 miss → 410, no v3 call. | Fill from upstream if unknown; a failed fill fails the POST | Allowed (cron + admin) |
-| **REQ** | `/pckcert` → 461 if platform unknown; other GETs → 404. No upstream. | Queue, fill, then drop **only this platform's** queue row; a failed fill keeps the row and fails the POST | Allowed |
-| **OFFLINE** | Same as REQ (461 / 404). Never calls upstream. | Queue only | 503 (after parameter validation) |
-
-In every mode a `/pckcert` miss for a *known* platform first runs PCK cert
-selection against the cached pool; only if that fails does LAZY go upstream and
-REQ / OFFLINE answer 404. Concurrent misses on the same key are de-duplicated:
-50 simultaneous requests produce one upstream fetch. `GET|POST /refresh` is
-serialised, and a CRL or TCB-info refresh that the upstream cannot satisfy is a
-`503` rather than a silent success.
-
-In REQ mode, TCB levels that Intel reports as `"Not available"` are written to
-the registration queue with state `1`, readable via `GET /platforms?source=reg_na`
-(Node `processNotAvailableTcbs`).
-
-Upstream is Intel PCS **or** another PCCS. Same paths (`pckcert`, `pckcrl`,
-`tcb`, `qe/identity`, `qve/identity`, `rootcacrl`, `crl`). Intel uses
-`pckcerts` + in-memory PCK selection; a PCCS upstream is a single GET.
-
-Intel PCS has no `rootcacrl` route. Like Node, the root CA CRL URL is taken from
-the CRL Distribution Point of the Intel root CA certificate (the last PEM of an
-issuer chain); if that cannot be read, pccs-rs falls back to
-`https://certificates.trustedservices.intel.com/IntelSGXRootCA.der` and logs it.
-A PCCS upstream keeps serving `{base}rootcacrl`.
-
-## Timeouts and upstream limits
-
-CLI overrides JSON config, which overrides the built-in default.
+### Timeouts and upstream limits
 
 | CLI | env | JSON | default |
 |-----|-----|------|---------|
@@ -144,7 +123,41 @@ legitimately wait on a 120s upstream budget, and an admin `/refresh` walks the
 whole cache. Cancelling those mid-write is how a half-written platform record
 happens, so response production is left unbounded, exactly as in Node.
 
+Upstream requests: 120s total timeout, 10s connect timeout, 16 MiB response
+cap, at most `UpstreamMaxConcurrent` in flight, `UpstreamMaxAttempts` tries
+(429/503 retried at most twice, honouring `Retry-After`).
 `UpstreamMaxAttempts` mirrors Node `pcs_client.js` `MAX_RETRY_COUNT`.
+
+## Caching modes
+
+| Mode | GET miss | POST /platforms | Refresh |
+|------|----------|-----------------|---------|
+| **LAZY** | Fetch upstream, store, return. v3 miss → 410, no v3 call. | Fill from upstream if unknown; a failed fill fails the POST | Allowed (cron + admin) |
+| **REQ** | `/pckcert` → 461 if platform unknown; other GETs → 404. No upstream. | Queue, fill, then drop **only this platform's** queue row; a failed fill keeps the row and fails the POST | Allowed |
+| **OFFLINE** | Same as REQ (461 / 404). Never calls upstream. | Queue only | 503 (after parameter validation) |
+
+In every mode a `/pckcert` miss for a *known* platform first runs PCK cert
+selection against the cached pool; only if that fails does LAZY go upstream and
+REQ / OFFLINE answer 404. Concurrent misses on the same key are de-duplicated:
+50 simultaneous requests produce one upstream fetch. `GET|POST /refresh` is
+serialised, and a CRL or TCB-info refresh that the upstream cannot satisfy is a
+`503` rather than a silent success.
+
+In REQ mode, TCB levels that Intel reports as `"Not available"` are written to
+the registration queue with state `1`, readable via
+`GET /platforms?source=reg_na` (Node `processNotAvailableTcbs`).
+
+### Upstream: Intel PCS or another PCCS
+
+Same paths (`pckcert`, `pckcrl`, `tcb`, `qe/identity`, `qve/identity`,
+`rootcacrl`, `crl`). Intel uses `pckcerts` + in-memory PCK selection; a PCCS
+upstream is a single GET.
+
+Intel PCS has no `rootcacrl` route. Like Node, the root CA CRL URL is taken
+from the CRL Distribution Point of the Intel root CA certificate (the last PEM
+of an issuer chain); if that cannot be read, pccs-rs falls back to
+`https://certificates.trustedservices.intel.com/IntelSGXRootCA.der` and logs
+it. A PCCS upstream keeps serving `{base}rootcacrl`.
 
 ## Connection reuse
 
@@ -152,26 +165,27 @@ happens, so response production is left unbounded, exactly as in Node.
 between requests — this is the value a reverse proxy in front of pccs-rs cares
 about, and it must be at least as long as the proxy's own idle timeout (Caddy
 defaults to 90s; raise `KeepAliveTimeoutSeconds` to match if you see the proxy
-reconnect on every request). `HeadersTimeoutSeconds` is separate: it bounds only
-a *freshly accepted* connection, which must send the first byte of a request
-within that window or be dropped. A partial request head that stalls on an
-already established keep-alive connection is bounded by
+reconnect on every request). `HeadersTimeoutSeconds` is separate: it bounds
+only a *freshly accepted* connection, which must send the first byte of a
+request within that window or be dropped. A partial request head that stalls on
+an already established keep-alive connection is bounded by
 `KeepAliveTimeoutSeconds` instead. On the HTTPS path `HeadersTimeoutSeconds`
 bounds the TLS handshake.
 
 Accepted sockets get `TCP_NODELAY` and 60s `SO_KEEPALIVE` probes. Upstream
-sockets get the same, plus a connection pool: up to `UpstreamMaxConcurrent` idle
-connections per host, dropped after `UpstreamPoolIdleSeconds` (default 60,
-deliberately under the idle timeout of Intel PCS and of a PCCS behind a proxy, so
-a pooled connection is never handed a request after the far end closed it). Set
-it to 0 to disable pooling.
+sockets get the same, plus a connection pool: up to `UpstreamMaxConcurrent`
+idle connections per host, dropped after `UpstreamPoolIdleSeconds` (default 60,
+deliberately under the idle timeout of Intel PCS and of a PCCS behind a proxy,
+so a pooled connection is never handed a request after the far end closed it).
+Set it to 0 to disable pooling.
 
 ## RocksDB key layout
 
-`{type-prefix}{cityhash128(canonical fields) hex}` — keys lowercase. Values JSON.
+`{type-prefix}{cityhash128(canonical fields) hex}` — keys lowercase. Values
+JSON.
 
 | Prefix | Canonical fields | Value |
-|--------|------------------|--------|
+|--------|------------------|-------|
 | `platform/` | qeid / pceid | the platform's **whole PCK cert pool** + fmspc, ca, enc_ppid, platform_manifest, issuer chain, and its known raw TCB levels |
 | `pckcert/` | qeid / pceid / cpusvn / pcesvn | selected PEM + SGX-TCBm, FMSPC, CA, issuer chain (hot path) |
 | `tcb/` | sgx\|tdx / version / fmspc / update | TCB JSON + issuer chain |
@@ -180,21 +194,26 @@ it to 0 to disable pooling.
 | `rootcacrl` | (literal) | CRL bytes |
 | `crl/` | uri | CRL bytes |
 | `appraisal/` | fmspc | policy list (GET joins defaults) |
-| `preg/` | qeid / pceid / cpusvn / pcesvn | registration queue (GET /platforms?source=reg drain) |
+| `preg/` | qeid / pceid / cpusvn / pcesvn | registration queue (`GET /platforms?source=reg` drain) |
 
 `platform/` collapses Intel's `platforms`, `pck_cert` and `platform_tcbs`
-tables into one record, so `GET /pckcert` for a platform that is known but whose
-raw TCB has never been seen is answered by running PCK cert selection locally
-instead of calling upstream, and `has_platform` is a single `DB::get` rather
-than a full scan.
+tables into one record, so `GET /pckcert` for a platform that is known but
+whose raw TCB has never been seen is answered by running PCK cert selection
+locally instead of calling upstream, and `has_platform` is a single `DB::get`
+rather than a full scan.
 
 Every read re-checks the stored record against the key it was fetched with
 (qeid / pceid / cpusvn / pcesvn, fmspc, update type …); a mismatch counts as a
 miss instead of serving another platform's collateral.
 
-**Migration.** Databases written before `platform/` existed have `pckcert/`
-records but no platform records. Nothing needs to be deleted and nothing is
-lost, but two behaviours change until the platform records are refilled:
+Writes that Intel wrapped in a SQL transaction use a RocksDB `WriteBatch`.
+zstd block compression. No Intel multi-table joins.
+
+### Migration from pre-`platform/` databases
+
+Databases written before `platform/` existed have `pckcert/` records but no
+platform records. Nothing needs to be deleted and nothing is lost, but two
+behaviours change until the platform records are refilled:
 
 - **`GET /platforms?source=[fmspc]` comes back empty.** The listing now
   iterates `platform/` records rather than scanning `pckcert/`, and a
@@ -204,26 +223,25 @@ lost, but two behaviours change until the platform records are refilled:
 - **Those platforms read as unknown**, so REQ / OFFLINE answer `461`. LAZY
   refills from the upstream on the first request.
 
-Old `pckcert/` records keep working throughout: an exact-key hit
-(same qeid / pceid / cpusvn / pcesvn) is still served straight from cache.
-
-Writes that Intel wrapped in a SQL transaction use a RocksDB `WriteBatch`.
-zstd block compression. No Intel multi-table joins.
+Old `pckcert/` records keep working throughout: an exact-key hit (same qeid /
+pceid / cpusvn / pcesvn) is still served straight from cache.
 
 ## What is implemented
 
-- All 30 default v4 routes (SGX v3 + v4 + TDX v4)
+- All 30 default v4 routes (SGX v3 + v4 + TDX v4), mounted at
+  `/sgx/certification/v3`, `/sgx/certification/v4`, and `/tdx/certification/v4`
 - Auth, Request-ID (always freshly generated, like Node), v3 Warning, Intel
-  headers, `text/html` error bodies, body limit (413 `Content too large.`)
+  headers, `text/html` error bodies, body limit (413 `Content too large.`),
+  `x-powered-by` not set
 - LAZY / REQ / OFFLINE, real upstream client, cron refresh
-- POST /platforms (body must be a JSON **object**, per Node's
-  `PLATFORM_REG_SCHEMA`; arrays are `400`), GET /platforms
-  (`reg` / `reg_na` / `[fmspc,…]` — the fmspc listing returns exactly
-  `qe_id`, `pce_id`, `cpu_svn`, `pce_svn`, `enc_ppid`, `platform_manifest`)
-- PUT /platformcollateral, validated against Intel's
+- `POST /platforms` (body must be a JSON **object**, per Node's
+  `PLATFORM_REG_SCHEMA`; arrays are `400`), `GET /platforms`
+  (`reg` / `reg_na` / `[fmspc,…]` — the fmspc listing returns exactly `qe_id`,
+  `pce_id`, `cpu_svn`, `pce_svn`, `enc_ppid`, `platform_manifest`)
+- `PUT /platformcollateral`, validated against Intel's
   `PLATFORM_COLLATERAL_SCHEMA_V3` / `_V4` before anything is stored
-- GET/POST /refresh (collateral; `type=certs` re-fetches each platform's pool)
-- PUT/GET appraisalpolicy (SHA-384 id, upsert by id, one default per fmspc,
+- `GET|POST /refresh` (collateral; `type=certs` re-fetches each platform's pool)
+- `PUT|GET /appraisalpolicy` (SHA-384 id, upsert by id, one default per fmspc,
   JWS payload and `class_id` validated as Node does)
 - Full PCK cert selection (`pckCertSelection.js` + `Tcb.js` + the SGX X.509
   extension reader from `x509.js`): a certificate's TCB is read from the
@@ -234,25 +252,18 @@ zstd block compression. No Intel multi-table joins.
   (`filterDuplicatedParams.js`); signed TCB-info / enclave-identity bodies are
   stored and returned byte-for-byte, so their signatures still verify
 
-## How to bench
+## Benchmarks
 
 ```bash
 ./scripts/bench.sh
-# or:
+# or manually:
 cargo build --release --bin pccs-rs --bin loadgen
 ./target/release/pccs-rs --http --port 18081 --db-path /tmp/pccs-bench --uri '' --seed fixtures/seed.json &
 ./target/release/loadgen --url http://127.0.0.1:18081 --duration 5 --concurrency 32
 ```
 
-Results: `bench-results.txt`. Mix is 70% `/pckcert` / 20% `/tcb` / 10% `/qe/identity`
-against seeded v4 data (cache-hit, no Intel network).
-
-```bash
-cargo test
-cargo build --release
-```
-
-## Memory
+Results: `bench-results.txt`. Mix is 70% `/pckcert` / 20% `/tcb` /
+10% `/qe/identity` against seeded v4 data (cache-hit, no Intel network).
 
 RocksDB RSS measured **27.1 MiB** on a 5s HTTP cache-hit bench (32 conc,
 135k rps) with the shipped defaults (8 / 64 / 2 / -1). Higher than the old
@@ -261,8 +272,8 @@ in-memory DashMap (~8 MiB), far below Node PCCS (~112 MiB). See
 
 ### RocksDB memory flags
 
-All four knobs are runtime-configurable (CLI overrides JSON / env). Applied
-in `Store::open` via `Options` + `BlockBasedOptions` (zstd stays on).
+All four knobs are runtime-configurable (CLI overrides JSON / env). Applied in
+`Store::open` via `Options` + `BlockBasedOptions` (zstd stays on).
 
 | CLI | env | JSON | default |
 |-----|-----|------|---------|
@@ -279,9 +290,13 @@ pccs-rs --http --port 8081 \
   --rocksdb-max-open-files -1
 ```
 
-## API map
+## Development
 
-Mounted at `/sgx/certification/v3`, `/sgx/certification/v4`, and (v4) `/tdx/certification/v4`.
+```bash
+cargo test
+cargo build --release
+```
 
-See `/workspace/pccs-api-inventory.md` for the full 1:1 contract (paths, headers,
-status text). Collateral GETs are unauthenticated. `x-powered-by` is not set.
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
