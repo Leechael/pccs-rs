@@ -16,15 +16,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Build release binary
         run: cargo build --release --locked --bin pccs-rs --target x86_64-unknown-linux-gnu
       - name: Package
         run: |
           mkdir -p dist
           tar -C target/x86_64-unknown-linux-gnu/release -czf dist/pccs-rs-x86_64-unknown-linux-gnu.tar.gz pccs-rs
-          sha256sum dist/pccs-rs-x86_64-unknown-linux-gnu.tar.gz > dist/pccs-rs-x86_64-unknown-linux-gnu.tar.gz.sha256
+          (cd dist && sha256sum pccs-rs-x86_64-unknown-linux-gnu.tar.gz > pccs-rs-x86_64-unknown-linux-gnu.tar.gz.sha256)
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/* --title "${{ github.ref_name }}" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
