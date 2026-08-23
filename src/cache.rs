@@ -1424,12 +1424,28 @@ mod tests {
             let cache = cache.clone();
             async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
         });
-        // Let the second request enqueue on the key lock (current-thread
-        // runtime: each yield advances the spawned task one await point),
-        // then let the first fetch fail.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        // Wait until the second request is deterministically queued on the
+        // key lock: the first request holds the lock Arc plus its guard, so a
+        // third strong reference is the second request inside `key_lock`.
+        let key = keys::tcb(keys::prod_name(0), 4, "00A067110000", UpdateType::Standard.as_str());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let strong = {
+                    let map = cache.inflight.lock().await;
+                    map.get(&key)
+                        .and_then(Weak::upgrade)
+                        .map(|lock| Arc::strong_count(&lock))
+                        .unwrap_or(0)
+                };
+                if strong >= 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second request never queued on the key lock");
+        // The waiter is in place; let the first fetch fail.
         release.notify_one();
         let first = first.await.unwrap();
         let second = second.await.unwrap();
