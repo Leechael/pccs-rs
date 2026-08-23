@@ -8,6 +8,7 @@ use crate::error::{self, PccsError};
 use crate::headers;
 use crate::store::{IdentityRecord, PckCertRecord, PckCrlRecord, TcbRecord};
 use crate::validate::UpdateType;
+use base64::Engine;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
@@ -648,35 +649,7 @@ fn last_pem_der(pem: &str) -> Option<Vec<u8>> {
         .chars()
         .filter(|c| !c.is_ascii_whitespace())
         .collect();
-    base64_decode(&b64)
-}
-
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let val = |c: u8| -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => u32::from(c - b'A'),
-            b'a'..=b'z' => u32::from(c - b'a') + 26,
-            b'0'..=b'9' => u32::from(c - b'0') + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        })
-    };
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    for c in s.bytes() {
-        if c == b'=' {
-            break;
-        }
-        acc = (acc << 6) | val(c)?;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
+    base64::engine::general_purpose::STANDARD.decode(b64).ok()
 }
 
 /// URI of the first CRL Distribution Point in a DER certificate.
@@ -825,8 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn base64_and_last_pem_roundtrip() {
-        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+    fn last_pem_returns_the_last_certificate() {
         let pem = "-----BEGIN CERTIFICATE-----\naGVsbG8=\n-----END CERTIFICATE-----\n\
                    -----BEGIN CERTIFICATE-----\nd29ybGQ=\n-----END CERTIFICATE-----\n";
         assert_eq!(last_pem_der(pem).unwrap(), b"world");
