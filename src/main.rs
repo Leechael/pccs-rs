@@ -435,41 +435,50 @@ mod tests {
         configure_http(&mut builder, &cfg);
     }
 
+    /// Occurrences of `needle` in the shared log stream. The stream is
+    /// process-global and tests run in parallel, so every assertion is a
+    /// before/after count on a needle only this test can produce.
+    fn log_count(logs: &std::sync::Mutex<Vec<u8>>, needle: &str) -> usize {
+        String::from_utf8_lossy(&logs.lock().unwrap())
+            .matches(needle)
+            .count()
+    }
+
     #[test]
     fn warn_helpers_log_exactly_when_they_should() {
         let logs = captured_logs();
+        let dev_tokens = "built-in dev token hashes are in use";
+        let self_upstream = "looks like this service";
         let mut cfg = Config::default();
+
+        let before = log_count(&logs, dev_tokens);
         warn_on_dev_tokens(&cfg);
-        assert!(
-            !logs_contain(&logs, "dev token"),
+        assert_eq!(
+            log_count(&logs, dev_tokens),
+            before,
             "no dev tokens configured: no warning"
         );
         cfg.user_token_hash = DEFAULT_USER_TOKEN_HASH.into();
         warn_on_dev_tokens(&cfg);
-        assert!(logs_contain(&logs, "built-in dev token hashes are in use"));
+        assert_eq!(log_count(&logs, dev_tokens), before + 1);
 
         // No URI host at all: nothing to compare.
+        let before = log_count(&logs, self_upstream);
         cfg.uri = String::new();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
-        assert!(
-            !logs_contain(&logs, "looks like this service"),
+        assert_eq!(
+            log_count(&logs, self_upstream),
+            before,
             "empty upstream must not warn"
         );
         // Upstream on this very address: warns.
         cfg.uri = "http://127.0.0.1:8081/sgx/certification/v4/".into();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
-        assert!(logs_contain(&logs, "looks like this service"));
-        // Unresolvable upstream host: no warning, no panic. (Count, not
-        // buffer length: tests in this binary share one log stream.)
-        let count = |logs: &std::sync::Mutex<Vec<u8>>| {
-            String::from_utf8_lossy(&logs.lock().unwrap())
-                .matches("looks like this service")
-                .count()
-        };
-        let before = count(&logs);
+        assert_eq!(log_count(&logs, self_upstream), before + 1);
+        // Unresolvable upstream host: no warning, no panic.
         cfg.uri = "https://nonexistent.invalid/sgx/".into();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
-        assert_eq!(count(&logs), before, "no new self-upstream warning");
+        assert_eq!(log_count(&logs, self_upstream), before + 1);
     }
 
     #[tokio::test]

@@ -1389,16 +1389,24 @@ mod tests {
     async fn a_failed_fetch_is_reused_by_the_waiters_behind_it() {
         use axum::routing::get;
         let calls = Arc::new(AtomicU64::new(0));
+        // The mock signals when the first fetch arrives and then blocks until
+        // the test releases it, so the second request is deterministically
+        // queued behind the first one's key lock when the failure lands.
+        let received = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
         let c = calls.clone();
-        // Slow enough that the second request is genuinely queued behind the
-        // first one's key lock when the failure lands.
+        let r = received.clone();
+        let g = release.clone();
         let app = axum::Router::new().route(
             "/sgx/certification/v4/tcb",
             get(move || {
                 let c = c.clone();
+                let r = r.clone();
+                let g = g.clone();
                 async move {
                     c.fetch_add(1, Ordering::Relaxed);
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    r.notify_one();
+                    g.notified().await;
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR
                 }
             }),
@@ -1410,12 +1418,21 @@ mod tests {
             let cache = cache.clone();
             async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
         });
-        // Let the first request take the key lock and reach the upstream.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let second = cache
-            .get_tcb(0, "00A067110000", 4, UpdateType::Standard)
-            .await;
+        // The first request has taken the key lock and reached the upstream.
+        received.notified().await;
+        let second = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
+        });
+        // Let the second request enqueue on the key lock (current-thread
+        // runtime: each yield advances the spawned task one await point),
+        // then let the first fetch fail.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_one();
         let first = first.await.unwrap();
+        let second = second.await.unwrap();
 
         assert_err(&first.unwrap_err(), &error::NO_CACHE_DATA);
         // The waiter was queued behind the failing fetch and reuses its error
