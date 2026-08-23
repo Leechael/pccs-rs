@@ -32,6 +32,9 @@ thiserror = "2"
 rocksdb = { version = "0.23", default-features = false, features = ["zstd", "bindgen-runtime"] }
 cron = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Socket options (TCP_NODELAY / SO_KEEPALIVE) on accepted and upstream sockets.
+# Already in the tree as a hyper-util / tokio dependency.
+socket2 = "0.6"
 
 [[bin]]
 name = "pccs-rs"

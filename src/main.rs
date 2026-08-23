@@ -15,6 +15,13 @@ use tracing_subscriber::EnvFilter;
 /// How long in-flight requests get to finish after SIGINT / SIGTERM.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
+/// TCP keepalive on accepted connections. Long-lived keep-alive connections from
+/// the reverse proxy would otherwise be indistinguishable from a proxy that died
+/// without a FIN, and idle NAT / load-balancer state can be dropped underneath
+/// them. Not configurable on purpose: it is a transport-level liveness probe,
+/// unrelated to the HTTP keep-alive idle timeout.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -88,7 +95,15 @@ async fn run(cfg: Config) {
             tracing::info!("shutting down");
             shutdown_handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
         });
-        let mut server = axum_server::bind_rustls(addr, tls).handle(handle);
+        // `axum_server` 0.7 has no first-byte timeout of its own, so on the TLS
+        // path `HeadersTimeoutSeconds` bounds the TLS handshake instead: a peer
+        // that connects and then says nothing is dropped when the handshake
+        // times out. Once the handshake is done, the hyper builder below governs
+        // the request head exactly like the plain-HTTP path.
+        let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(tls)
+            .handshake_timeout(Duration::from_secs(cfg.headers_timeout_secs.max(1)))
+            .acceptor(TunedAcceptor);
+        let mut server = axum_server::bind(addr).acceptor(acceptor).handle(handle);
         configure_http(server.http_builder(), &cfg);
         if let Err(e) = server.serve(app.into_make_service()).await {
             tracing::error!("https server: {e}");
@@ -111,11 +126,22 @@ async fn run(cfg: Config) {
 
 /// Plain HTTP with the Node `pccs_server.js` connection timeouts and a
 /// graceful shutdown on SIGINT / SIGTERM.
+///
+/// Accepted sockets are tuned for reuse (`TCP_NODELAY`, `SO_KEEPALIVE`) and a
+/// fresh connection must produce its first byte within `HeadersTimeoutSeconds`
+/// before it is handed to hyper — see `configure_http` for why that check lives
+/// here and not in the hyper builder.
 async fn serve_http(listener: tokio::net::TcpListener, app: axum::Router, cfg: &Config) {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     configure_http(&mut builder, cfg);
     let graceful = GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown_signal());
+    let first_byte = Duration::from_secs(cfg.headers_timeout_secs);
+
+    // The first-byte wait must not stall the accept loop, and `GracefulShutdown`
+    // is not shareable across tasks, so the wait happens in its own task and the
+    // stream comes back here to be registered and served.
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
 
     loop {
         tokio::select! {
@@ -127,6 +153,15 @@ async fn serve_http(listener: tokio::net::TcpListener, app: axum::Router, cfg: &
                         continue;
                     }
                 };
+                tune_tcp(&stream);
+                let tx = ready_tx.clone();
+                tokio::spawn(async move {
+                    if await_first_byte(&stream, first_byte).await {
+                        let _ = tx.send(stream);
+                    }
+                });
+            }
+            Some(stream) = ready_rx.recv() => {
                 let service = TowerToHyperService::new(app.clone());
                 let conn = builder
                     .serve_connection_with_upgrades(TokioIo::new(stream), service)
@@ -153,20 +188,94 @@ async fn serve_http(listener: tokio::net::TcpListener, app: axum::Router, cfg: &
     }
 }
 
-/// `HeadersTimeoutSeconds` maps onto hyper's header read timeout. Note hyper has
-/// no separate keep-alive idle timeout: the same timer bounds how long an idle
-/// keep-alive connection may wait for the next request head, so
-/// `KeepAliveTimeoutSeconds` only acts as an upper bound here (hyper closes
-/// earlier, at the headers timeout).
+/// `false` means the connection is not worth serving: it stayed silent past the
+/// deadline (slowloris / a probe that opens sockets and leaves), or it hung up.
+/// `peek` leaves the byte in the socket buffer for hyper to read.
+async fn await_first_byte(stream: &tokio::net::TcpStream, timeout: Duration) -> bool {
+    if timeout.is_zero() {
+        return true;
+    }
+    match tokio::time::timeout(timeout, stream.peek(&mut [0u8; 1])).await {
+        Ok(Ok(0)) => false,
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            tracing::debug!("first byte: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("no request within {timeout:?} of connect; closing");
+            false
+        }
+    }
+}
+
+/// `TCP_NODELAY` (collateral responses are small; Nagle would add latency to
+/// back-to-back requests on a reused connection) plus `SO_KEEPALIVE`. Failures
+/// are logged, never fatal: the connection is still perfectly serviceable.
+fn tune_tcp(stream: &tokio::net::TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!("set_nodelay: {e}");
+    }
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE)
+        .with_interval(TCP_KEEPALIVE);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::debug!("set_tcp_keepalive: {e}");
+    }
+}
+
+/// The TLS path goes through `axum_server`, which owns its accept loop; this
+/// acceptor is spliced in front of the rustls one so accepted sockets get the
+/// same treatment as on the plain-HTTP path.
+#[derive(Clone, Copy)]
+struct TunedAcceptor;
+
+impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for TunedAcceptor {
+    type Stream = tokio::net::TcpStream;
+    type Service = S;
+    type Future = std::future::Ready<std::io::Result<(Self::Stream, Self::Service)>>;
+
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        tune_tcp(&stream);
+        std::future::ready(Ok((stream, service)))
+    }
+}
+
+/// Connection timeouts, split the way a reverse proxy needs them.
+///
+/// hyper 1.x has a single `header_read_timeout`, and it runs both while a
+/// request head is being read *and* while an idle keep-alive connection waits
+/// for the next request. Driving it from `HeadersTimeoutSeconds` therefore closed
+/// idle connections from Caddy after 10s instead of 60s — a reconnect per
+/// request, and a close/reuse race that surfaces at the proxy as a 502.
+///
+/// So `KeepAliveTimeoutSeconds` owns hyper's timer (0 disables keep-alive
+/// entirely), and `HeadersTimeoutSeconds` is enforced separately, by
+/// `await_first_byte`, on a freshly accepted connection only. That bounds
+/// slowloris on new connections, which is what it was there for.
+///
+/// The trade-off: a *partial* request head that stalls mid-way on an already
+/// established keep-alive connection is bounded by `KeepAliveTimeoutSeconds`
+/// (60s), not by `HeadersTimeoutSeconds` (10s). An attacker must complete one
+/// full request before they can hold a socket for the longer window, and the
+/// concurrency cost of that is the same as any idle keep-alive connection.
 fn configure_http(builder: &mut auto::Builder<TokioExecutor>, cfg: &Config) {
-    let headers = cfg
-        .headers_timeout_secs
-        .min(cfg.keepalive_timeout_secs.max(1));
+    let keep_alive = cfg.keepalive_timeout_secs > 0;
+    // With keep-alive off there is no idle wait to bound, so the headers timeout
+    // is the only meaningful value for the single request head.
+    let idle = if keep_alive {
+        cfg.keepalive_timeout_secs
+    } else {
+        cfg.headers_timeout_secs.max(1)
+    };
     builder
         .http1()
         .timer(TokioTimer::new())
-        .keep_alive(cfg.keepalive_timeout_secs > 0)
-        .header_read_timeout(Some(Duration::from_secs(headers)));
+        .keep_alive(keep_alive)
+        // A client that pipelines back-to-back requests gets their responses
+        // coalesced into one write instead of one syscall each.
+        .pipeline_flush(true)
+        .header_read_timeout(Some(Duration::from_secs(idle)));
 }
 
 async fn shutdown_signal() {

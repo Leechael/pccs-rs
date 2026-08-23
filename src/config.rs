@@ -27,6 +27,11 @@ pub const DEFAULT_KEEPALIVE_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_UPSTREAM_MAX_CONCURRENT: usize = 64;
 /// Node `pcs_client.js` MAX_RETRY_COUNT.
 pub const DEFAULT_UPSTREAM_MAX_ATTEMPTS: u32 = 6;
+/// How long an upstream connection may sit idle in the client pool before it is
+/// dropped. Kept below the idle timeout of the peers we talk to (Intel PCS /
+/// Azure front door, and a PCCS behind Caddy, all >= 90s) so we never hand a
+/// request to a socket the far end has already closed. 0 disables pooling.
+pub const DEFAULT_UPSTREAM_POOL_IDLE_SECS: u64 = 60;
 
 pub const DEFAULT_MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
 
@@ -187,6 +192,11 @@ pub struct Cli {
     #[arg(long, env = "PCCS_UPSTREAM_MAX_ATTEMPTS")]
     pub upstream_max_attempts: Option<u32>,
 
+    /// How long an idle upstream connection is kept pooled (seconds).
+    /// 0 disables connection reuse. Default 60.
+    #[arg(long, env = "PCCS_UPSTREAM_POOL_IDLE_SECONDS")]
+    pub upstream_pool_idle_seconds: Option<u64>,
+
     /// Enable the built-in dev token hashes (SHA-512 of "user" / "admin").
     /// Local development and benchmarking only — never in production.
     #[arg(long, default_value_t = false)]
@@ -236,6 +246,8 @@ struct FileConfig {
     upstream_max_concurrent: Option<usize>,
     #[serde(rename = "UpstreamMaxAttempts")]
     upstream_max_attempts: Option<u32>,
+    #[serde(rename = "UpstreamPoolIdleSeconds")]
+    upstream_pool_idle_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +279,7 @@ pub struct Config {
     pub keepalive_timeout_secs: u64,
     pub upstream_max_concurrent: usize,
     pub upstream_max_attempts: u32,
+    pub upstream_pool_idle_secs: u64,
     /// Problems noticed while parsing config, before tracing exists. `main`
     /// logs these right after the subscriber is installed; see
     /// `parse_body_size_reporting`.
@@ -306,6 +319,7 @@ impl Default for Config {
             keepalive_timeout_secs: DEFAULT_KEEPALIVE_TIMEOUT_SECS,
             upstream_max_concurrent: DEFAULT_UPSTREAM_MAX_CONCURRENT,
             upstream_max_attempts: DEFAULT_UPSTREAM_MAX_ATTEMPTS,
+            upstream_pool_idle_secs: DEFAULT_UPSTREAM_POOL_IDLE_SECS,
             warnings: Vec::new(),
         }
     }
@@ -523,6 +537,9 @@ impl From<Cli> for Config {
         if let Some(n) = file.upstream_max_attempts {
             cfg.upstream_max_attempts = n;
         }
+        if let Some(n) = file.upstream_pool_idle_seconds {
+            cfg.upstream_pool_idle_secs = n;
+        }
 
         if let Some(h) = c.host {
             cfg.host = h;
@@ -594,6 +611,9 @@ impl From<Cli> for Config {
         }
         if let Some(n) = c.upstream_max_attempts {
             cfg.upstream_max_attempts = n;
+        }
+        if let Some(n) = c.upstream_pool_idle_seconds {
+            cfg.upstream_pool_idle_secs = n;
         }
         if c.dev_tokens {
             if cfg.user_token_hash.is_empty() {

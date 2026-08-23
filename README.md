@@ -52,6 +52,7 @@ names as Intel `service/config/default.json`, plus `DB_PATH` instead of sqlite:
   "KeepAliveTimeoutSeconds": 60,
   "UpstreamMaxConcurrent": 64,
   "UpstreamMaxAttempts": 6,
+  "UpstreamPoolIdleSeconds": 60,
   "RocksDbBlockCacheMb": 8,
   "RocksDbWriteBufferMb": 64,
   "RocksDbMaxWriteBuffers": 2,
@@ -74,7 +75,8 @@ names as Intel `service/config/default.json`, plus `DB_PATH` instead of sqlite:
   (10s for in-flight requests) and closes RocksDB.
 - Upstream requests: 120s total timeout, 10s connect timeout, 16 MiB response
   cap, at most `UpstreamMaxConcurrent` in flight, `UpstreamMaxAttempts` tries
-  (429/503 retried at most twice, honouring `Retry-After`).
+  (429/503 retried at most twice, honouring `Retry-After`). Connections are
+  pooled and reused for `UpstreamPoolIdleSeconds`.
 
 CLI overrides the file. Tokens are SHA-512 hex of the raw `user-token` /
 `admin-token` header (timing-safe compare).
@@ -132,6 +134,7 @@ CLI overrides JSON config, which overrides the built-in default.
 | `--keepalive-timeout-seconds` | `PCCS_KEEPALIVE_TIMEOUT_SECONDS` | `KeepAliveTimeoutSeconds` | 60 |
 | `--upstream-max-concurrent` | `PCCS_UPSTREAM_MAX_CONCURRENT` | `UpstreamMaxConcurrent` | 64 |
 | `--upstream-max-attempts` | `PCCS_UPSTREAM_MAX_ATTEMPTS` | `UpstreamMaxAttempts` | 6 |
+| `--upstream-pool-idle-seconds` | `PCCS_UPSTREAM_POOL_IDLE_SECONDS` | `UpstreamPoolIdleSeconds` | 60 |
 
 `RequestTimeoutSeconds` bounds **receiving** a request, matching Node's
 `server.requestTimeout` — the headers half via hyper's header read timeout, the
@@ -142,6 +145,26 @@ whole cache. Cancelling those mid-write is how a half-written platform record
 happens, so response production is left unbounded, exactly as in Node.
 
 `UpstreamMaxAttempts` mirrors Node `pcs_client.js` `MAX_RETRY_COUNT`.
+
+## Connection reuse
+
+`KeepAliveTimeoutSeconds` is how long an idle client connection is held open
+between requests — this is the value a reverse proxy in front of pccs-rs cares
+about, and it must be at least as long as the proxy's own idle timeout (Caddy
+defaults to 90s; raise `KeepAliveTimeoutSeconds` to match if you see the proxy
+reconnect on every request). `HeadersTimeoutSeconds` is separate: it bounds only
+a *freshly accepted* connection, which must send the first byte of a request
+within that window or be dropped. A partial request head that stalls on an
+already established keep-alive connection is bounded by
+`KeepAliveTimeoutSeconds` instead. On the HTTPS path `HeadersTimeoutSeconds`
+bounds the TLS handshake.
+
+Accepted sockets get `TCP_NODELAY` and 60s `SO_KEEPALIVE` probes. Upstream
+sockets get the same, plus a connection pool: up to `UpstreamMaxConcurrent` idle
+connections per host, dropped after `UpstreamPoolIdleSeconds` (default 60,
+deliberately under the idle timeout of Intel PCS and of a PCCS behind a proxy, so
+a pooled connection is never handed a request after the far end closed it). Set
+it to 0 to disable pooling.
 
 ## RocksDB key layout
 

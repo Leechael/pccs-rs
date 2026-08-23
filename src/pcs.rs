@@ -14,7 +14,7 @@ use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::{Request, Uri};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,6 +24,10 @@ use tokio::sync::Semaphore;
 /// Node `pcs_client.js` HTTP_TIMEOUT.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// TCP keepalive probes on upstream sockets: they keep NAT / load-balancer
+/// mappings alive across a quiet period and surface a peer that went away
+/// without a FIN, instead of letting a pooled connection look healthy.
+const UPSTREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 /// Largest upstream body we will buffer. Intel collateral is far below this.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// A 429/503 storm must not be amplified by the full retry budget.
@@ -107,6 +111,27 @@ impl PcsClient {
         }
         let mut http_conn = HttpConnector::new();
         http_conn.set_connect_timeout(Some(CONNECT_TIMEOUT));
+        // Collateral requests are small and latency-bound; Nagle would add up to
+        // 40ms to every request head that does not fill a segment.
+        http_conn.set_nodelay(true);
+        http_conn.set_keepalive(Some(UPSTREAM_TCP_KEEPALIVE));
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder
+            // Without a pool timer hyper-util never spawns the reaper task, so
+            // idle connections are only ever evicted when a checkout happens to
+            // look at them. With it, `pool_idle_timeout` is enforced in the
+            // background too.
+            .pool_timer(TokioTimer::new())
+            .pool_idle_timeout(Duration::from_secs(cfg.upstream_pool_idle_secs))
+            // One idle connection per in-flight slot: the semaphore already caps
+            // concurrency, so this is the most we can ever have open at once.
+            .pool_max_idle_per_host(cfg.upstream_max_concurrent.max(1))
+            // Default, kept explicit: a pooled connection the peer closed while
+            // it sat idle fails before any byte of the request was written, so
+            // replaying it is safe. Our GETs are idempotent (same request, same
+            // result); the one POST (`pckcerts` with a platform manifest) is
+            // already replayed by the retry loop in `send`.
+            .retry_canceled_requests(true);
         let https = cfg.uri.starts_with("https://") || cfg.uri.is_empty();
         let client = if https {
             http_conn.enforce_http(false);
@@ -116,9 +141,9 @@ impl PcsClient {
                 .https_or_http()
                 .enable_http1()
                 .wrap_connector(http_conn);
-            AnyClient::Https(Client::builder(TokioExecutor::new()).build(https_conn))
+            AnyClient::Https(builder.build(https_conn))
         } else {
-            AnyClient::Http(Client::builder(TokioExecutor::new()).build(http_conn))
+            AnyClient::Http(builder.build(http_conn))
         };
         Ok(Self {
             base: normalize_base(&cfg.uri),
