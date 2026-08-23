@@ -177,7 +177,9 @@ fn find_extension<'a>(buf: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
 }
 
 fn der_int(bytes: &[u8]) -> Option<u32> {
-    if bytes.is_empty() || bytes.len() > 5 {
+    // A DER INTEGER is signed: a set top bit without a leading 0x00 pad is a
+    // negative value, meaningless for a cert version or PCESVN.
+    if bytes.is_empty() || bytes.len() > 5 || bytes[0] & 0x80 != 0 {
         return None;
     }
     let mut v = 0u64;
@@ -956,8 +958,9 @@ mod tests {
     fn der_int_limits() {
         assert_eq!(der_int(&[]), None);
         assert_eq!(der_int(&[0x01]), Some(1));
-        assert_eq!(der_int(&[0xFF, 0xFF, 0xFF, 0xFF]), Some(u32::MAX));
-        // 5 bytes can still fit…
+        // DER INTEGERs are signed: 0xFFFFFFFF is -1, not u32::MAX.
+        assert_eq!(der_int(&[0xFF, 0xFF, 0xFF, 0xFF]), None);
+        // A leading 0x00 pad keeps it positive, and 5 bytes can still fit…
         assert_eq!(der_int(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF]), Some(u32::MAX));
         // …or overflow u32.
         assert_eq!(der_int(&[0x01, 0x00, 0x00, 0x00, 0x00]), None);
@@ -1005,17 +1008,24 @@ mod tests {
             },
             tcb: Tcb::new(cpusvn, pcesvn).unwrap(),
         };
-        let parsed = vec![cert("A", "02000000000000000000000000000000", 1)];
-        // Non-comparable with the bucket cert (lower cpusvn, higher pcesvn):
-        // skipped without advancing the index.
-        let candidate = cert("B", "01000000000000000000000000000000", 2);
-        assert_eq!(find_insert_index(&[0], &parsed, &candidate), -1);
-        // A candidate higher than the bucket cert inserts at 0.
-        let higher = cert("C", "03000000000000000000000000000000", 1);
-        assert_eq!(find_insert_index(&[0], &parsed, &higher), 0);
-        // …and a lower one goes past it.
-        let lower = cert("D", "01000000000000000000000000000000", 1);
-        assert_eq!(find_insert_index(&[0], &parsed, &lower), -1);
+        // Two bucket entries: A non-comparable with the candidate, C lower
+        // than it. The candidate must skip A *without advancing the index*
+        // and insert at 0, before C. An implementation that advanced the
+        // index on the non-comparable entry would answer 1 here.
+        let parsed = vec![
+            cert("A", "02000000000000000000000000000000", 3),
+            cert("C", "01000000000000000000000000000000", 1),
+        ];
+        // Non-comparable with A (higher cpusvn, lower pcesvn), above C.
+        let candidate = cert("B", "03000000000000000000000000000000", 2);
+        assert_eq!(find_insert_index(&[0, 1], &parsed, &candidate), 0);
+        // Non-comparable with every entry (higher cpusvn, lower pcesvn):
+        // never inserted (-1).
+        let non_comparable = cert("D", "03000000000000000000000000000000", 0);
+        assert_eq!(find_insert_index(&[0, 1], &parsed, &non_comparable), -1);
+        // Lower than everything comparable: goes past the end.
+        let lower = cert("E", "00000000000000000000000000000000", 0);
+        assert_eq!(find_insert_index(&[0, 1], &parsed, &lower), -1);
     }
 
     #[test]

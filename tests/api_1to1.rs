@@ -1180,60 +1180,81 @@ async fn refresh_updates_value_from_mock() {
     assert_eq!(v["signature"], "after");
 }
 
+/// Kills the child and removes its DB dir even when a test assertion panics.
+struct ServerGuard {
+    child: std::process::Child,
+    db: std::path::PathBuf,
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.db);
+    }
+}
+
+/// Spawns pccs-rs on a free port and waits until it answers. A bind-release
+/// port can be stolen between the probe and the server's own bind, so an
+/// early exit is retried with a fresh port.
+async fn spawn_server() -> Option<(ServerGuard, String)> {
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<http_body_util::Empty<bytes::Bytes>>();
+    for _ in 0..3 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let db = std::env::temp_dir().join(format!("pccs-rs-e2e-{}", uuid::Uuid::new_v4()));
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_pccs-rs"))
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--db-path",
+                db.to_str().unwrap(),
+                "--dev-tokens",
+                "--no-seed",
+                "--cache-mode",
+                "offline",
+            ])
+            .env("PCCS_URI", "") // no upstream: pure OFFLINE-style serving
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn pccs-rs");
+        let mut guard = ServerGuard { child, db };
+        let url = format!("http://127.0.0.1:{port}");
+        for _ in 0..100 {
+            if guard.child.try_wait().unwrap().is_some() {
+                break; // died before serving (e.g. lost the port race): retry
+            }
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("{url}/no/such/route"))
+                .body(http_body_util::Empty::<bytes::Bytes>::new())
+                .unwrap();
+            if let Ok(resp) = client.request(req).await {
+                // Even the 404 fallback carries a Request-ID: the app is up.
+                if resp.headers().get(headers::REQUEST_ID).is_some() {
+                    return Some((guard, url));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    None
+}
+
 /// End-to-end: the real binary serves the seeded cache over plain HTTP, the
 /// load generator runs against it, and SIGTERM shuts it down cleanly.
 #[tokio::test]
 async fn binary_serves_seeded_cache_and_shuts_down_on_sigterm() {
-    // A free port: bind, release, reuse.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let db = std::env::temp_dir().join(format!("pccs-rs-e2e-{}", uuid::Uuid::new_v4()));
-    let mut server = std::process::Command::new(env!("CARGO_BIN_EXE_pccs-rs"))
-        .args([
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--db-path",
-            db.to_str().unwrap(),
-            "--dev-tokens",
-            "--no-seed",
-        ])
-        .env("PCCS_URI", "") // no upstream: pure OFFLINE-style serving
-        .arg("--cache-mode")
-        .arg("offline")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn pccs-rs");
-
-    // Wait until the port answers (or the server died).
-    let url = format!("http://127.0.0.1:{port}");
+    let (mut guard, url) = spawn_server().await.expect("pccs-rs never came up");
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .build_http::<http_body_util::Empty<bytes::Bytes>>();
-    let mut up = false;
-    for _ in 0..100 {
-        if server.try_wait().unwrap().is_some() {
-            panic!("pccs-rs exited before serving");
-        }
-        let req = Request::builder()
-            .method("GET")
-            .uri(format!("{url}/no/such/route"))
-            .body(http_body_util::Empty::<bytes::Bytes>::new())
-            .unwrap();
-        if let Ok(resp) = client.request(req).await {
-            // Even the 404 fallback carries a Request-ID: the app is up.
-            if resp.headers().get(headers::REQUEST_ID).is_some() {
-                up = true;
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(up, "pccs-rs never came up");
 
     // A cache miss in OFFLINE mode is a 404 with the Node body.
     let req = Request::builder()
@@ -1267,15 +1288,16 @@ async fn binary_serves_seeded_cache_and_shuts_down_on_sigterm() {
     assert!(stdout.contains("rps:"), "{stdout}");
     assert!(stdout.contains("p99_ms:"), "{stdout}");
 
-    // SIGTERM → graceful shutdown, exit code 0.
+    // SIGTERM → graceful shutdown, exit code 0. (The guard still kills and
+    // cleans up if any assertion above panicked.)
     let status = std::process::Command::new("kill")
-        .args(["-TERM", &server.id().to_string()])
+        .args(["-TERM", &guard.child.id().to_string()])
         .status()
         .unwrap();
     assert!(status.success());
     let waited = tokio::time::timeout(std::time::Duration::from_secs(15), async move {
         loop {
-            if let Some(status) = server.try_wait().unwrap() {
+            if let Some(status) = guard.child.try_wait().unwrap() {
                 break status;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1284,7 +1306,6 @@ async fn binary_serves_seeded_cache_and_shuts_down_on_sigterm() {
     .await
     .expect("server did not exit after SIGTERM");
     assert!(waited.success(), "graceful shutdown must exit 0: {waited}");
-    let _ = std::fs::remove_dir_all(&db);
 }
 
 #[tokio::test]

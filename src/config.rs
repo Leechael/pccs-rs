@@ -633,6 +633,16 @@ impl From<Cli> for Config {
 mod tests {
     use super::*;
 
+    /// `Cli` reads `PCCS_*` env vars for any flag not given inline; drop them
+    /// so the process environment cannot leak into these tests.
+    fn clear_pccs_env() {
+        for (key, _) in std::env::vars() {
+            if key.starts_with("PCCS_") {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
     #[test]
     fn rocksdb_opts_presets_differ() {
         let default = RocksDbOpts::default();
@@ -767,6 +777,7 @@ mod tests {
 
     #[test]
     fn file_then_cli_precedence() {
+        clear_pccs_env();
         let dir = std::env::temp_dir().join(format!("pccs-rs-cfg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
@@ -898,6 +909,7 @@ mod tests {
 
     #[test]
     fn http_flag_and_dev_tokens() {
+        clear_pccs_env();
         let cli = Cli::parse_from(["pccs-rs", "--http", "--dev-tokens"]);
         let cfg = Config::from(cli);
         assert!(cfg.http);
@@ -919,6 +931,7 @@ mod tests {
 
     #[test]
     fn bad_max_body_warns_instead_of_panicking() {
+        clear_pccs_env();
         let cli = Cli::parse_from(["pccs-rs", "--max-body-size", "huge"]);
         let cfg = Config::from(cli);
         assert_eq!(cfg.max_body_size, DEFAULT_MAX_BODY_SIZE);
@@ -928,6 +941,7 @@ mod tests {
 
     #[test]
     fn file_and_cli_override_rocksdb_knobs() {
+        clear_pccs_env();
         let json = r#"{
             "RocksDbBlockCacheMb": 2,
             "RocksDbWriteBufferMb": 8,

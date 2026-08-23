@@ -1392,9 +1392,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn temp_store() -> Store {
+    /// Removes the RocksDB directory once the store is dropped.
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Bind as `let (_dir, s) = temp_store();` — locals drop in reverse
+    /// declaration order, so the store closes before the directory is removed.
+    fn temp_store() -> (TestDir, Store) {
         let dir = std::env::temp_dir().join(format!("pccs-rs-store-{}", uuid::Uuid::new_v4()));
-        Store::open(&dir, CacheMode::Lazy, &RocksDbOpts::default()).expect("temp store")
+        let store = Store::open(&dir, CacheMode::Lazy, &RocksDbOpts::default()).expect("temp store");
+        (TestDir(dir), store)
     }
 
     fn pckcert_rec(qeid: &str) -> PckCertRecord {
@@ -1415,7 +1427,7 @@ mod tests {
 
     #[test]
     fn counters_count() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         s.record_hit();
         s.record_hit();
         s.record_miss();
@@ -1427,7 +1439,7 @@ mod tests {
 
     #[test]
     fn pckcert_round_trip_and_key_mismatch_is_a_miss() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         let rec = pckcert_rec("QEID1");
         s.put_pckcert(&rec).unwrap();
         // Case-insensitive on every field, like Node's SQL.
@@ -1446,7 +1458,7 @@ mod tests {
 
     #[test]
     fn platform_pool_lifecycle() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         assert!(!s.has_platform("QE", "0001"));
         assert!(s.get_platform_pool("QE", "0001").is_none());
         // upsert / remove on an unknown platform are no-ops, not errors.
@@ -1507,7 +1519,7 @@ mod tests {
 
     #[test]
     fn cached_platforms_by_fmspc_filters_and_expands_raw_tcbs() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         let pool = PlatformPool {
             qe_id: "QE".into(),
             pce_id: "0001".into(),
@@ -1545,7 +1557,7 @@ mod tests {
 
     #[test]
     fn tcb_identity_crl_round_trips_and_mismatches() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         s.put_tcb(&tcb_rec(4, "STANDARD")).unwrap();
         assert!(s.get_tcb(0, "00906ea10000", 4, UpdateType::Standard).is_some());
         // Version / update / prod type are part of the identity of a record.
@@ -1610,7 +1622,7 @@ mod tests {
 
     #[test]
     fn registration_queue_normalises_takes_and_deletes() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         s.register_platform(reg("qe-lowercase", 0)).unwrap();
         s.register_platform(reg("QE2", 1)).unwrap();
 
@@ -1635,7 +1647,7 @@ mod tests {
 
     #[test]
     fn appraisal_defaults_join_and_404_when_absent() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         assert!(s.get_default_policies("ABCDABCDABCD").is_err());
         // No default policy for the fmspc is also a 404.
         s.upsert_appraisal_policy_raw("ABCDABCDABCD", "p.nondefault", false);
@@ -1654,7 +1666,7 @@ mod tests {
 
     #[test]
     fn seed_value_loads_every_section() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         s.load_seed_value(&serde_json::json!({
             "tcbinfo": [{
                 "prod_type": "tdx", "fmspc": "00a067110000", "version": 4,
@@ -1683,7 +1695,7 @@ mod tests {
 
     #[test]
     fn seed_platform_merges_without_overwriting_cert_fields() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         // A seeded cert establishes the pool first…
         s.load_seed_value(&serde_json::json!({
             "pckcerts": [{
@@ -1750,7 +1762,7 @@ mod tests {
 
     #[test]
     fn put_platform_collateral_v3_stores_every_collateral_kind() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         let qeid = "33333333333333333333333333333333";
         let body = serde_json::json!({
             "platforms": [{
@@ -1821,7 +1833,7 @@ mod tests {
 
     #[test]
     fn put_platform_collateral_rejects_broken_inputs() {
-        let s = temp_store();
+        let (_dir, s) = temp_store();
         let base = serde_json::json!({
             "platforms": [{
                 "qe_id": "QE", "pce_id": PCEID,

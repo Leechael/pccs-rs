@@ -865,7 +865,8 @@ mod tests {
             platforms_source(Some("reg_na")).unwrap(),
             PlatformsSource::RegNa
         ));
-        // Empty list is allowed and matches nothing downstream.
+        // Empty list is allowed; downstream an empty filter matches every
+        // cached platform (cached_platforms_by_fmspc skips the fmspc check).
         match platforms_source(Some("[]")).unwrap() {
             PlatformsSource::Fmspc(v) => assert!(v.is_empty()),
             _ => panic!("[] must be an fmspc list"),

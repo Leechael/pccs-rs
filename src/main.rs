@@ -382,6 +382,42 @@ fn spawn_refresh_scheduler(
 mod tests {
     use super::*;
 
+    /// Process-global log capture: tracing allows one global subscriber, so
+    /// every test in this binary shares the buffer and asserts with `contains`.
+    fn captured_logs() -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        use std::sync::{Mutex, OnceLock};
+        static LOGS: OnceLock<std::sync::Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+        LOGS.get_or_init(|| {
+            let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+            struct Writer(std::sync::Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for Writer {
+                fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(data);
+                    Ok(data.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl tracing_subscriber::fmt::MakeWriter<'_> for Writer {
+                type Writer = Self;
+                fn make_writer(&self) -> Self::Writer {
+                    Writer(self.0.clone())
+                }
+            }
+            let _ = tracing_subscriber::fmt()
+                .with_writer(Writer(buf.clone()))
+                .with_ansi(false)
+                .try_init();
+            buf
+        })
+        .clone()
+    }
+
+    fn logs_contain(buf: &std::sync::Mutex<Vec<u8>>, needle: &str) -> bool {
+        String::from_utf8_lossy(&buf.lock().unwrap()).contains(needle)
+    }
+
     #[test]
     fn resolve_bind_addr_accepts_hosts_and_ips() {
         let addr = resolve_bind_addr("127.0.0.1:8081");
@@ -400,21 +436,40 @@ mod tests {
     }
 
     #[test]
-    fn warn_helpers_only_log() {
+    fn warn_helpers_log_exactly_when_they_should() {
+        let logs = captured_logs();
         let mut cfg = Config::default();
         warn_on_dev_tokens(&cfg);
+        assert!(
+            !logs_contain(&logs, "dev token"),
+            "no dev tokens configured: no warning"
+        );
         cfg.user_token_hash = DEFAULT_USER_TOKEN_HASH.into();
         warn_on_dev_tokens(&cfg);
+        assert!(logs_contain(&logs, "built-in dev token hashes are in use"));
 
         // No URI host at all: nothing to compare.
         cfg.uri = String::new();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        assert!(
+            !logs_contain(&logs, "looks like this service"),
+            "empty upstream must not warn"
+        );
         // Upstream on this very address: warns.
         cfg.uri = "http://127.0.0.1:8081/sgx/certification/v4/".into();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
-        // Unresolvable upstream host: no warning, no panic.
+        assert!(logs_contain(&logs, "looks like this service"));
+        // Unresolvable upstream host: no warning, no panic. (Count, not
+        // buffer length: tests in this binary share one log stream.)
+        let count = |logs: &std::sync::Mutex<Vec<u8>>| {
+            String::from_utf8_lossy(&logs.lock().unwrap())
+                .matches("looks like this service")
+                .count()
+        };
+        let before = count(&logs);
         cfg.uri = "https://nonexistent.invalid/sgx/".into();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        assert_eq!(count(&logs), before, "no new self-upstream warning");
     }
 
     #[tokio::test]
@@ -467,13 +522,26 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_refresh_schedule_falls_back_to_the_default() {
+        let logs = captured_logs();
         let cfg = Config::test_default();
         let cache = pccs_rs::cache::build_cache(&cfg).unwrap();
-        // An unparseable schedule must not kill the task; it still computes a
-        // next run from the daily-01:00 default.
         let handle = spawn_refresh_scheduler(cache, "not a cron".to_string());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!handle.is_finished());
+        // The fallback logs both the parse failure and the next run computed
+        // from the daily-01:00 default.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if logs_contain(&logs, "invalid RefreshSchedule")
+                    && logs_contain(&logs, "using daily 01:00")
+                    && logs_contain(&logs, "next scheduled refresh at")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("scheduler never logged the fallback");
+        assert!(!handle.is_finished(), "the task keeps scheduling");
         handle.abort();
     }
 }

@@ -1026,21 +1026,14 @@ mod tests {
 
     #[test]
     fn miss_v3_is_eol_only_in_lazy_mode() {
-        let cache = |mode: CacheMode| {
-            let dir =
-                std::env::temp_dir().join(format!("pccs-rs-cache-{}", uuid::Uuid::new_v4()));
-            let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
-            let cfg = Config {
-                uri: String::new(),
-                cache_mode: mode,
-                ..Config::default()
-            };
-            let pcs = PcsClient::new(&cfg).unwrap();
-            Cache::new(store, pcs, &cfg)
-        };
-        assert_err(&cache(CacheMode::Lazy).miss_v3(3), &error::PCS_V3_REACHED_EOL);
-        assert_err(&cache(CacheMode::Lazy).miss_v3(4), &error::NO_CACHE_DATA);
-        assert_err(&cache(CacheMode::Offline).miss_v3(3), &error::NO_CACHE_DATA);
+        for (mode, version, want) in [
+            (CacheMode::Lazy, 3, error::PCS_V3_REACHED_EOL),
+            (CacheMode::Lazy, 4, error::NO_CACHE_DATA),
+            (CacheMode::Offline, 3, error::NO_CACHE_DATA),
+        ] {
+            let (_dir, cache) = cache_with("", mode);
+            assert_err(&cache.miss_v3(version), &want);
+        }
     }
 
     #[test]
@@ -1061,7 +1054,18 @@ mod tests {
         assert_eq!((got.status, got.message), (want.status, want.message));
     }
 
-    fn cache_with(base: &str, mode: CacheMode) -> Arc<Cache> {
+    /// Removes the RocksDB directory once the cache is dropped.
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Bind as `let (_dir, cache) = cache_with(..);` — locals drop in reverse
+    /// declaration order, so the cache closes before the directory is removed.
+    fn cache_with(base: &str, mode: CacheMode) -> (TestDir, Arc<Cache>) {
         let dir = std::env::temp_dir().join(format!("pccs-rs-cache-{}", uuid::Uuid::new_v4()));
         let cfg = Config {
             uri: base.into(),
@@ -1072,7 +1076,7 @@ mod tests {
         };
         let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
         let pcs = PcsClient::new(&cfg).unwrap();
-        Arc::new(Cache::new(store, pcs, &cfg))
+        (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
     }
 
     async fn spawn(app: axum::Router) -> String {
@@ -1223,7 +1227,7 @@ mod tests {
     async fn lazy_register_fills_cert_and_qv_collateral() {
         let calls = Arc::new(AtomicU64::new(0));
         let base = spawn_pccs(calls.clone()).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
 
         cache
             .register_platform(platform("QE1"), UpdateType::All)
@@ -1252,13 +1256,14 @@ mod tests {
         assert!(cache.store.get_rootcacrl().is_some());
 
         // A second registration of the same platform is a cache hit: no new
-        // upstream calls at all.
-        let before = cache.store.upstream_fetches.load(Ordering::Relaxed);
+        // upstream calls at all. (The mock's counter, not `upstream_fetches`
+        // — the direct QV-collateral fetches bypass that metric.)
+        let before = calls.load(Ordering::Relaxed);
         cache
             .register_platform(platform("QE1"), UpdateType::Standard)
             .await
             .unwrap();
-        assert_eq!(cache.store.upstream_fetches.load(Ordering::Relaxed), before);
+        assert_eq!(calls.load(Ordering::Relaxed), before);
     }
 
     #[tokio::test]
@@ -1269,7 +1274,7 @@ mod tests {
             get(|| async { axum::http::StatusCode::NOT_FOUND }),
         );
         let base = spawn(app).await;
-        let cache = cache_with(&base, CacheMode::Req);
+        let (_dir, cache) = cache_with(&base, CacheMode::Req);
 
         let err = cache
             .register_platform(platform("QE2"), UpdateType::Standard)
@@ -1286,7 +1291,7 @@ mod tests {
     async fn lazy_pckcert_without_ppid_or_manifest_is_a_400() {
         let calls = Arc::new(AtomicU64::new(0));
         let base = spawn_pccs(calls.clone()).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
         let err = cache
             .get_pckcert("QE9", &"AB".repeat(16), "00FF", "0001", None, 4)
             .await
@@ -1298,7 +1303,7 @@ mod tests {
     #[tokio::test]
     async fn offline_and_req_pckcert_miss_is_platform_unknown() {
         for mode in [CacheMode::Offline, CacheMode::Req] {
-            let cache = cache_with("", mode);
+            let (_dir, cache) = cache_with("", mode);
             let err = cache
                 .get_pckcert("QE9", &"AB".repeat(16), "00FF", "0001", None, 4)
                 .await
@@ -1324,7 +1329,7 @@ mod tests {
             }),
         );
         let base = spawn(app).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
 
         let rec = cache.get_pckcrl("PROCESSOR", 4).await.unwrap();
         assert_eq!(rec.pckcrl, vec![0x30]);
@@ -1337,7 +1342,7 @@ mod tests {
     async fn rootcacrl_and_crl_fill_through_cache() {
         let calls = Arc::new(AtomicU64::new(0));
         let base = spawn_pccs(calls.clone()).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
 
         // PCCS upstream: {base}rootcacrl, cached after the first fetch.
         let crl_calls = calls.load(Ordering::Relaxed);
@@ -1348,7 +1353,7 @@ mod tests {
 
         // A v3 *miss* is EOL, never a network call (a cached record is still
         // served — the store hit above comes first, as in Node).
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
         let err = cache.get_rootcacrl(3).await.unwrap_err();
         assert_err(&err, &error::PCS_V3_REACHED_EOL);
     }
@@ -1369,7 +1374,7 @@ mod tests {
             }),
         );
         let base = spawn(app).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
         // `get_crl` takes the URI verbatim; the handler layer is what
         // restricts it to Intel hosts.
         let host = base.trim_end_matches("/sgx/certification/v4/");
@@ -1385,31 +1390,37 @@ mod tests {
         use axum::routing::get;
         let calls = Arc::new(AtomicU64::new(0));
         let c = calls.clone();
+        // Slow enough that the second request is genuinely queued behind the
+        // first one's key lock when the failure lands.
         let app = axum::Router::new().route(
             "/sgx/certification/v4/tcb",
             get(move || {
                 let c = c.clone();
                 async move {
                     c.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR
                 }
             }),
         );
         let base = spawn(app).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
 
-        let err = cache
+        let first = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
+        });
+        // Let the first request take the key lock and reach the upstream.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = cache
             .get_tcb(0, "00A067110000", 4, UpdateType::Standard)
-            .await
-            .unwrap_err();
-        assert_err(&err, &error::NO_CACHE_DATA);
-        // Within FAILURE_TTL the sibling gets the same error without a
-        // second upstream call.
-        let err = cache
-            .get_tcb(0, "00A067110000", 4, UpdateType::Standard)
-            .await
-            .unwrap_err();
-        assert_err(&err, &error::NO_CACHE_DATA);
+            .await;
+        let first = first.await.unwrap();
+
+        assert_err(&first.unwrap_err(), &error::NO_CACHE_DATA);
+        // The waiter was queued behind the failing fetch and reuses its error
+        // instead of issuing a second upstream call.
+        assert_err(&second.unwrap_err(), &error::NO_CACHE_DATA);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
@@ -1417,7 +1428,7 @@ mod tests {
     async fn refresh_certs_pccs_refetches_every_known_raw_tcb() {
         let calls = Arc::new(AtomicU64::new(0));
         let base = spawn_pccs(calls.clone()).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
 
         let mut pool = crate::store::PlatformPool {
             qe_id: "QE3".into(),
@@ -1465,7 +1476,7 @@ mod tests {
             get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
         );
         let base = spawn(app).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
         cache
             .store
             .put_pckcrl(&PckCrlRecord {
@@ -1486,7 +1497,7 @@ mod tests {
             get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
         );
         let base = spawn(app).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
         cache.store.put_rootcacrl(&[1]).unwrap();
         let err = cache.refresh(None, None).await.unwrap_err();
         assert_err(&err, &error::INTERNAL_ERROR);
@@ -1494,14 +1505,14 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_without_upstream_is_a_noop() {
-        let cache = cache_with("", CacheMode::Lazy);
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
         cache.refresh(None, None).await.unwrap();
         cache.refresh(Some("certs"), Some("00A067110000")).await.unwrap();
     }
 
     #[tokio::test]
     async fn process_not_available_queues_na_rows_in_req_mode() {
-        let cache = cache_with("", CacheMode::Req);
+        let (_dir, cache) = cache_with("", CacheMode::Req);
         let mut tcb = serde_json::Map::new();
         for i in 1..=16u32 {
             tcb.insert(format!("sgxtcbcomp{i:02}svn"), serde_json::json!(i));
@@ -1531,7 +1542,7 @@ mod tests {
         assert_eq!(queued[0].state, PLATF_REG_NOT_AVAILABLE);
 
         // LAZY / OFFLINE never queue these rows.
-        let cache = cache_with("", CacheMode::Lazy);
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
         cache
             .process_not_available("QE4", "0001", "PP", "", &resp)
             .unwrap();
@@ -1628,7 +1639,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
     #[tokio::test]
     async fn lazy_pckcert_with_manifest_fills_via_pckcerts_post() {
         let base = spawn_intel_pckcerts_mock(false).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
         // A platform known only by its manifest; the local pool has no certs,
         // so selection fails and LAZY falls back to the upstream.
         cache
@@ -1663,7 +1674,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
     #[tokio::test]
     async fn lazy_fill_with_not_available_levels_forgets_the_raw_tcb() {
         let base = spawn_intel_pckcerts_mock(true).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
         cache
             .store
             .put_platform_pool(&crate::store::PlatformPool {
@@ -1689,7 +1700,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
     async fn req_register_success_clears_the_queue_row() {
         let calls = Arc::new(AtomicU64::new(0));
         let base = spawn_pccs(calls.clone()).await;
-        let cache = cache_with(&base, CacheMode::Req);
+        let (_dir, cache) = cache_with(&base, CacheMode::Req);
         cache
             .register_platform(platform("QER"), UpdateType::Standard)
             .await
@@ -1711,7 +1722,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             get(|| async { axum::http::StatusCode::NOT_FOUND }),
         );
         let base = spawn(app).await;
-        let cache = cache_with(&base, CacheMode::Req);
+        let (_dir, cache) = cache_with(&base, CacheMode::Req);
         let resp = PckCertsResponse {
             certs: vec![("TM".into(), "cert-pem".into())],
             not_available: Vec::new(),
@@ -1743,7 +1754,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
                 }),
             );
         let base = spawn(app).await;
-        let cache = cache_with(&base, CacheMode::Lazy);
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
         cache
             .store
             .put_identity(&IdentityRecord {
@@ -1766,7 +1777,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
 
     #[tokio::test]
     async fn v3_and_non_lazy_short_circuits() {
-        let cache = cache_with("", CacheMode::Req);
+        let (_dir, cache) = cache_with("", CacheMode::Req);
         let err = cache
             .get_identity(1, 4, UpdateType::Standard)
             .await
@@ -1777,7 +1788,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
         let err = cache.get_crl("https://x/y.crl", 4).await.unwrap_err();
         assert_err(&err, &error::NO_CACHE_DATA);
 
-        let cache = cache_with("", CacheMode::Lazy);
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
         let err = cache
             .get_identity(1, 3, UpdateType::Standard)
             .await
@@ -1804,7 +1815,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             }),
         );
         let base = spawn(app).await;
-        let cache = cache_with(&base, CacheMode::Req);
+        let (_dir, cache) = cache_with(&base, CacheMode::Req);
         let resp = PckCertsResponse {
             certs: vec![("TM".into(), "cert-pem".into())],
             not_available: Vec::new(),
