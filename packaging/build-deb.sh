@@ -45,6 +45,10 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$VERSION" && -n "$BINARY" ]] || usage
 [[ -f "$BINARY" ]] || { echo "binary not found: $BINARY" >&2; exit 1; }
+if [[ ! "$VERSION" =~ ^[0-9][A-Za-z0-9.+~-]*$ ]]; then
+  echo "invalid Debian package version: $VERSION" >&2
+  exit 1
+fi
 
 PKG="pccs-rs_${VERSION}_${ARCH}"
 STAGE="$(mktemp -d)"
@@ -90,6 +94,9 @@ cat > "$DEB/DEBIAN/postinst" <<'EOF'
 set -e
 if [ "$1" = "configure" ] && command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload >/dev/null 2>&1 || true
+  if systemctl is-active --quiet pccs-rs.service; then
+    systemctl restart pccs-rs.service >/dev/null 2>&1 || true
+  fi
 fi
 exit 0
 EOF
@@ -110,7 +117,7 @@ cat > "$DEB/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
 if [ "$1" = "purge" ]; then
-  rm -rf /var/lib/pccs-rs
+  rm -rf /var/lib/pccs-rs /var/lib/private/pccs-rs
 fi
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload >/dev/null 2>&1 || true

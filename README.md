@@ -57,7 +57,7 @@ when that name resolves back here): every cache miss would then call back into
 pccs-rs and recurse. Startup logs a warning when the `uri` host looks like the
 address we bind.
 
-Direct TLS is also supported: `--https --cert certs/file.crt --key certs/private.pem`.
+Direct TLS is also supported: `pccs-rs serve --https --cert certs/file.crt --key certs/private.pem`.
 
 ## Configuration
 
@@ -80,7 +80,7 @@ db_path = "/var/lib/pccs-rs"
 # key = "certs/private.pem"
 # cache_mode = "lazy" # lazy | offline | req
 # uri = "https://api.trustedservices.intel.com/sgx/certification/v4/"
-# proxy = ""
+# proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
 # user_token_hash = ""
 # admin_token_hash = ""
@@ -299,7 +299,7 @@ compare summary: [`docs/compare-results.md`](docs/compare-results.md).
 
 ### RocksDB memory flags
 
-All four knobs are runtime-configurable (CLI overrides JSON / env). Applied in
+All four knobs are runtime-configurable (CLI overrides TOML / env). Applied in
 `Store::open` via `Options` + `BlockBasedOptions` (zstd stays on).
 
 | CLI | env | TOML | default |
