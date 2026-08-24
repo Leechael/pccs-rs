@@ -1,0 +1,21 @@
+[Unit]
+Description=pccs-rs Provisioning Certificate Caching Service
+Documentation=https://github.com/Leechael/pccs-rs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pccs-rs serve --config /etc/pccs-rs/config.toml
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+StateDirectory=pccs-rs
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

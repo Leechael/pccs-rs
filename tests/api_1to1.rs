@@ -1209,6 +1209,7 @@ async fn spawn_server() -> Option<(ServerGuard, String)> {
         let db = std::env::temp_dir().join(format!("pccs-rs-e2e-{}", uuid::Uuid::new_v4()));
         let child = std::process::Command::new(env!("CARGO_BIN_EXE_pccs-rs"))
             .args([
+                "serve",
                 "--host",
                 "127.0.0.1",
                 "--port",

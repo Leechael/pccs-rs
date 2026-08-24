@@ -1,8 +1,9 @@
-//! File + CLI config. Mirrors Node `service/config/default.json` fields that matter.
+//! File + CLI config. Serve reads TOML; `config import` maps Node `pccs.json`.
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use toml_edit::{value, DocumentMut};
 
 /// SHA-512("user") — **dev / bench / tests only**, never a production default.
 pub const DEFAULT_USER_TOKEN: &str = "user";
@@ -17,6 +18,9 @@ pub const DEFAULT_ADMIN_TOKEN_HASH: &str =
 /// Intel PCS, same as Node `service/config/default.json`.
 pub const DEFAULT_URI: &str = "https://api.trustedservices.intel.com/sgx/certification/v4/";
 pub const DEFAULT_REFRESH: &str = "0 0 1 * * *";
+
+/// Packaged default path. systemd always passes `--config` pointing here.
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/pccs-rs/config.toml";
 
 /// Node `pccs_server.js` server timeouts.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
@@ -34,6 +38,8 @@ pub const DEFAULT_UPSTREAM_MAX_ATTEMPTS: u32 = 6;
 pub const DEFAULT_UPSTREAM_POOL_IDLE_SECS: u64 = 60;
 
 pub const DEFAULT_MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
+
+const DEFAULT_CONFIG_TOML: &str = include_str!("../packaging/config.toml");
 
 /// RocksDB memory knobs. Defaults match stock RocksDB (8 MiB LRU, 64 MiB write buffer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +103,38 @@ impl CacheMode {
     about = "Rust PCCS — Intel PCCS replacement (RocksDB, Caddy-friendly HTTP)"
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Start the PCCS HTTP server
+    Serve(ServeArgs),
+    /// Convert or update configuration files
+    Config(ConfigCmd),
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct ConfigCmd {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ConfigCommand {
+    /// Read a Node PCCS JSON config and write or update a TOML config
+    Import {
+        /// Path to pccs.json / default.json
+        from: PathBuf,
+        /// Destination TOML path
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        to: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct ServeArgs {
     #[arg(long, env = "PCCS_CONFIG")]
     pub config: Option<PathBuf>,
 
@@ -203,9 +241,10 @@ pub struct Cli {
     pub dev_tokens: bool,
 }
 
+/// Node `service/config/default.json` / `pccs.json` field names.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-struct FileConfig {
+struct JsonConfig {
     #[serde(rename = "HTTPS_PORT")]
     https_port: Option<u16>,
     #[serde(rename = "hosts")]
@@ -247,6 +286,36 @@ struct FileConfig {
     #[serde(rename = "UpstreamMaxAttempts")]
     upstream_max_attempts: Option<u32>,
     #[serde(rename = "UpstreamPoolIdleSeconds")]
+    upstream_pool_idle_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct TomlConfig {
+    host: Option<String>,
+    port: Option<u16>,
+    https: Option<bool>,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    cache_mode: Option<String>,
+    user_token_hash: Option<String>,
+    admin_token_hash: Option<String>,
+    uri: Option<String>,
+    api_key: Option<String>,
+    proxy: Option<String>,
+    refresh_schedule: Option<String>,
+    db_path: Option<PathBuf>,
+    log_level: Option<String>,
+    max_request_body_size: Option<String>,
+    rocksdb_block_cache_mb: Option<usize>,
+    rocksdb_write_buffer_mb: Option<usize>,
+    rocksdb_max_write_buffers: Option<i32>,
+    rocksdb_max_open_files: Option<i32>,
+    request_timeout_seconds: Option<u64>,
+    headers_timeout_seconds: Option<u64>,
+    keepalive_timeout_seconds: Option<u64>,
+    upstream_max_concurrent: Option<usize>,
+    upstream_max_attempts: Option<u32>,
     upstream_pool_idle_seconds: Option<u64>,
 }
 
@@ -391,6 +460,24 @@ impl Config {
             max_open_files: self.max_open_files,
         }
     }
+
+    /// `implicit_config` is loaded when `--config` / `PCCS_CONFIG` is unset
+    /// and that path exists. Tests pass `None` so a machine-local
+    /// `/etc/pccs-rs/config.toml` cannot leak into them.
+    pub fn from_serve_args(c: ServeArgs, implicit_config: Option<&Path>) -> Self {
+        let path = match c.config.as_deref() {
+            Some(p) => Some(p.to_path_buf()),
+            None => implicit_config
+                .filter(|p| p.is_file())
+                .map(Path::to_path_buf),
+        };
+        let file = path.as_deref().map(load_toml).unwrap_or_default();
+
+        let mut cfg = Config::default();
+        apply_toml(&mut cfg, file);
+        apply_cli(&mut cfg, c);
+        cfg
+    }
 }
 
 /// `128` lowercase/uppercase hex characters, like Node's `SHA512_HEX_REGEX`.
@@ -458,183 +545,311 @@ fn try_parse_body_size(s: &str) -> Option<usize> {
 
 /// A config file that was named but cannot be read or parsed is fatal: silently
 /// running on built-in defaults would hide a wrong `uri` or missing token hash.
-fn load_file(path: &std::path::Path) -> FileConfig {
+fn load_toml(path: &Path) -> TomlConfig {
     let s = std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("config file {}: {e}", path.display());
         std::process::exit(1);
     });
-    serde_json::from_str(&s).unwrap_or_else(|e| {
-        eprintln!("config file {}: invalid JSON: {e}", path.display());
+    toml::from_str(&s).unwrap_or_else(|e| {
+        eprintln!("config file {}: invalid TOML: {e}", path.display());
         std::process::exit(1);
     })
 }
 
-impl From<Cli> for Config {
-    fn from(c: Cli) -> Self {
-        let file = c.config.as_deref().map(load_file).unwrap_or_default();
-
-        let mut cfg = Config::default();
-        if let Some(h) = file.hosts {
-            cfg.host = h;
-        }
-        if let Some(p) = file.https_port {
-            cfg.port = p;
-        }
-        if let Some(u) = file.uri {
-            cfg.uri = u;
-        }
-        if let Some(k) = file.api_key {
-            cfg.api_key = k;
-        }
-        if let Some(p) = file.proxy {
-            cfg.proxy = p;
-        }
-        if let Some(s) = file.refresh_schedule {
-            cfg.refresh_schedule = s;
-        }
-        if let Some(h) = file.user_token_hash.filter(|s| !s.is_empty()) {
-            cfg.user_token_hash = h;
-        }
-        if let Some(h) = file.admin_token_hash.filter(|s| !s.is_empty()) {
-            cfg.admin_token_hash = h;
-        }
-        if let Some(m) = file.caching_fill_mode.as_deref().and_then(CacheMode::parse) {
-            cfg.cache_mode = m;
-        }
-        if let Some(l) = file.log_level {
-            cfg.log_level = l;
-        }
-        if let Some(p) = file.db_path {
-            cfg.db_path = p;
-        }
-        if let Some(s) = file.max_request_body_size {
-            cfg.max_body_size = parse_body_size_reporting(&s, &mut cfg.warnings);
-        }
-        if let Some(n) = file.block_cache_mb {
-            cfg.block_cache_mb = n;
-        }
-        if let Some(n) = file.write_buffer_mb {
-            cfg.write_buffer_mb = n;
-        }
-        if let Some(n) = file.max_write_buffers {
-            cfg.max_write_buffers = n;
-        }
-        if let Some(n) = file.max_open_files {
-            cfg.max_open_files = n;
-        }
-        if let Some(n) = file.request_timeout_seconds {
-            cfg.request_timeout_secs = n;
-        }
-        if let Some(n) = file.headers_timeout_seconds {
-            cfg.headers_timeout_secs = n;
-        }
-        if let Some(n) = file.keepalive_timeout_seconds {
-            cfg.keepalive_timeout_secs = n;
-        }
-        if let Some(n) = file.upstream_max_concurrent {
-            cfg.upstream_max_concurrent = n;
-        }
-        if let Some(n) = file.upstream_max_attempts {
-            cfg.upstream_max_attempts = n;
-        }
-        if let Some(n) = file.upstream_pool_idle_seconds {
-            cfg.upstream_pool_idle_secs = n;
-        }
-
-        if let Some(h) = c.host {
-            cfg.host = h;
-        }
-        if let Some(p) = c.port {
-            cfg.port = p;
-        }
-        cfg.https = c.https;
-        cfg.http = c.http || !c.https;
-        if let Some(p) = c.cert {
-            cfg.cert = p;
-        }
-        if let Some(p) = c.key {
-            cfg.key = p;
-        }
-        if let Some(m) = c.cache_mode {
-            cfg.cache_mode = m;
-        }
-        if let Some(h) = c.user_token_hash {
-            cfg.user_token_hash = h;
-        }
-        if let Some(h) = c.admin_token_hash {
-            cfg.admin_token_hash = h;
-        }
-        if let Some(u) = c.uri {
-            cfg.uri = u;
-        }
-        if let Some(k) = c.api_key {
-            cfg.api_key = k;
-        }
-        if let Some(p) = c.proxy {
-            cfg.proxy = p;
-        }
-        if let Some(s) = c.refresh_schedule {
-            cfg.refresh_schedule = s;
-        }
-        if let Some(p) = c.db_path {
-            cfg.db_path = p;
-        }
-        if let Some(l) = c.log_level {
-            cfg.log_level = l;
-        }
-        if let Some(s) = c.max_body_size {
-            cfg.max_body_size = parse_body_size_reporting(&s, &mut cfg.warnings);
-        }
-        if let Some(n) = c.block_cache_mb {
-            cfg.block_cache_mb = n;
-        }
-        if let Some(n) = c.write_buffer_mb {
-            cfg.write_buffer_mb = n;
-        }
-        if let Some(n) = c.max_write_buffers {
-            cfg.max_write_buffers = n;
-        }
-        if let Some(n) = c.max_open_files {
-            cfg.max_open_files = n;
-        }
-        if let Some(n) = c.request_timeout_seconds {
-            cfg.request_timeout_secs = n;
-        }
-        if let Some(n) = c.headers_timeout_seconds {
-            cfg.headers_timeout_secs = n;
-        }
-        if let Some(n) = c.keepalive_timeout_seconds {
-            cfg.keepalive_timeout_secs = n;
-        }
-        if let Some(n) = c.upstream_max_concurrent {
-            cfg.upstream_max_concurrent = n;
-        }
-        if let Some(n) = c.upstream_max_attempts {
-            cfg.upstream_max_attempts = n;
-        }
-        if let Some(n) = c.upstream_pool_idle_seconds {
-            cfg.upstream_pool_idle_secs = n;
-        }
-        if c.dev_tokens {
-            if cfg.user_token_hash.is_empty() {
-                cfg.user_token_hash = DEFAULT_USER_TOKEN_HASH.into();
-            }
-            if cfg.admin_token_hash.is_empty() {
-                cfg.admin_token_hash = DEFAULT_ADMIN_TOKEN_HASH.into();
-            }
-        }
-        cfg.seed = c.seed;
-        cfg.no_seed = c.no_seed;
-        cfg
+fn apply_toml(cfg: &mut Config, file: TomlConfig) {
+    if let Some(h) = file.host {
+        cfg.host = h;
     }
+    if let Some(p) = file.port {
+        cfg.port = p;
+    }
+    if let Some(https) = file.https {
+        cfg.https = https;
+        cfg.http = !https;
+    }
+    if let Some(p) = file.cert {
+        cfg.cert = p;
+    }
+    if let Some(p) = file.key {
+        cfg.key = p;
+    }
+    if let Some(u) = file.uri {
+        cfg.uri = u;
+    }
+    if let Some(k) = file.api_key {
+        cfg.api_key = k;
+    }
+    if let Some(p) = file.proxy {
+        cfg.proxy = p;
+    }
+    if let Some(s) = file.refresh_schedule {
+        cfg.refresh_schedule = s;
+    }
+    if let Some(h) = file.user_token_hash.filter(|s| !s.is_empty()) {
+        cfg.user_token_hash = h;
+    }
+    if let Some(h) = file.admin_token_hash.filter(|s| !s.is_empty()) {
+        cfg.admin_token_hash = h;
+    }
+    if let Some(m) = file.cache_mode.as_deref().and_then(CacheMode::parse) {
+        cfg.cache_mode = m;
+    }
+    if let Some(l) = file.log_level {
+        cfg.log_level = l;
+    }
+    if let Some(p) = file.db_path {
+        cfg.db_path = p;
+    }
+    if let Some(s) = file.max_request_body_size {
+        cfg.max_body_size = parse_body_size_reporting(&s, &mut cfg.warnings);
+    }
+    if let Some(n) = file.rocksdb_block_cache_mb {
+        cfg.block_cache_mb = n;
+    }
+    if let Some(n) = file.rocksdb_write_buffer_mb {
+        cfg.write_buffer_mb = n;
+    }
+    if let Some(n) = file.rocksdb_max_write_buffers {
+        cfg.max_write_buffers = n;
+    }
+    if let Some(n) = file.rocksdb_max_open_files {
+        cfg.max_open_files = n;
+    }
+    if let Some(n) = file.request_timeout_seconds {
+        cfg.request_timeout_secs = n;
+    }
+    if let Some(n) = file.headers_timeout_seconds {
+        cfg.headers_timeout_secs = n;
+    }
+    if let Some(n) = file.keepalive_timeout_seconds {
+        cfg.keepalive_timeout_secs = n;
+    }
+    if let Some(n) = file.upstream_max_concurrent {
+        cfg.upstream_max_concurrent = n;
+    }
+    if let Some(n) = file.upstream_max_attempts {
+        cfg.upstream_max_attempts = n;
+    }
+    if let Some(n) = file.upstream_pool_idle_seconds {
+        cfg.upstream_pool_idle_secs = n;
+    }
+}
+
+fn apply_cli(cfg: &mut Config, c: ServeArgs) {
+    if let Some(h) = c.host {
+        cfg.host = h;
+    }
+    if let Some(p) = c.port {
+        cfg.port = p;
+    }
+    // Only override the file when a transport flag is actually passed.
+    // `--https` / `--http` are clap store-true, so the unset default is false.
+    if c.https {
+        cfg.https = true;
+        cfg.http = false;
+    } else if c.http {
+        cfg.https = false;
+        cfg.http = true;
+    }
+    if let Some(p) = c.cert {
+        cfg.cert = p;
+    }
+    if let Some(p) = c.key {
+        cfg.key = p;
+    }
+    if let Some(m) = c.cache_mode {
+        cfg.cache_mode = m;
+    }
+    if let Some(h) = c.user_token_hash {
+        cfg.user_token_hash = h;
+    }
+    if let Some(h) = c.admin_token_hash {
+        cfg.admin_token_hash = h;
+    }
+    if let Some(u) = c.uri {
+        cfg.uri = u;
+    }
+    if let Some(k) = c.api_key {
+        cfg.api_key = k;
+    }
+    if let Some(p) = c.proxy {
+        cfg.proxy = p;
+    }
+    if let Some(s) = c.refresh_schedule {
+        cfg.refresh_schedule = s;
+    }
+    if let Some(p) = c.db_path {
+        cfg.db_path = p;
+    }
+    if let Some(l) = c.log_level {
+        cfg.log_level = l;
+    }
+    if let Some(s) = c.max_body_size {
+        cfg.max_body_size = parse_body_size_reporting(&s, &mut cfg.warnings);
+    }
+    if let Some(n) = c.block_cache_mb {
+        cfg.block_cache_mb = n;
+    }
+    if let Some(n) = c.write_buffer_mb {
+        cfg.write_buffer_mb = n;
+    }
+    if let Some(n) = c.max_write_buffers {
+        cfg.max_write_buffers = n;
+    }
+    if let Some(n) = c.max_open_files {
+        cfg.max_open_files = n;
+    }
+    if let Some(n) = c.request_timeout_seconds {
+        cfg.request_timeout_secs = n;
+    }
+    if let Some(n) = c.headers_timeout_seconds {
+        cfg.headers_timeout_secs = n;
+    }
+    if let Some(n) = c.keepalive_timeout_seconds {
+        cfg.keepalive_timeout_secs = n;
+    }
+    if let Some(n) = c.upstream_max_concurrent {
+        cfg.upstream_max_concurrent = n;
+    }
+    if let Some(n) = c.upstream_max_attempts {
+        cfg.upstream_max_attempts = n;
+    }
+    if let Some(n) = c.upstream_pool_idle_seconds {
+        cfg.upstream_pool_idle_secs = n;
+    }
+    if c.dev_tokens {
+        if cfg.user_token_hash.is_empty() {
+            cfg.user_token_hash = DEFAULT_USER_TOKEN_HASH.into();
+        }
+        if cfg.admin_token_hash.is_empty() {
+            cfg.admin_token_hash = DEFAULT_ADMIN_TOKEN_HASH.into();
+        }
+    }
+    cfg.seed = c.seed;
+    cfg.no_seed = c.no_seed;
+}
+
+impl From<ServeArgs> for Config {
+    fn from(c: ServeArgs) -> Self {
+        Self::from_serve_args(c, Some(Path::new(DEFAULT_CONFIG_PATH)))
+    }
+}
+
+fn load_json(path: &Path) -> Result<JsonConfig, String> {
+    let s = std::fs::read_to_string(path)
+        .map_err(|e| format!("config file {}: {e}", path.display()))?;
+    serde_json::from_str(&s)
+        .map_err(|e| format!("config file {}: invalid JSON: {e}", path.display()))
+}
+
+fn toml_i64(n: impl Into<i64>) -> toml_edit::Item {
+    value(n.into())
+}
+
+fn apply_json_to_toml(doc: &mut DocumentMut, src: &JsonConfig) {
+    if let Some(ref v) = src.hosts {
+        doc["host"] = value(v.as_str());
+    }
+    if let Some(v) = src.https_port {
+        doc["port"] = toml_i64(v);
+    }
+    if let Some(ref v) = src.uri {
+        doc["uri"] = value(v.as_str());
+    }
+    if let Some(ref v) = src.api_key {
+        doc["api_key"] = value(v.as_str());
+    }
+    if let Some(ref v) = src.proxy {
+        doc["proxy"] = value(v.as_str());
+    }
+    if let Some(ref v) = src.refresh_schedule {
+        doc["refresh_schedule"] = value(v.as_str());
+    }
+    if let Some(ref v) = src.user_token_hash {
+        doc["user_token_hash"] = value(v.as_str());
+    }
+    if let Some(ref v) = src.admin_token_hash {
+        doc["admin_token_hash"] = value(v.as_str());
+    }
+    if let Some(ref v) = src.caching_fill_mode {
+        let mode = CacheMode::parse(v)
+            .map(|m| m.as_str().to_ascii_lowercase())
+            .unwrap_or_else(|| v.to_ascii_lowercase());
+        doc["cache_mode"] = value(mode);
+    }
+    if let Some(ref v) = src.log_level {
+        doc["log_level"] = value(v.as_str());
+    }
+    if let Some(ref v) = src.db_path {
+        doc["db_path"] = value(v.display().to_string());
+    }
+    if let Some(ref v) = src.max_request_body_size {
+        doc["max_request_body_size"] = value(v.as_str());
+    }
+    if let Some(n) = src.block_cache_mb {
+        doc["rocksdb_block_cache_mb"] = value(n as i64);
+    }
+    if let Some(n) = src.write_buffer_mb {
+        doc["rocksdb_write_buffer_mb"] = value(n as i64);
+    }
+    if let Some(n) = src.max_write_buffers {
+        doc["rocksdb_max_write_buffers"] = toml_i64(n);
+    }
+    if let Some(n) = src.max_open_files {
+        doc["rocksdb_max_open_files"] = toml_i64(n);
+    }
+    if let Some(n) = src.request_timeout_seconds {
+        doc["request_timeout_seconds"] = value(n as i64);
+    }
+    if let Some(n) = src.headers_timeout_seconds {
+        doc["headers_timeout_seconds"] = value(n as i64);
+    }
+    if let Some(n) = src.keepalive_timeout_seconds {
+        doc["keepalive_timeout_seconds"] = value(n as i64);
+    }
+    if let Some(n) = src.upstream_max_concurrent {
+        doc["upstream_max_concurrent"] = value(n as i64);
+    }
+    if let Some(n) = src.upstream_max_attempts {
+        doc["upstream_max_attempts"] = value(n as i64);
+    }
+    if let Some(n) = src.upstream_pool_idle_seconds {
+        doc["upstream_pool_idle_seconds"] = value(n as i64);
+    }
+}
+
+/// Read a Node PCCS JSON config and write or update `to` as TOML.
+///
+/// Missing destination: start from the packaged template. Existing
+/// destination: keep keys and comments that the JSON does not mention.
+pub fn import_pccs_json(from: &Path, to: &Path) -> Result<(), String> {
+    let src = load_json(from)?;
+    let mut doc = if to.is_file() {
+        let s = std::fs::read_to_string(to).map_err(|e| format!("{}: {e}", to.display()))?;
+        s.parse::<DocumentMut>()
+            .map_err(|e| format!("{}: invalid TOML: {e}", to.display()))?
+    } else {
+        DEFAULT_CONFIG_TOML
+            .parse::<DocumentMut>()
+            .expect("packaged config.toml is valid TOML")
+    };
+    apply_json_to_toml(&mut doc, &src);
+    if let Some(parent) = to.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(to, doc.to_string()).map_err(|e| format!("write {}: {e}", to.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `Cli` reads `PCCS_*` env vars for any flag not given inline; drop them
-    /// so the process environment cannot leak into these tests. The
+    /// `ServeArgs` reads `PCCS_*` env vars for any flag not given inline; drop
+    /// them so the process environment cannot leak into these tests. The
     /// environment is process-global and tests run in parallel, so the whole
     /// clear-and-parse sequence is serialised behind a lock.
     fn clear_pccs_env() -> std::sync::MutexGuard<'static, ()> {
@@ -646,6 +861,15 @@ mod tests {
             }
         }
         guard
+    }
+
+    fn parse_serve<I, T>(args: I) -> Config
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let cli = ServeArgs::parse_from(args);
+        Config::from_serve_args(cli, None)
     }
 
     #[test]
@@ -733,7 +957,10 @@ mod tests {
             Some("api.example.com")
         );
         // No scheme is tolerated (`host:port/path`).
-        assert_eq!(uri_host("example.com:8081/x").as_deref(), Some("example.com"));
+        assert_eq!(
+            uri_host("example.com:8081/x").as_deref(),
+            Some("example.com")
+        );
         // Userinfo is stripped.
         assert_eq!(
             uri_host("https://user:pass@example.com/x").as_deref(),
@@ -785,35 +1012,34 @@ mod tests {
         let _env = clear_pccs_env();
         let dir = std::env::temp_dir().join(format!("pccs-rs-cfg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.json");
+        let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            r#"{
-                "HTTPS_PORT": 8443,
-                "hosts": "0.0.0.0",
-                "uri": "https://file.example/sgx/certification/v4/",
-                "ApiKey": "file-key",
-                "proxy": "http://proxy.example:8080",
-                "RefreshSchedule": "0 0 2 * * *",
-                "UserTokenHash": "file-user-hash",
-                "AdminTokenHash": "file-admin-hash",
-                "CachingFillMode": "OFFLINE",
-                "LogLevel": "debug",
-                "DB_PATH": "/tmp/file-db",
-                "MaxRequestBodySize": "1MB",
-                "RequestTimeoutSeconds": 5,
-                "HeadersTimeoutSeconds": 6,
-                "KeepAliveTimeoutSeconds": 7,
-                "UpstreamMaxConcurrent": 8,
-                "UpstreamMaxAttempts": 9,
-                "UpstreamPoolIdleSeconds": 10
-            }"#,
+            r#"
+                port = 8443
+                host = "0.0.0.0"
+                uri = "https://file.example/sgx/certification/v4/"
+                api_key = "file-key"
+                proxy = "http://proxy.example:8080"
+                refresh_schedule = "0 0 2 * * *"
+                user_token_hash = "file-user-hash"
+                admin_token_hash = "file-admin-hash"
+                cache_mode = "OFFLINE"
+                log_level = "debug"
+                db_path = "/tmp/file-db"
+                max_request_body_size = "1MB"
+                request_timeout_seconds = 5
+                headers_timeout_seconds = 6
+                keepalive_timeout_seconds = 7
+                upstream_max_concurrent = 8
+                upstream_max_attempts = 9
+                upstream_pool_idle_seconds = 10
+            "#,
         )
         .unwrap();
 
         // File values apply where the CLI is silent.
-        let cli = Cli::parse_from(["pccs-rs", "--config", path.to_str().unwrap()]);
-        let cfg = Config::from(cli);
+        let cfg = parse_serve(["pccs-rs", "--config", path.to_str().unwrap()]);
         assert_eq!(cfg.port, 8443);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.uri, "https://file.example/sgx/certification/v4/");
@@ -834,7 +1060,7 @@ mod tests {
         assert_eq!(cfg.upstream_pool_idle_secs, 10);
 
         // CLI wins over the file.
-        let cli = Cli::parse_from([
+        let cfg = parse_serve([
             "pccs-rs",
             "--config",
             path.to_str().unwrap(),
@@ -883,7 +1109,6 @@ mod tests {
             "--key",
             "/tmp/k.pem",
         ]);
-        let cfg = Config::from(cli);
         assert_eq!(cfg.host, "127.0.0.2");
         assert_eq!(cfg.port, 9000);
         assert_eq!(cfg.cache_mode, CacheMode::Req);
@@ -913,23 +1138,34 @@ mod tests {
     }
 
     #[test]
+    fn toml_https_survives_without_cli_flag() {
+        let _env = clear_pccs_env();
+        let dir = std::env::temp_dir().join(format!("pccs-rs-https-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "https = true\ncert = \"/tmp/c.crt\"\nkey = \"/tmp/k.pem\"\n",
+        )
+        .unwrap();
+        let cfg = parse_serve(["pccs-rs", "--config", path.to_str().unwrap()]);
+        assert!(cfg.https);
+        assert!(!cfg.http);
+        assert_eq!(cfg.cert, PathBuf::from("/tmp/c.crt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn http_flag_and_dev_tokens() {
         let _env = clear_pccs_env();
-        let cli = Cli::parse_from(["pccs-rs", "--http", "--dev-tokens"]);
-        let cfg = Config::from(cli);
+        let cfg = parse_serve(["pccs-rs", "--http", "--dev-tokens"]);
         assert!(cfg.http);
         assert!(!cfg.https);
         assert_eq!(cfg.user_token_hash, DEFAULT_USER_TOKEN_HASH);
         assert_eq!(cfg.admin_token_hash, DEFAULT_ADMIN_TOKEN_HASH);
 
         // --dev-tokens never overwrites an explicit hash.
-        let cli = Cli::parse_from([
-            "pccs-rs",
-            "--dev-tokens",
-            "--user-token-hash",
-            "custom",
-        ]);
-        let cfg = Config::from(cli);
+        let cfg = parse_serve(["pccs-rs", "--dev-tokens", "--user-token-hash", "custom"]);
         assert_eq!(cfg.user_token_hash, "custom");
         assert_eq!(cfg.admin_token_hash, DEFAULT_ADMIN_TOKEN_HASH);
     }
@@ -937,8 +1173,7 @@ mod tests {
     #[test]
     fn bad_max_body_warns_instead_of_panicking() {
         let _env = clear_pccs_env();
-        let cli = Cli::parse_from(["pccs-rs", "--max-body-size", "huge"]);
-        let cfg = Config::from(cli);
+        let cfg = parse_serve(["pccs-rs", "--max-body-size", "huge"]);
         assert_eq!(cfg.max_body_size, DEFAULT_MAX_BODY_SIZE);
         assert_eq!(cfg.warnings.len(), 1);
         assert!(cfg.warnings[0].contains("huge"));
@@ -947,19 +1182,19 @@ mod tests {
     #[test]
     fn file_and_cli_override_rocksdb_knobs() {
         let _env = clear_pccs_env();
-        let json = r#"{
-            "RocksDbBlockCacheMb": 2,
-            "RocksDbWriteBufferMb": 8,
-            "RocksDbMaxWriteBuffers": 2,
-            "RocksDbMaxOpenFiles": 128
-        }"#;
-        let file: FileConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(file.block_cache_mb, Some(2));
-        assert_eq!(file.write_buffer_mb, Some(8));
-        assert_eq!(file.max_write_buffers, Some(2));
-        assert_eq!(file.max_open_files, Some(128));
+        let raw = r#"
+            rocksdb_block_cache_mb = 2
+            rocksdb_write_buffer_mb = 8
+            rocksdb_max_write_buffers = 2
+            rocksdb_max_open_files = 128
+        "#;
+        let file: TomlConfig = toml::from_str(raw).unwrap();
+        assert_eq!(file.rocksdb_block_cache_mb, Some(2));
+        assert_eq!(file.rocksdb_write_buffer_mb, Some(8));
+        assert_eq!(file.rocksdb_max_write_buffers, Some(2));
+        assert_eq!(file.rocksdb_max_open_files, Some(128));
 
-        let cli = Cli::parse_from([
+        let cfg = parse_serve([
             "pccs-rs",
             "--rocksdb-block-cache-mb",
             "1",
@@ -970,7 +1205,6 @@ mod tests {
             "--rocksdb-max-open-files",
             "64",
         ]);
-        let cfg = Config::from(cli);
         assert_eq!(
             cfg.rocksdb_opts(),
             RocksDbOpts {
@@ -980,5 +1214,93 @@ mod tests {
                 max_open_files: 64,
             }
         );
+    }
+
+    #[test]
+    fn implicit_config_path_only_when_file_exists() {
+        let _env = clear_pccs_env();
+        let dir = std::env::temp_dir().join(format!("pccs-rs-implicit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let missing = ServeArgs::parse_from(["pccs-rs"]);
+        let cfg = Config::from_serve_args(missing, Some(path.as_path()));
+        assert_eq!(cfg.api_key, "");
+
+        std::fs::write(&path, "api_key = \"from-implicit\"\n").unwrap();
+        let present = ServeArgs::parse_from(["pccs-rs"]);
+        let cfg = Config::from_serve_args(present, Some(path.as_path()));
+        assert_eq!(cfg.api_key, "from-implicit");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn top_level_cli_requires_subcommand() {
+        let _env = clear_pccs_env();
+        assert!(Cli::try_parse_from(["pccs-rs"]).is_err());
+        let cli = Cli::try_parse_from(["pccs-rs", "serve", "--http"]).unwrap();
+        assert!(matches!(cli.command, Command::Serve(_)));
+    }
+
+    #[test]
+    fn packaged_config_template_is_valid_toml() {
+        let file: TomlConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        assert_eq!(file.api_key.as_deref(), Some(""));
+        assert_eq!(file.db_path.as_deref(), Some(Path::new("/var/lib/pccs-rs")));
+    }
+
+    #[test]
+    fn import_pccs_json_creates_and_merges() {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("pccs.json");
+        let toml_path = dir.join("config.toml");
+        std::fs::write(
+            &json,
+            r#"{
+                "HTTPS_PORT": 8443,
+                "hosts": "0.0.0.0",
+                "uri": "https://file.example/sgx/certification/v4/",
+                "ApiKey": "imported-key",
+                "CachingFillMode": "REQ",
+                "DB_PATH": "/tmp/imported-db",
+                "RocksDbMaxOpenFiles": -1
+            }"#,
+        )
+        .unwrap();
+
+        import_pccs_json(&json, &toml_path).unwrap();
+        let text = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(text.contains("Intel PCS"), "template comments kept");
+        let file: TomlConfig = toml::from_str(&text).unwrap();
+        assert_eq!(file.port, Some(8443));
+        assert_eq!(file.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(file.api_key.as_deref(), Some("imported-key"));
+        assert_eq!(file.cache_mode.as_deref(), Some("req"));
+        assert_eq!(file.db_path.as_deref(), Some(Path::new("/tmp/imported-db")));
+        assert_eq!(file.rocksdb_max_open_files, Some(-1));
+
+        // Merge: keep keys the JSON does not mention, update those it does.
+        std::fs::write(
+            &toml_path,
+            "# keep me\napi_key = \"old\"\nlog_level = \"trace\"\n",
+        )
+        .unwrap();
+        std::fs::write(&json, r#"{"ApiKey":"new-key"}"#).unwrap();
+        import_pccs_json(&json, &toml_path).unwrap();
+        let text = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(text.contains("# keep me"));
+        let file: TomlConfig = toml::from_str(&text).unwrap();
+        assert_eq!(file.api_key.as_deref(), Some("new-key"));
+        assert_eq!(file.log_level.as_deref(), Some("trace"));
+
+        let err = import_pccs_json(&dir.join("missing.json"), &toml_path).unwrap_err();
+        assert!(err.contains("missing.json"));
+        std::fs::write(&json, "not-json").unwrap();
+        let err = import_pccs_json(&json, &toml_path).unwrap_err();
+        assert!(err.contains("invalid JSON"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
