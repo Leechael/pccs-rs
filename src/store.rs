@@ -1405,7 +1405,8 @@ mod tests {
     /// declaration order, so the store closes before the directory is removed.
     fn temp_store() -> (TestDir, Store) {
         let dir = std::env::temp_dir().join(format!("pccs-rs-store-{}", uuid::Uuid::new_v4()));
-        let store = Store::open(&dir, CacheMode::Lazy, &RocksDbOpts::default()).expect("temp store");
+        let store =
+            Store::open(&dir, CacheMode::Lazy, &RocksDbOpts::default()).expect("temp store");
         (TestDir(dir), store)
     }
 
@@ -1443,17 +1444,23 @@ mod tests {
         let rec = pckcert_rec("QEID1");
         s.put_pckcert(&rec).unwrap();
         // Case-insensitive on every field, like Node's SQL.
-        let got = s.get_pckcert("qeid1", &"ab".repeat(16), "00ff", "0001").unwrap();
+        let got = s
+            .get_pckcert("qeid1", &"ab".repeat(16), "00ff", "0001")
+            .unwrap();
         assert_eq!(got.qeid, "QEID1");
         // A different raw TCB is a different key.
-        assert!(s.get_pckcert("QEID1", &"CD".repeat(16), "00FF", "0001").is_none());
+        assert!(s
+            .get_pckcert("QEID1", &"CD".repeat(16), "00FF", "0001")
+            .is_none());
 
         // A record stored under a key it does not match reads as a miss, never
         // as another platform's certificate.
         let other = pckcert_rec("QEID2");
         let key = keys::pckcert("QEID3", "0001", &"AB".repeat(16), "00FF");
         s.put_json(&key, &other).unwrap();
-        assert!(s.get_pckcert("QEID3", &"AB".repeat(16), "00FF", "0001").is_none());
+        assert!(s
+            .get_pckcert("QEID3", &"AB".repeat(16), "00FF", "0001")
+            .is_none());
     }
 
     #[test]
@@ -1503,7 +1510,11 @@ mod tests {
         let previous = s.replace_platform_certs(&fresh).unwrap();
         assert_eq!(previous.len(), 2);
         let pool = s.get_platform_pool("QE", "0001").unwrap();
-        assert_eq!(pool.raw_tcbs.len(), 2, "raw TCBs must survive a cert refresh");
+        assert_eq!(
+            pool.raw_tcbs.len(),
+            2,
+            "raw TCBs must survive a cert refresh"
+        );
         assert_eq!(pool.cert_pairs(), vec![("T".to_string(), "C".to_string())]);
 
         s.remove_raw_tcb("QE", "0001", "aa", "bb").unwrap();
@@ -1526,8 +1537,16 @@ mod tests {
             enc_ppid: "PP".into(),
             fmspc: "00906EA10000".into(),
             raw_tcbs: vec![
-                RawTcb { cpu_svn: "A".into(), pce_svn: "B".into(), tcbm: String::new() },
-                RawTcb { cpu_svn: "C".into(), pce_svn: "D".into(), tcbm: String::new() },
+                RawTcb {
+                    cpu_svn: "A".into(),
+                    pce_svn: "B".into(),
+                    tcbm: String::new(),
+                },
+                RawTcb {
+                    cpu_svn: "C".into(),
+                    pce_svn: "D".into(),
+                    tcbm: String::new(),
+                },
             ],
             ..Default::default()
         };
@@ -1540,7 +1559,9 @@ mod tests {
         // Filtered by fmspc, case-insensitively.
         let hit = s.cached_platforms_by_fmspc(&["00906ea10000".to_string()]);
         assert_eq!(hit.len(), 2);
-        assert!(s.cached_platforms_by_fmspc(&["FFFFFFFFFFFF".to_string()]).is_empty());
+        assert!(s
+            .cached_platforms_by_fmspc(&["FFFFFFFFFFFF".to_string()])
+            .is_empty());
     }
 
     fn tcb_rec(version: u32, update: &str) -> TcbRecord {
@@ -1559,16 +1580,24 @@ mod tests {
     fn tcb_identity_crl_round_trips_and_mismatches() {
         let (_dir, s) = temp_store();
         s.put_tcb(&tcb_rec(4, "STANDARD")).unwrap();
-        assert!(s.get_tcb(0, "00906ea10000", 4, UpdateType::Standard).is_some());
+        assert!(s
+            .get_tcb(0, "00906ea10000", 4, UpdateType::Standard)
+            .is_some());
         // Version / update / prod type are part of the identity of a record.
-        assert!(s.get_tcb(0, "00906EA10000", 3, UpdateType::Standard).is_none());
+        assert!(s
+            .get_tcb(0, "00906EA10000", 3, UpdateType::Standard)
+            .is_none());
         assert!(s.get_tcb(0, "00906EA10000", 4, UpdateType::Early).is_none());
-        assert!(s.get_tcb(1, "00906EA10000", 4, UpdateType::Standard).is_none());
+        assert!(s
+            .get_tcb(1, "00906EA10000", 4, UpdateType::Standard)
+            .is_none());
         assert_eq!(s.list_tcbs().len(), 1);
         // Tampered record under a foreign key is a miss.
         let key = keys::tcb("sgx", 4, "FFFFFFFFFFFF", "STANDARD");
         s.put_json(&key, &tcb_rec(4, "STANDARD")).unwrap();
-        assert!(s.get_tcb(0, "FFFFFFFFFFFF", 4, UpdateType::Standard).is_none());
+        assert!(s
+            .get_tcb(0, "FFFFFFFFFFFF", 4, UpdateType::Standard)
+            .is_none());
 
         let id = IdentityRecord {
             enclave_id: 1,
@@ -1597,7 +1626,10 @@ mod tests {
         assert_eq!(s.list_pckcrls().len(), 1);
         let key = keys::pckcrl("PLATFORM");
         s.put_json(&key, &crl).unwrap();
-        assert!(s.get_pckcrl("PLATFORM").is_none(), "ca mismatch reads as a miss");
+        assert!(
+            s.get_pckcrl("PLATFORM").is_none(),
+            "ca mismatch reads as a miss"
+        );
 
         s.put_rootcacrl(&[9, 9]).unwrap();
         assert_eq!(s.get_rootcacrl().unwrap(), vec![9, 9]);
@@ -1738,7 +1770,9 @@ mod tests {
         let pool = s.get_platform_pool("QE", "0001").unwrap();
         assert_eq!(pool.certs.len(), 1);
         // The alternate key spelling (qeid/pceid) is accepted.
-        assert!(s.get_pckcert("QE", &"AB".repeat(16), "00FF", "0001").is_some());
+        assert!(s
+            .get_pckcert("QE", &"AB".repeat(16), "00FF", "0001")
+            .is_some());
     }
 
     /// A synthetic PCK certificate (Platform CA) matching the TCB below.
@@ -1749,8 +1783,9 @@ mod tests {
     const FMSPC: &str = "1234567890AB";
 
     fn tcb_info_json() -> serde_json::Value {
-        let comps: Vec<serde_json::Value> =
-            (0..16).map(|_| serde_json::json!({ "svn": 0x22 })).collect();
+        let comps: Vec<serde_json::Value> = (0..16)
+            .map(|_| serde_json::json!({ "svn": 0x22 }))
+            .collect();
         serde_json::json!({
             "id": "SGX", "fmspc": FMSPC, "pceId": PCEID, "tcbType": 0,
             "tcbLevels": [{
@@ -1915,7 +1950,9 @@ mod tests {
         // A missing explicit path falls through to the built-in candidates;
         // the repo ships fixtures/seed.json, so this is always Some here.
         let missing = std::path::Path::new("/definitely/not/here.json");
-        assert!(find_seed_path(Some(missing)).unwrap().ends_with("seed.json"));
+        assert!(find_seed_path(Some(missing))
+            .unwrap()
+            .ends_with("seed.json"));
         let _ = std::fs::remove_file(&explicit);
     }
 }

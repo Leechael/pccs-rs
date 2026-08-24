@@ -98,4 +98,3 @@ PID 636670  RSS=8164  VSZ=618652  VmHWM=8164  (KiB)
 ## Memory takeaway
 
 Idle RSS is the clean comparison: after seed, Node sits at **112 MiB** (V8 + mapped `node_modules` + libsqlite3) while Rust HTTPS is **8 MiB** and Rust HTTP **6.9 MiB** — about **14×** less resident memory for the same three cache-hit documents. Under a 32-way load Node grows to **204–240 MiB** (V8 heap + buffers) and does not shrink; Rust moves from ~8 MiB to a tight **13–14 MiB** band and stays there on the 15s run. The collateral itself is tens of KiB; almost all of Node's footprint is runtime baseline, not cache contents.
-

@@ -1626,11 +1626,7 @@ async fn v3_upstream_mounts_no_v4_routes() {
     assert_eq!(status, StatusCode::NOT_FOUND, "v4 must not be mounted");
 
     // v3 routes still answer (seeded TCB info).
-    let (status, h, _) = send(
-        router,
-        get("/sgx/certification/v3/tcb?fmspc=ABCDABCDABCD"),
-    )
-    .await;
+    let (status, h, _) = send(router, get("/sgx/certification/v3/tcb?fmspc=ABCDABCDABCD")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(h.get(headers::WARNING).is_some());
 }
@@ -1657,14 +1653,24 @@ async fn lazy_pckcert_fill_from_pccs_then_hit() {
     assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), "00A067110000");
     // The mock sends "processor" in lowercase; the served header is the
     // normalised uppercase form.
-    assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(), "PROCESSOR");
-    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBCCCC");
+    assert_eq!(
+        h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(),
+        "PROCESSOR"
+    );
+    assert_eq!(
+        h.get(headers::SGX_TCBM).unwrap(),
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBCCCC"
+    );
     assert!(String::from_utf8_lossy(&body).contains("BEGIN CERTIFICATE"));
     let pck_calls = calls.load(Ordering::Relaxed);
 
     let (status, _, _) = send(router, get(&path)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(calls.load(Ordering::Relaxed), pck_calls, "second GET is a store hit");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        pck_calls,
+        "second GET is a store hit"
+    );
 }
 
 /// A request body that delivers one chunk and then never completes, without
