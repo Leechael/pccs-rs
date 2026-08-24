@@ -1136,9 +1136,9 @@ mod tests {
                     let c = c2.clone();
                     async move {
                         count(&c);
-                        let mut resp = axum::response::Response::new(axum::body::Body::from(
-                            vec![0x30u8, 0x03],
-                        ));
+                        let mut resp = axum::response::Response::new(axum::body::Body::from(vec![
+                            0x30u8, 0x03,
+                        ]));
                         resp.headers_mut().insert(
                             crate::headers::SGX_PCK_CRL_ISSUER_CHAIN,
                             axum::http::HeaderValue::from_static("crl-chain"),
@@ -1333,9 +1333,16 @@ mod tests {
 
         let rec = cache.get_pckcrl("PROCESSOR", 4).await.unwrap();
         assert_eq!(rec.pckcrl, vec![0x30]);
-        assert!(cache.store.get_pckcrl("PROCESSOR").is_none(), "chain-less CRL is not cached");
+        assert!(
+            cache.store.get_pckcrl("PROCESSOR").is_none(),
+            "chain-less CRL is not cached"
+        );
         cache.get_pckcrl("PROCESSOR", 4).await.unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 2, "every request retries upstream");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "every request retries upstream"
+        );
     }
 
     #[tokio::test]
@@ -1349,7 +1356,11 @@ mod tests {
         let der = cache.get_rootcacrl(4).await.unwrap();
         assert_eq!(der, vec![0x30, 0x82]);
         cache.get_rootcacrl(4).await.unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), crl_calls + 1, "second GET is a store hit");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            crl_calls + 1,
+            "second GET is a store hit"
+        );
 
         // A v3 *miss* is EOL, never a network call (a cached record is still
         // served — the store hit above comes first, as in Node).
@@ -1416,18 +1427,31 @@ mod tests {
 
         let first = tokio::spawn({
             let cache = cache.clone();
-            async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
+            async move {
+                cache
+                    .get_tcb(0, "00A067110000", 4, UpdateType::Standard)
+                    .await
+            }
         });
         // The first request has taken the key lock and reached the upstream.
         received.notified().await;
         let second = tokio::spawn({
             let cache = cache.clone();
-            async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
+            async move {
+                cache
+                    .get_tcb(0, "00A067110000", 4, UpdateType::Standard)
+                    .await
+            }
         });
         // Wait until the second request is deterministically queued on the
         // key lock: the first request holds the lock Arc plus its guard, so a
         // third strong reference is the second request inside `key_lock`.
-        let key = keys::tcb(keys::prod_name(0), 4, "00A067110000", UpdateType::Standard.as_str());
+        let key = keys::tcb(
+            keys::prod_name(0),
+            4,
+            "00A067110000",
+            UpdateType::Standard.as_str(),
+        );
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let strong = {
@@ -1540,7 +1564,10 @@ mod tests {
     async fn refresh_without_upstream_is_a_noop() {
         let (_dir, cache) = cache_with("", CacheMode::Lazy);
         cache.refresh(None, None).await.unwrap();
-        cache.refresh(Some("certs"), Some("00A067110000")).await.unwrap();
+        cache
+            .refresh(Some("certs"), Some("00A067110000"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1601,8 +1628,9 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
 ";
 
     fn pck_tcb_info() -> serde_json::Value {
-        let comps: Vec<serde_json::Value> =
-            (0..16).map(|_| serde_json::json!({ "svn": 0x22 })).collect();
+        let comps: Vec<serde_json::Value> = (0..16)
+            .map(|_| serde_json::json!({ "svn": 0x22 }))
+            .collect();
         serde_json::json!({
             "id": "SGX", "fmspc": "1234567890AB", "pceId": "4444", "tcbType": 0,
             "tcbLevels": [{
@@ -1801,11 +1829,17 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             .unwrap();
         cache.store.put_rootcacrl(&[1]).unwrap();
         // Not an Intel CRL URI: skipped, never fetched.
-        cache.store.put_crl("https://evil.test/x.crl", &[2]).unwrap();
+        cache
+            .store
+            .put_crl("https://evil.test/x.crl", &[2])
+            .unwrap();
 
         cache.refresh(None, None).await.unwrap();
         assert_eq!(cache.store.get_rootcacrl().unwrap(), vec![0x0A]);
-        assert_eq!(cache.store.get_crl("https://evil.test/x.crl").unwrap(), vec![2]);
+        assert_eq!(
+            cache.store.get_crl("https://evil.test/x.crl").unwrap(),
+            vec![2]
+        );
     }
 
     #[tokio::test]

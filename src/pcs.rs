@@ -913,7 +913,12 @@ mod tests {
             let seen = seen2.clone();
             async move {
                 let method = req.method().to_string();
-                let pq = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string();
+                let pq = req
+                    .uri()
+                    .path_and_query()
+                    .map(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let key = req
                     .headers()
                     .get("Ocp-Apim-Subscription-Key")
@@ -943,7 +948,11 @@ mod tests {
             .is_err());
         let req = seen.lock().unwrap()[0].clone();
         assert_eq!(req.0, "GET");
-        assert!(req.1.starts_with("/sgx/certification/v4/pckcert?"), "{}", req.1);
+        assert!(
+            req.1.starts_with("/sgx/certification/v4/pckcert?"),
+            "{}",
+            req.1
+        );
         // No enc_ppid param when None; the key is not sent on plain collateral.
         assert!(!req.1.contains("encrypted_ppid"), "{}", req.1);
         assert_eq!(req.2, "");
@@ -1005,7 +1014,10 @@ mod tests {
         let client = client_for("");
         assert!(!client.enabled());
         assert!(client.fetch_pckcerts_intel("", "0000").await.is_err());
-        assert!(client.fetch_pckcerts_intel("00000000", "0000").await.is_err());
+        assert!(client
+            .fetch_pckcerts_intel("00000000", "0000")
+            .await
+            .is_err());
         assert_eq!(client.call_count(), 0, "no network call may happen");
     }
 
@@ -1072,7 +1084,11 @@ mod tests {
             async move {
                 seen.lock().unwrap().push((
                     String::new(),
-                    req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string(),
+                    req.uri()
+                        .path_and_query()
+                        .map(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     String::new(),
                 ));
                 let mut resp = axum::response::Response::new(axum::body::Body::from(
@@ -1083,7 +1099,8 @@ mod tests {
                 } else {
                     headers::TCB_INFO_ISSUER_CHAIN
                 };
-                resp.headers_mut().insert(name, HeaderValue::from_static("tcb-chain"));
+                resp.headers_mut()
+                    .insert(name, HeaderValue::from_static("tcb-chain"));
                 resp
             }
         };
@@ -1097,7 +1114,11 @@ mod tests {
                     async move {
                         seen.lock().unwrap().push((
                             String::new(),
-                            req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string(),
+                            req.uri()
+                                .path_and_query()
+                                .map(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                             String::new(),
                         ));
                         let mut resp = axum::response::Response::new(axum::body::Body::from(
@@ -1115,7 +1136,10 @@ mod tests {
         let client = client_for(&base);
 
         // v3 is refused before any network call.
-        assert!(client.fetch_tcb(0, "00A067110000", 3, UpdateType::Standard).await.is_err());
+        assert!(client
+            .fetch_tcb(0, "00A067110000", 3, UpdateType::Standard)
+            .await
+            .is_err());
         assert_eq!(client.call_count(), 0);
 
         let rec = client
@@ -1135,20 +1159,29 @@ mod tests {
         assert_eq!(rec.issuer_chain, "legacy-chain");
 
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0].1, "/sgx/certification/v4/tcb?fmspc=00a067110000&update=early");
-        assert_eq!(seen[1].1, "/tdx/certification/v4/tcb?fmspc=00A067110000&update=standard");
+        assert_eq!(
+            seen[0].1,
+            "/sgx/certification/v4/tcb?fmspc=00a067110000&update=early"
+        );
+        assert_eq!(
+            seen[1].1,
+            "/tdx/certification/v4/tcb?fmspc=00A067110000&update=standard"
+        );
     }
 
     #[tokio::test]
     async fn fetch_tcb_bad_responses_are_cache_misses() {
         use axum::routing::get;
-        let app = axum::Router::new()
-            .route("/sgx/certification/v4/tcb", get(|| async {
-                axum::response::Response::new(axum::body::Body::from("not json"))
-            }));
+        let app = axum::Router::new().route(
+            "/sgx/certification/v4/tcb",
+            get(|| async { axum::response::Response::new(axum::body::Body::from("not json")) }),
+        );
         let base = spawn(app).await;
         let client = client_for(&base);
-        assert!(client.fetch_tcb(0, "00A067110000", 4, UpdateType::Standard).await.is_err());
+        assert!(client
+            .fetch_tcb(0, "00A067110000", 4, UpdateType::Standard)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1158,14 +1191,32 @@ mod tests {
         let client = client_for(&base);
 
         // 404s are cache misses, but the URLs are still observable.
-        assert!(client.fetch_identity(1, 4, UpdateType::Standard).await.is_err());
-        assert!(client.fetch_identity(2, 4, UpdateType::Early).await.is_err());
-        assert!(client.fetch_identity(3, 4, UpdateType::Standard).await.is_err());
-        assert!(client.fetch_identity(1, 3, UpdateType::Standard).await.is_err());
+        assert!(client
+            .fetch_identity(1, 4, UpdateType::Standard)
+            .await
+            .is_err());
+        assert!(client
+            .fetch_identity(2, 4, UpdateType::Early)
+            .await
+            .is_err());
+        assert!(client
+            .fetch_identity(3, 4, UpdateType::Standard)
+            .await
+            .is_err());
+        assert!(client
+            .fetch_identity(1, 3, UpdateType::Standard)
+            .await
+            .is_err());
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0].1, "/sgx/certification/v4/qe/identity?update=standard");
+        assert_eq!(
+            seen[0].1,
+            "/sgx/certification/v4/qe/identity?update=standard"
+        );
         assert_eq!(seen[1].1, "/sgx/certification/v4/qve/identity?update=early");
-        assert_eq!(seen[2].1, "/tdx/certification/v4/qe/identity?update=standard");
+        assert_eq!(
+            seen[2].1,
+            "/tdx/certification/v4/qe/identity?update=standard"
+        );
         assert_eq!(seen.len(), 3, "v3 never reaches the network");
     }
 
@@ -1187,7 +1238,10 @@ mod tests {
         );
         let base = spawn(app).await;
         let client = client_for(&base);
-        let rec = client.fetch_identity(2, 4, UpdateType::Standard).await.unwrap();
+        let rec = client
+            .fetch_identity(2, 4, UpdateType::Standard)
+            .await
+            .unwrap();
         assert_eq!(rec.enclave_id, 2);
         assert_eq!(rec.issuer_chain, "id-chain");
         assert!(rec.raw_body.contains("QvE"));
@@ -1230,9 +1284,7 @@ mod tests {
         // Hex-text body is decoded to DER.
         let app = axum::Router::new().route(
             "/sgx/certification/v4/rootcacrl",
-            get(|| async {
-                axum::response::Response::new(axum::body::Body::from("30 03\n0a0b"))
-            }),
+            get(|| async { axum::response::Response::new(axum::body::Body::from("30 03\n0a0b")) }),
         );
         let base = spawn(app).await;
         let client = client_for(&base);
@@ -1268,7 +1320,10 @@ mod tests {
             .await
             .is_err());
         // v3 CRL URLs are refused before the network.
-        assert!(client.fetch_crl("https://x/v3/pckcrl?ca=processor").await.is_err());
+        assert!(client
+            .fetch_crl("https://x/v3/pckcrl?ca=processor")
+            .await
+            .is_err());
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -1299,7 +1354,11 @@ mod tests {
         };
         let client = PcsClient::new(&cfg).unwrap();
         let err = client.fetch_pckcrl("processor").await.unwrap_err();
-        assert_eq!(err.status, StatusCode::NOT_FOUND, "final 503 surfaces as a miss");
+        assert_eq!(
+            err.status,
+            StatusCode::NOT_FOUND,
+            "final 503 surfaces as a miss"
+        );
         assert_eq!(
             calls.load(Ordering::Relaxed),
             u64::from(MAX_THROTTLED_ATTEMPTS),

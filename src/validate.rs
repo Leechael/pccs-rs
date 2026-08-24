@@ -809,7 +809,10 @@ mod tests {
             update_type(Some("standard"), false).unwrap(),
             UpdateType::Standard
         );
-        assert_eq!(update_type(Some("early"), false).unwrap(), UpdateType::Early);
+        assert_eq!(
+            update_type(Some("early"), false).unwrap(),
+            UpdateType::Early
+        );
         // ALL is only accepted where Node allows it (POST /platforms).
         assert_eq!(update_type(Some("all"), true).unwrap(), UpdateType::All);
         assert!(update_type(Some("all"), false).is_err());
@@ -852,7 +855,10 @@ mod tests {
 
     #[test]
     fn platforms_source_variants() {
-        assert!(matches!(platforms_source(None).unwrap(), PlatformsSource::Reg));
+        assert!(matches!(
+            platforms_source(None).unwrap(),
+            PlatformsSource::Reg
+        ));
         assert!(matches!(
             platforms_source(Some("")).unwrap(),
             PlatformsSource::Reg
@@ -930,7 +936,8 @@ mod tests {
         assert!(platform_collateral(&bad, 3).is_err());
 
         let mut bad = v3.clone();
-        bad["collaterals"]["pck_certs"][0]["certs"] = json!([{ "tcbm": "0".repeat(36), "cert": "x" }]);
+        bad["collaterals"]["pck_certs"][0]["certs"] =
+            json!([{ "tcbm": "0".repeat(36), "cert": "x" }]);
         assert!(platform_collateral(&bad, 3).is_err());
 
         // tcbinfos[].tcbinfo must be an object carrying tcbInfo + signature.

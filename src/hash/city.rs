@@ -73,7 +73,14 @@ fn hash_len0to16(s: &[u8]) -> u64 {
     K2
 }
 
-fn weak_hash_len32_with_seeds(w: u64, x: u64, y: u64, z: u64, mut a: u64, mut b: u64) -> (u64, u64) {
+fn weak_hash_len32_with_seeds(
+    w: u64,
+    x: u64,
+    y: u64,
+    z: u64,
+    mut a: u64,
+    mut b: u64,
+) -> (u64, u64) {
     a = a.wrapping_add(w);
     b = b.wrapping_add(a).wrapping_add(z).rotate_right(21);
     let c = a;
@@ -83,7 +90,14 @@ fn weak_hash_len32_with_seeds(w: u64, x: u64, y: u64, z: u64, mut a: u64, mut b:
 }
 
 fn weak_hash32(s: &[u8], a: u64, b: u64) -> (u64, u64) {
-    weak_hash_len32_with_seeds(fetch64(s), fetch64(&s[8..]), fetch64(&s[16..]), fetch64(&s[24..]), a, b)
+    weak_hash_len32_with_seeds(
+        fetch64(s),
+        fetch64(&s[8..]),
+        fetch64(&s[16..]),
+        fetch64(&s[24..]),
+        a,
+        b,
+    )
 }
 
 /// Pack C++ `uint128` as `(Uint128High64 << 64) | Uint128Low64` (cityhash-sys).
@@ -134,10 +148,23 @@ fn city_hash128_with_seed(mut s: &[u8], seed_low: u64, seed_high: u64) -> u128 {
     let mut x = seed_low;
     let mut y = seed_high;
     let mut z = (s.len() as u64).wrapping_mul(K1);
-    let mut v0 = (y ^ K1).rotate_right(49).wrapping_mul(K1).wrapping_add(fetch64(s));
-    let mut v1 = v0.rotate_right(42).wrapping_mul(K1).wrapping_add(fetch64(&s[8..]));
-    let mut w0 = y.wrapping_add(z).rotate_right(35).wrapping_mul(K1).wrapping_add(x);
-    let mut w1 = x.wrapping_add(fetch64(&s[88..])).rotate_right(53).wrapping_mul(K1);
+    let mut v0 = (y ^ K1)
+        .rotate_right(49)
+        .wrapping_mul(K1)
+        .wrapping_add(fetch64(s));
+    let mut v1 = v0
+        .rotate_right(42)
+        .wrapping_mul(K1)
+        .wrapping_add(fetch64(&s[8..]));
+    let mut w0 = y
+        .wrapping_add(z)
+        .rotate_right(35)
+        .wrapping_mul(K1)
+        .wrapping_add(x);
+    let mut w1 = x
+        .wrapping_add(fetch64(&s[88..]))
+        .rotate_right(53)
+        .wrapping_mul(K1);
     let orig = s;
     let mut remaining = s.len();
 
@@ -160,7 +187,11 @@ fn city_hash128_with_seed(mut s: &[u8], seed_low: u64, seed_high: u64) -> u128 {
             let v = weak_hash32(s, v1.wrapping_mul(K1), x.wrapping_add(w0));
             v0 = v.0;
             v1 = v.1;
-            let w = weak_hash32(&s[32..], z.wrapping_add(w1), y.wrapping_add(fetch64(&s[16..])));
+            let w = weak_hash32(
+                &s[32..],
+                z.wrapping_add(w1),
+                y.wrapping_add(fetch64(&s[16..])),
+            );
             w0 = w.0;
             w1 = w.1;
             core::mem::swap(&mut z, &mut x);
@@ -178,16 +209,18 @@ fn city_hash128_with_seed(mut s: &[u8], seed_low: u64, seed_high: u64) -> u128 {
     let mut tail_done = 0usize;
     while tail_done < remaining {
         tail_done += 32;
-        y = x.wrapping_add(y).rotate_right(42).wrapping_mul(K0).wrapping_add(v1);
+        y = x
+            .wrapping_add(y)
+            .rotate_right(42)
+            .wrapping_mul(K0)
+            .wrapping_add(v1);
         w0 = w0.wrapping_add(fetch64(&orig[orig.len() - tail_done + 16..]));
         x = x.wrapping_mul(K0).wrapping_add(w0);
-        z = z.wrapping_add(w1).wrapping_add(fetch64(&orig[orig.len() - tail_done..]));
+        z = z
+            .wrapping_add(w1)
+            .wrapping_add(fetch64(&orig[orig.len() - tail_done..]));
         w1 = w1.wrapping_add(v0);
-        let v = weak_hash32(
-            &orig[orig.len() - tail_done..],
-            v0.wrapping_add(z),
-            v1,
-        );
+        let v = weak_hash32(&orig[orig.len() - tail_done..], v0.wrapping_add(z), v1);
         v0 = v.0.wrapping_mul(K0);
         v1 = v.1;
     }

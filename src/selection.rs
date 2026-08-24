@@ -970,7 +970,9 @@ mod tests {
     #[test]
     fn pem_to_der_variants() {
         assert!(pem_to_der("no markers").is_none());
-        assert!(pem_to_der("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----").is_none());
+        assert!(
+            pem_to_der("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----").is_none()
+        );
         let der = pem_to_der("-----BEGIN CERTIFICATE-----\naGVs bG8=\n-----END CERTIFICATE-----")
             .unwrap();
         assert_eq!(der, b"hello");
