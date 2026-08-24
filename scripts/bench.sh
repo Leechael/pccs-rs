@@ -20,7 +20,7 @@ LOAD="$ROOT/target/release/loadgen"
 
 rm -rf "$DB"
 echo "==> starting pccs-rs on :$PORT (RocksDB $DB)"
-"$BIN" --http --port "$PORT" --host 127.0.0.1 --cache-mode lazy --db-path "$DB" --uri "" --seed "$ROOT/fixtures/seed.json" &
+"$BIN" serve --http --port "$PORT" --host 127.0.0.1 --cache-mode lazy --db-path "$DB" --uri "" --seed "$ROOT/fixtures/seed.json" &
 PID=$!
 cleanup() { kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; }
 trap cleanup EXIT

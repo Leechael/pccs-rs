@@ -35,6 +35,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Socket options (TCP_NODELAY / SO_KEEPALIVE) on accepted and upstream sockets.
 # Already in the tree as a hyper-util / tokio dependency.
 socket2 = "0.6"
+toml = "0.8"
+toml_edit = "0.22"
 
 [[bin]]
 name = "pccs-rs"

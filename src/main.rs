@@ -5,7 +5,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
-use pccs_rs::config::{Cli, Config, DEFAULT_ADMIN_TOKEN_HASH, DEFAULT_USER_TOKEN_HASH};
+use pccs_rs::config::{
+    Cli, Command, Config, ConfigCommand, DEFAULT_ADMIN_TOKEN_HASH, DEFAULT_USER_TOKEN_HASH,
+};
 use pccs_rs::{app_state, create_app};
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
@@ -24,11 +26,30 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// unrelated to the HTTP keep-alive idle timeout.
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
-#[tokio::main]
-async fn main() {
-    let cli = Cli::parse();
-    let cfg = Config::from(cli);
+fn main() {
+    match Cli::parse().command {
+        Command::Serve(args) => serve_main(Config::from(args)),
+        Command::Config(cmd) => {
+            if let Err(e) = run_config(cmd) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
 
+fn run_config(cmd: pccs_rs::config::ConfigCmd) -> Result<(), String> {
+    match cmd.command {
+        ConfigCommand::Import { from, to } => {
+            pccs_rs::config::import_pccs_json(&from, &to)?;
+            println!("wrote {}", to.display());
+            Ok(())
+        }
+    }
+}
+
+#[tokio::main]
+async fn serve_main(cfg: Config) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::try_new(&cfg.log_level).unwrap_or_else(|e| {
             eprintln!("invalid LogLevel {:?}: {e}; using info", cfg.log_level);
@@ -486,9 +507,8 @@ mod tests {
         use axum_server::accept::Accept;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = tokio::spawn(async move {
-            tokio::net::TcpStream::connect(addr).await.unwrap()
-        });
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
         let (stream, _) = listener.accept().await.unwrap();
         tune_tcp(&stream);
         let (stream, _service) = TunedAcceptor.accept(stream, ()).await.unwrap();

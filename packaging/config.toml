@@ -1,0 +1,37 @@
+# pccs-rs — Intel PCCS replacement
+#
+# Out of the box this file only needs an Intel PCS API key.
+# Every other setting has a built-in default; uncomment to override.
+#
+# TLS termination belongs on Caddy or nginx in front of this service.
+# This package does not ship a reverse-proxy configuration.
+
+# Required to fetch from Intel PCS (Ocp-Apim-Subscription-Key).
+api_key = ""
+
+# RocksDB directory. The systemd unit creates this via StateDirectory=.
+db_path = "/var/lib/pccs-rs"
+
+# host = "127.0.0.1"
+# port = 8081
+# https = false
+# cert = "certs/file.crt"
+# key = "certs/private.pem"
+# cache_mode = "lazy" # lazy | offline | req
+# uri = "https://api.trustedservices.intel.com/sgx/certification/v4/"
+# proxy is not supported; a non-empty value refuses to start.
+# refresh_schedule = "0 0 1 * * *"
+# user_token_hash = ""
+# admin_token_hash = ""
+# log_level = "info"
+# max_request_body_size = "2MB"
+# request_timeout_seconds = 15
+# headers_timeout_seconds = 10
+# keepalive_timeout_seconds = 60
+# upstream_max_concurrent = 64
+# upstream_max_attempts = 6
+# upstream_pool_idle_seconds = 60
+# rocksdb_block_cache_mb = 8
+# rocksdb_write_buffer_mb = 64
+# rocksdb_max_write_buffers = 2
+# rocksdb_max_open_files = -1

@@ -11,16 +11,39 @@ Production **Rust + Tokio** replacement for
   get: the value is the response body plus Intel headers.
 - Licensed under [Apache 2.0](#license).
 
-## Running behind Caddy
+## Debian / Ubuntu package
 
-Caddy terminates TLS. pccs-rs listens on HTTP:
+Release artifacts include `pccs-rs_<version>_amd64.deb`, built against glibc
+2.31 (Debian 11+, Ubuntu 20.04+). The package ships the binary, a systemd
+unit, and `/etc/pccs-rs/config.toml`. Put Caddy or nginx in front if you want
+TLS; this package does not include a reverse-proxy configuration.
 
 ```bash
-pccs-rs \
+sudo dpkg -i pccs-rs_<version>_amd64.deb
+# set api_key in /etc/pccs-rs/config.toml, then:
+sudo systemctl enable --now pccs-rs
+```
+
+To copy values out of an existing Node PCCS `pccs.json` / `default.json`:
+
+```bash
+sudo pccs-rs config import /opt/intel/sgx-dcap-pccs/config/default.json
+```
+
+That writes `/etc/pccs-rs/config.toml` (override with `--to`). An existing
+destination is updated in place: keys present in the JSON are overwritten,
+other keys and comments are kept.
+
+## Running behind Caddy or nginx
+
+Terminate TLS on the reverse proxy. pccs-rs listens on HTTP:
+
+```bash
+pccs-rs serve \
   --http \
   --host 127.0.0.1 \
   --port 8081 \
-  --db-path /var/lib/pccs/rocksdb \
+  --db-path /var/lib/pccs-rs \
   --uri https://api.trustedservices.intel.com/sgx/certification/v4/ \
   --api-key <intel-subscription-key> \
   --cache-mode lazy \
@@ -34,59 +57,62 @@ when that name resolves back here): every cache miss would then call back into
 pccs-rs and recurse. Startup logs a warning when the `uri` host looks like the
 address we bind.
 
-Direct TLS is also supported: `--https --cert certs/file.crt --key certs/private.pem`.
+Direct TLS is also supported: `pccs-rs serve --https --cert certs/file.crt --key certs/private.pem`.
 
 ## Configuration
 
-CLI overrides JSON config file, which overrides built-in defaults. A named
-`--config` file that is unreadable or invalid JSON is a fatal error, not a
+The server starts with `pccs-rs serve`. CLI overrides the TOML config file,
+which overrides built-in defaults. `serve` loads `--config` / `PCCS_CONFIG` if
+set, otherwise `/etc/pccs-rs/config.toml` when that file exists. A named or
+auto-selected file that is unreadable or invalid TOML is a fatal error, not a
 silent fall-back to defaults.
 
-`--config /etc/pccs/config.json` uses the same field names as Intel
-`service/config/default.json`, plus `DB_PATH` instead of sqlite:
+The packaged file only needs `api_key` filled in. Everything else is optional:
 
-```json
-{
-  "HTTPS_PORT": 8081,
-  "hosts": "127.0.0.1",
-  "uri": "https://api.trustedservices.intel.com/sgx/certification/v4/",
-  "ApiKey": "",
-  "proxy": "",
-  "RefreshSchedule": "0 0 1 * * *",
-  "UserTokenHash": "",
-  "AdminTokenHash": "",
-  "CachingFillMode": "LAZY",
-  "LogLevel": "info",
-  "DB_PATH": "/var/lib/pccs/rocksdb",
-  "MaxRequestBodySize": "2MB",
-  "RequestTimeoutSeconds": 15,
-  "HeadersTimeoutSeconds": 10,
-  "KeepAliveTimeoutSeconds": 60,
-  "UpstreamMaxConcurrent": 64,
-  "UpstreamMaxAttempts": 6,
-  "UpstreamPoolIdleSeconds": 60,
-  "RocksDbBlockCacheMb": 8,
-  "RocksDbWriteBufferMb": 64,
-  "RocksDbMaxWriteBuffers": 2,
-  "RocksDbMaxOpenFiles": -1
-}
+```toml
+api_key = ""
+db_path = "/var/lib/pccs-rs"
+
+# host = "127.0.0.1"
+# port = 8081
+# https = false
+# cert = "certs/file.crt"
+# key = "certs/private.pem"
+# cache_mode = "lazy" # lazy | offline | req
+# uri = "https://api.trustedservices.intel.com/sgx/certification/v4/"
+# proxy is not supported; a non-empty value refuses to start.
+# refresh_schedule = "0 0 1 * * *"
+# user_token_hash = ""
+# admin_token_hash = ""
+# log_level = "info"
+# max_request_body_size = "2MB"
+# request_timeout_seconds = 15
+# headers_timeout_seconds = 10
+# keepalive_timeout_seconds = 60
+# upstream_max_concurrent = 64
+# upstream_max_attempts = 6
+# upstream_pool_idle_seconds = 60
+# rocksdb_block_cache_mb = 8
+# rocksdb_write_buffer_mb = 64
+# rocksdb_max_write_buffers = 2
+# rocksdb_max_open_files = -1
 ```
 
 Notes:
 
 - Default upstream is Intel PCS, the same as Node `config/default.json`.
-- `ApiKey` (`Ocp-Apim-Subscription-Key`) is sent exactly where Node sends it:
+- `api_key` (`Ocp-Apim-Subscription-Key`) is sent exactly where Node sends it:
   on `pckcerts` requests, and on every request to the early-access portal
   (`https://validation.api.trustedservices.intel.com/`). Never on CRL downloads.
 - `proxy` is **not supported**; startup fails if it is set. Remove it and run
   pccs-rs on a host with direct outbound access.
-- `RefreshSchedule` is a 6-field cron (seconds first). Default: daily 01:00.
+- `refresh_schedule` is a 6-field cron (seconds first). Default: daily 01:00.
 - SIGINT / SIGTERM shuts down gracefully (10s for in-flight requests) and
   closes RocksDB.
 
 ### Tokens
 
-**There is no default token.** `UserTokenHash` / `AdminTokenHash` are empty out
+**There is no default token.** `user_token_hash` / `admin_token_hash` are empty out
 of the box; an empty or malformed hash logs an ERROR at startup and every
 request to an endpoint guarded by that token answers `401`. Tokens are SHA-512
 hex of the raw header value (timing-safe compare):
@@ -106,14 +132,14 @@ logs a loud warning. Never in production.
 
 ### Timeouts and upstream limits
 
-| CLI | env | JSON | default |
+| CLI | env | TOML | default |
 |-----|-----|------|---------|
-| `--request-timeout-seconds` | `PCCS_REQUEST_TIMEOUT_SECONDS` | `RequestTimeoutSeconds` | 15 |
-| `--headers-timeout-seconds` | `PCCS_HEADERS_TIMEOUT_SECONDS` | `HeadersTimeoutSeconds` | 10 |
-| `--keepalive-timeout-seconds` | `PCCS_KEEPALIVE_TIMEOUT_SECONDS` | `KeepAliveTimeoutSeconds` | 60 |
-| `--upstream-max-concurrent` | `PCCS_UPSTREAM_MAX_CONCURRENT` | `UpstreamMaxConcurrent` | 64 |
-| `--upstream-max-attempts` | `PCCS_UPSTREAM_MAX_ATTEMPTS` | `UpstreamMaxAttempts` | 6 |
-| `--upstream-pool-idle-seconds` | `PCCS_UPSTREAM_POOL_IDLE_SECONDS` | `UpstreamPoolIdleSeconds` | 60 |
+| `--request-timeout-seconds` | `PCCS_REQUEST_TIMEOUT_SECONDS` | `request_timeout_seconds` | 15 |
+| `--headers-timeout-seconds` | `PCCS_HEADERS_TIMEOUT_SECONDS` | `headers_timeout_seconds` | 10 |
+| `--keepalive-timeout-seconds` | `PCCS_KEEPALIVE_TIMEOUT_SECONDS` | `keepalive_timeout_seconds` | 60 |
+| `--upstream-max-concurrent` | `PCCS_UPSTREAM_MAX_CONCURRENT` | `upstream_max_concurrent` | 64 |
+| `--upstream-max-attempts` | `PCCS_UPSTREAM_MAX_ATTEMPTS` | `upstream_max_attempts` | 6 |
+| `--upstream-pool-idle-seconds` | `PCCS_UPSTREAM_POOL_IDLE_SECONDS` | `upstream_pool_idle_seconds` | 60 |
 
 `RequestTimeoutSeconds` bounds **receiving** a request, matching Node's
 `server.requestTimeout` — the headers half via hyper's header read timeout, the
@@ -258,7 +284,7 @@ pceid / cpusvn / pcesvn) is still served straight from cache.
 ./scripts/bench.sh
 # or manually:
 cargo build --release --bin pccs-rs --bin loadgen
-./target/release/pccs-rs --http --port 18081 --db-path /tmp/pccs-bench --uri '' --seed fixtures/seed.json &
+./target/release/pccs-rs serve --http --port 18081 --db-path /tmp/pccs-bench --uri '' --seed fixtures/seed.json &
 ./target/release/loadgen --url http://127.0.0.1:18081 --duration 5 --concurrency 32
 ```
 
@@ -273,18 +299,18 @@ compare summary: [`docs/compare-results.md`](docs/compare-results.md).
 
 ### RocksDB memory flags
 
-All four knobs are runtime-configurable (CLI overrides JSON / env). Applied in
+All four knobs are runtime-configurable (CLI overrides TOML / env). Applied in
 `Store::open` via `Options` + `BlockBasedOptions` (zstd stays on).
 
-| CLI | env | JSON | default |
+| CLI | env | TOML | default |
 |-----|-----|------|---------|
-| `--rocksdb-block-cache-mb` | `PCCS_ROCKSDB_BLOCK_CACHE_MB` | `RocksDbBlockCacheMb` | 8 (stock LRU) |
-| `--rocksdb-write-buffer-mb` | `PCCS_ROCKSDB_WRITE_BUFFER_MB` | `RocksDbWriteBufferMb` | 64 |
-| `--rocksdb-max-write-buffers` | | `RocksDbMaxWriteBuffers` | 2 |
-| `--rocksdb-max-open-files` | | `RocksDbMaxOpenFiles` | -1 (unlimited) |
+| `--rocksdb-block-cache-mb` | `PCCS_ROCKSDB_BLOCK_CACHE_MB` | `rocksdb_block_cache_mb` | 8 (stock LRU) |
+| `--rocksdb-write-buffer-mb` | `PCCS_ROCKSDB_WRITE_BUFFER_MB` | `rocksdb_write_buffer_mb` | 64 |
+| `--rocksdb-max-write-buffers` | | `rocksdb_max_write_buffers` | 2 |
+| `--rocksdb-max-open-files` | | `rocksdb_max_open_files` | -1 (unlimited) |
 
 ```bash
-pccs-rs --http --port 8081 \
+pccs-rs serve --http --port 8081 \
   --rocksdb-block-cache-mb 8 \
   --rocksdb-write-buffer-mb 16 \
   --rocksdb-max-write-buffers 2 \
