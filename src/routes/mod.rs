@@ -45,3 +45,9 @@ pub fn healthz_router() -> Router<AppState> {
         .route("/ready", get(health::readiness))
         .route("/startup", get(health::startup))
 }
+
+pub fn amd_kds_router() -> Router<AppState> {
+    Router::new()
+        .route("/{product}/cert_chain", get(handlers::get_amd_cert_chain))
+        .route("/{product}/{hwid}", get(handlers::get_amd_vcek))
+}
