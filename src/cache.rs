@@ -177,6 +177,9 @@ impl Cache {
         }
         self.store.record_miss();
         tracing::info!("cache miss amd kds url={url}");
+        if self.mode != CacheMode::Lazy {
+            return Err(error::NO_CACHE_DATA);
+        }
 
         let key = keys::amd_kds(&url);
         let _guard = self.key_lock(&key).await?;
@@ -188,11 +191,12 @@ impl Cache {
         }
 
         self.store.record_upstream();
-        let (status, headers, body) = self
+        let fetched = self
             .pcs
             .get_url(&url)
             .await
-            .map_err(|_| error::AMD_KDS_ACCESS_FAILURE)?;
+            .map_err(|_| error::AMD_KDS_ACCESS_FAILURE);
+        let (status, headers, body) = self.note(&key, fetched).await?;
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -219,7 +223,7 @@ impl Cache {
             body,
             content_type,
             content_disposition,
-            fetched_at: now,
+            fetched_at: unix_time(),
         };
         self.store.put_amd_kds(&rec)?;
         Ok(rec.into())

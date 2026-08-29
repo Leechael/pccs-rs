@@ -133,9 +133,11 @@ impl PcsClient {
             // result); the one POST (`pckcerts` with a platform manifest) is
             // already replayed by the retry loop in `send`.
             .retry_canceled_requests(true);
-        let https = cfg.uri.starts_with("https://")
-            || cfg.amd_kds_uri.starts_with("https://")
-            || (cfg.uri.is_empty() && cfg.amd_kds_uri.is_empty());
+        let uri = cfg.uri.trim();
+        let amd_kds_uri = cfg.amd_kds_uri.trim();
+        let https = uri.starts_with("https://")
+            || amd_kds_uri.starts_with("https://")
+            || (uri.is_empty() && amd_kds_uri.is_empty());
         let client = if https {
             http_conn.enforce_http(false);
             let https_conn = hyper_rustls::HttpsConnectorBuilder::new()
@@ -900,6 +902,17 @@ mod tests {
             ..Config::default()
         };
         PcsClient::new(&cfg).unwrap()
+    }
+
+    #[test]
+    fn amd_kds_scheme_ignores_surrounding_whitespace() {
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: "  https://kds.example/vcek/v1  ".into(),
+            ..Config::default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        assert!(matches!(client.client, AnyClient::Https(_)));
     }
 
     async fn spawn(app: axum::Router) -> String {

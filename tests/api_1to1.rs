@@ -199,6 +199,42 @@ async fn amd_kds_transport_failure_is_a_bad_gateway() {
 }
 
 #[tokio::test]
+async fn concurrent_amd_kds_transport_failures_issue_one_upstream_fetch() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_calls = calls.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            mock_calls.fetch_add(1, Ordering::Relaxed);
+            drop(socket);
+        }
+    });
+
+    let db_path = std::env::temp_dir().join(format!(
+        "pccs-rs-amd-failed-concurrent-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: format!("http://{addr}/vcek/v1"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let path = "/vcek/v1/Genoa/cert_chain";
+
+    let (one, two) = tokio::join!(send(app.clone(), get(path)), send(app.clone(), get(path)));
+    assert_eq!(one.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(two.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
 async fn concurrent_amd_kds_misses_issue_one_upstream_fetch() {
     let calls = Arc::new(AtomicU64::new(0));
     let mock_calls = calls.clone();
@@ -270,6 +306,35 @@ async fn amd_kds_cache_survives_restart() {
 }
 
 #[tokio::test]
+async fn non_lazy_amd_kds_miss_never_calls_upstream() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_amd_kds(calls.clone()).await;
+
+    for mode in [CacheMode::Req, CacheMode::Offline] {
+        let db_path = std::env::temp_dir().join(format!(
+            "pccs-rs-amd-no-fill-{}-{}",
+            mode.as_str(),
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: upstream.clone(),
+            cache_mode: mode,
+            db_path: db_path.clone(),
+            upstream_max_attempts: 1,
+            ..Config::test_default()
+        };
+        let app = create_app_from_config(cfg);
+
+        let (status, _, _) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{}", mode.as_str());
+        drop(app);
+        let _ = std::fs::remove_dir_all(db_path);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn amd_kds_error_response_is_relayed_and_not_cached() {
     let calls = Arc::new(AtomicU64::new(0));
     let mock_calls = calls.clone();
@@ -310,6 +375,49 @@ async fn amd_kds_error_response_is_relayed_and_not_cached() {
         assert_eq!(body, "slow down");
     }
     assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_ttl_starts_after_the_upstream_response() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/vcek/v1/Genoa/cert_chain",
+        axum::routing::get(move || {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                "amd-chain"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-amd-ttl-start-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: format!("http://{addr}/vcek/v1"),
+        amd_kds_cache_ttl_secs: 1,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for _ in 0..2 {
+        let (status, _, _) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);
