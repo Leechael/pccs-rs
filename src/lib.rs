@@ -1,6 +1,6 @@
-//! pccs-rs — production Rust replacement for Intel PCCS.
+//! pccs-rs — Rust collateral cache for Intel PCS and AMD KDS.
 //!
-//! HTTP API is 1:1 with Node. RocksDB is the source of truth.
+//! The Intel HTTP API is 1:1 with Node PCCS. RocksDB is the source of truth.
 
 #![forbid(unsafe_code)]
 
@@ -48,7 +48,9 @@ pub fn create_app(state: AppState) -> Router {
         .fallback(routes::handlers::not_found)
         .layer(middleware::from_fn(auth::v3_eol_warning));
 
-    let mut app = Router::new().nest("/sgx/certification/v3", sgx_v3);
+    let mut app = Router::new()
+        .nest("/sgx/certification/v3", sgx_v3)
+        .nest("/vcek/v1", routes::amd_kds_router());
     if pcs_ver == 4 {
         app = app
             .nest("/sgx/certification/v4", routes::sgx_router(state.clone()))

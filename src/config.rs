@@ -17,6 +17,8 @@ pub const DEFAULT_ADMIN_TOKEN_HASH: &str =
 
 /// Intel PCS, same as Node `service/config/default.json`.
 pub const DEFAULT_URI: &str = "https://api.trustedservices.intel.com/sgx/certification/v4/";
+pub const DEFAULT_AMD_KDS_URI: &str = "https://kdsintf.amd.com/vcek/v1";
+pub const DEFAULT_AMD_KDS_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_REFRESH: &str = "0 0 1 * * *";
 
 /// Packaged default path. systemd always passes `--config` pointing here.
@@ -100,7 +102,7 @@ impl CacheMode {
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "pccs-rs",
-    about = "Rust PCCS — Intel PCCS replacement (RocksDB, Caddy-friendly HTTP)"
+    about = "Rust collateral cache for Intel PCS and AMD KDS (RocksDB, Caddy-friendly HTTP)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -171,6 +173,14 @@ pub struct ServeArgs {
 
     #[arg(long, env = "PCCS_API_KEY")]
     pub api_key: Option<String>,
+
+    /// AMD KDS VCEK v1 upstream base URL.
+    #[arg(long, env = "PCCS_AMD_KDS_URI")]
+    pub amd_kds_uri: Option<String>,
+
+    /// Freshness lifetime for cached AMD VCEKs and certificate chains.
+    #[arg(long, env = "PCCS_AMD_KDS_CACHE_TTL_SECONDS")]
+    pub amd_kds_cache_ttl_seconds: Option<u64>,
 
     #[arg(long, env = "PCCS_PROXY")]
     pub proxy: Option<String>,
@@ -302,6 +312,8 @@ struct TomlConfig {
     admin_token_hash: Option<String>,
     uri: Option<String>,
     api_key: Option<String>,
+    amd_kds_uri: Option<String>,
+    amd_kds_cache_ttl_seconds: Option<u64>,
     proxy: Option<String>,
     refresh_schedule: Option<String>,
     db_path: Option<PathBuf>,
@@ -332,6 +344,8 @@ pub struct Config {
     pub admin_token_hash: String,
     pub uri: String,
     pub api_key: String,
+    pub amd_kds_uri: String,
+    pub amd_kds_cache_ttl_secs: u64,
     pub proxy: String,
     pub refresh_schedule: String,
     pub db_path: PathBuf,
@@ -372,6 +386,8 @@ impl Default for Config {
             admin_token_hash: String::new(),
             uri: DEFAULT_URI.into(),
             api_key: String::new(),
+            amd_kds_uri: DEFAULT_AMD_KDS_URI.into(),
+            amd_kds_cache_ttl_secs: DEFAULT_AMD_KDS_CACHE_TTL_SECS,
             proxy: String::new(),
             refresh_schedule: DEFAULT_REFRESH.into(),
             db_path: PathBuf::from("pccs-db"),
@@ -579,6 +595,12 @@ fn apply_toml(cfg: &mut Config, file: TomlConfig) {
     if let Some(k) = file.api_key {
         cfg.api_key = k;
     }
+    if let Some(u) = file.amd_kds_uri {
+        cfg.amd_kds_uri = u;
+    }
+    if let Some(n) = file.amd_kds_cache_ttl_seconds {
+        cfg.amd_kds_cache_ttl_secs = n;
+    }
     if let Some(p) = file.proxy {
         cfg.proxy = p;
     }
@@ -671,6 +693,12 @@ fn apply_cli(cfg: &mut Config, c: ServeArgs) {
     }
     if let Some(k) = c.api_key {
         cfg.api_key = k;
+    }
+    if let Some(u) = c.amd_kds_uri {
+        cfg.amd_kds_uri = u;
+    }
+    if let Some(n) = c.amd_kds_cache_ttl_seconds {
+        cfg.amd_kds_cache_ttl_secs = n;
     }
     if let Some(p) = c.proxy {
         cfg.proxy = p;
@@ -1020,6 +1048,8 @@ mod tests {
                 host = "0.0.0.0"
                 uri = "https://file.example/sgx/certification/v4/"
                 api_key = "file-key"
+                amd_kds_uri = "https://amd-file.example/vcek/v1"
+                amd_kds_cache_ttl_seconds = 123
                 proxy = "http://proxy.example:8080"
                 refresh_schedule = "0 0 2 * * *"
                 user_token_hash = "file-user-hash"
@@ -1044,6 +1074,8 @@ mod tests {
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.uri, "https://file.example/sgx/certification/v4/");
         assert_eq!(cfg.api_key, "file-key");
+        assert_eq!(cfg.amd_kds_uri, "https://amd-file.example/vcek/v1");
+        assert_eq!(cfg.amd_kds_cache_ttl_secs, 123);
         assert_eq!(cfg.proxy, "http://proxy.example:8080");
         assert_eq!(cfg.refresh_schedule, "0 0 2 * * *");
         assert_eq!(cfg.user_token_hash, "file-user-hash");
@@ -1078,6 +1110,10 @@ mod tests {
             "https://cli.example/",
             "--api-key",
             "cli-key",
+            "--amd-kds-uri",
+            "https://amd-cli.example/vcek/v1",
+            "--amd-kds-cache-ttl-seconds",
+            "456",
             "--proxy",
             "http://cli-proxy:1",
             "--refresh-schedule",
@@ -1116,6 +1152,8 @@ mod tests {
         assert_eq!(cfg.admin_token_hash, "cli-admin");
         assert_eq!(cfg.uri, "https://cli.example/");
         assert_eq!(cfg.api_key, "cli-key");
+        assert_eq!(cfg.amd_kds_uri, "https://amd-cli.example/vcek/v1");
+        assert_eq!(cfg.amd_kds_cache_ttl_secs, 456);
         assert_eq!(cfg.proxy, "http://cli-proxy:1");
         assert_eq!(cfg.refresh_schedule, "0 0 3 * * *");
         assert_eq!(cfg.db_path, PathBuf::from("/tmp/cli-db"));

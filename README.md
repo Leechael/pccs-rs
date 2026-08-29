@@ -3,14 +3,15 @@
 Rust + Tokio replacement for
 [Intel PCCS](https://github.com/intel/confidential-computing.tee.dcap.pccs)
 (Provisioning Certificate Caching Service). HTTP API is 1:1 with Node PCCS
-(SGX v3 + v4, TDX v4). The cache is RocksDB and survives restart.
+(SGX v3 + v4, TDX v4) and also provides a read-through AMD KDS VCEK cache.
+The cache is RocksDB and survives restart.
 
 Sit it behind Caddy or nginx. This repo does not ship a reverse-proxy config.
 
 ## 5-minute kickoff
 
-You need an Intel PCS API key (`Ocp-Apim-Subscription-Key`). Everything else
-has a built-in default.
+Intel collateral requires an Intel PCS API key (`Ocp-Apim-Subscription-Key`).
+AMD KDS caching needs no API key. Everything else has a built-in default.
 
 ### Debian / Ubuntu
 
@@ -99,6 +100,8 @@ db_path = "/var/lib/pccs-rs"
 # key = "certs/private.pem"
 # cache_mode = "lazy" # lazy | offline | req
 # uri = "https://api.trustedservices.intel.com/sgx/certification/v4/"
+# amd_kds_uri = "https://kdsintf.amd.com/vcek/v1"
+# amd_kds_cache_ttl_seconds = 2592000 # 30 days
 # proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
 # user_token_hash = ""
@@ -117,7 +120,11 @@ db_path = "/var/lib/pccs-rs"
 # rocksdb_max_open_files = -1
 ```
 
-- Default upstream is Intel PCS.
+- Default Intel upstream is Intel PCS. The AMD KDS upstream defaults to
+  `https://kdsintf.amd.com/vcek/v1`.
+- AMD `cert_chain` and VCEK responses are cached for 30 days by default. Only
+  successful `200` responses are stored; the full upstream URL, including the
+  TCB query string, is the cache key.
 - `api_key` is sent where Node sends it: on `pckcerts`, and on every request
   to `https://validation.api.trustedservices.intel.com/`. Never on CRL
   downloads.
@@ -284,6 +291,7 @@ JSON.
 | `pckcrl/` | ca | CRL bytes + issuer chain |
 | `rootcacrl` | (literal) | CRL bytes |
 | `crl/` | uri | CRL bytes |
+| `amd-kds/` | complete upstream URL | response bytes, content headers, fetch time |
 | `appraisal/` | fmspc | policy list (GET joins defaults) |
 | `preg/` | qeid / pceid / cpusvn / pcesvn | registration queue |
 
@@ -301,6 +309,8 @@ REQ / OFFLINE answer `461` for those platforms until refilled.
 
 - All 30 default v4 routes (SGX v3 + v4 + TDX v4), mounted at
   `/sgx/certification/v3`, `/sgx/certification/v4`, and `/tdx/certification/v4`
+- AMD KDS-compatible `GET /vcek/v1/{product}/cert_chain` and
+  `GET /vcek/v1/{product}/{hwid}?{tcb_parameters}` for Milan, Genoa, and Turin
 - Auth, Request-ID (always freshly generated), v3 Warning, Intel headers,
   `text/html` error bodies, body limit (413 `Content too large.`),
   `x-powered-by` not set

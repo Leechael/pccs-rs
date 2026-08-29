@@ -133,7 +133,9 @@ impl PcsClient {
             // result); the one POST (`pckcerts` with a platform manifest) is
             // already replayed by the retry loop in `send`.
             .retry_canceled_requests(true);
-        let https = cfg.uri.starts_with("https://") || cfg.uri.is_empty();
+        let https = cfg.uri.starts_with("https://")
+            || cfg.amd_kds_uri.starts_with("https://")
+            || (cfg.uri.is_empty() && cfg.amd_kds_uri.is_empty());
         let client = if https {
             http_conn.enforce_http(false);
             let https_conn = hyper_rustls::HttpsConnectorBuilder::new()
@@ -187,6 +189,13 @@ impl PcsClient {
     /// twice so a PCS-side storm is not amplified by every cache miss. A
     /// `Retry-After` header wins over the exponential backoff, capped at 30s.
     async fn get(&self, url: &str) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
+        if !self.enabled() {
+            return Err(error::NO_CACHE_DATA);
+        }
+        self.send(url, None).await
+    }
+
+    pub async fn get_url(&self, url: &str) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
         self.send(url, None).await
     }
 
@@ -198,9 +207,6 @@ impl PcsClient {
         body: Option<Vec<u8>>,
     ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
         Self::check_v3(url)?;
-        if !self.enabled() {
-            return Err(error::NO_CACHE_DATA);
-        }
         self.calls.fetch_add(1, Ordering::Relaxed);
         let send_key = Self::wants_api_key(url) && !self.api_key.is_empty();
         let mut last = error::PCS_ACCESS_FAILURE;
@@ -374,6 +380,9 @@ impl PcsClient {
         platform_manifest: &str,
         pceid: &str,
     ) -> Result<PckCertsResponse, PccsError> {
+        if !self.enabled() {
+            return Err(error::NO_CACHE_DATA);
+        }
         let url = format!("{}pckcerts", self.base);
         let payload = serde_json::json!({
             "platformManifest": platform_manifest,
