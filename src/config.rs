@@ -452,6 +452,7 @@ impl Config {
         let dir = std::env::temp_dir().join(format!("pccs-rs-test-{}", uuid::Uuid::new_v4()));
         Self {
             uri: String::new(),
+            amd_kds_uri: String::new(),
             db_path: dir,
             seed: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/seed.json")),
             no_seed: false,
@@ -983,7 +984,10 @@ mod tests {
         assert!(cfg.admin_token_hash.is_empty());
         assert_eq!(cfg.uri, DEFAULT_URI);
         assert!(is_sha512_hex(DEFAULT_USER_TOKEN_HASH));
-        assert!(is_sha512_hex(Config::test_default().admin_token_hash.as_str()));
+        let test = Config::test_default();
+        assert!(is_sha512_hex(test.admin_token_hash.as_str()));
+        assert!(test.uri.is_empty());
+        assert!(test.amd_kds_uri.is_empty());
     }
 
     #[test]
