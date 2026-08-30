@@ -123,6 +123,10 @@ pub const PCS_ACCESS_FAILURE: PccsError = PccsError::new(
     StatusCode::BAD_GATEWAY,
     "Unable to retrieve the collateral from the Intel SGX PCS.",
 );
+pub const AMD_KDS_ACCESS_FAILURE: PccsError = PccsError::new(
+    StatusCode::BAD_GATEWAY,
+    "Unable to retrieve the collateral from the AMD KDS.",
+);
 
 /// Express `res.send(string)` sets `Content-Type: text/html; charset=utf-8`.
 /// Returning a bare `&str` from axum would say `text/plain`, so success bodies
@@ -157,6 +161,7 @@ mod tests {
         assert_eq!(INTERNAL_ERROR.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(SERVICE_UNAVAILABLE.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(PCS_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(AMD_KDS_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
         assert_eq!(integrity_error().status.as_u16(), 460);
         assert_eq!(platform_unknown().status.as_u16(), 461);
         assert_eq!(certs_unavailable().status.as_u16(), 462);

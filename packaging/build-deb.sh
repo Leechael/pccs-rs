@@ -82,9 +82,9 @@ Depends: libc6 (>= 2.31)
 Installed-Size: ${SIZE_KB}
 Maintainer: Leechael <yanleech@gmail.com>
 Homepage: https://github.com/Leechael/pccs-rs
-Description: Rust replacement for Intel PCCS
- Production Rust + Tokio Provisioning Certificate Caching Service
- with a RocksDB cache and a 1:1 Intel PCCS HTTP API.
+Description: Rust collateral cache for Intel PCS and AMD KDS
+ Production Rust + Tokio collateral service with a RocksDB cache,
+ a 1:1 Intel PCCS HTTP API, and AMD KDS-compatible VCEK endpoints.
 EOF
 
 printf '%s\n' /etc/pccs-rs/config.toml > "$DEB/DEBIAN/conffiles"

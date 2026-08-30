@@ -44,3 +44,9 @@ pub fn tdx_router() -> Router<AppState> {
         .route("/tcb", get(handlers::get_tdx_tcb))
         .route("/qe/identity", get(handlers::get_tdqe_identity))
 }
+
+pub fn amd_kds_router() -> Router<AppState> {
+    Router::new()
+        .route("/vcek/{*rest}", get(handlers::get_amd_kds))
+        .route("/vlek/{*rest}", get(handlers::get_amd_kds))
+}

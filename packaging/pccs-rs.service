@@ -1,5 +1,5 @@
 [Unit]
-Description=pccs-rs Provisioning Certificate Caching Service
+Description=pccs-rs Intel PCS and AMD KDS collateral cache
 Documentation=https://github.com/Leechael/pccs-rs
 After=network-online.target
 Wants=network-online.target

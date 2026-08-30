@@ -5,8 +5,8 @@ use crate::error::{self, PccsError};
 use crate::keys;
 use crate::pcs::{PckCertsResponse, PcsClient};
 use crate::store::{
-    IdentityRecord, PckCertRecord, PckCrlRecord, PlatformCert, PlatformPool, RegisteredPlatform,
-    Store, TcbRecord,
+    AmdKdsRecord, IdentityRecord, PckCertRecord, PckCrlRecord, PlatformCert, PlatformPool,
+    RegisteredPlatform, Store, TcbRecord,
 };
 use crate::validate::UpdateType;
 use std::collections::HashMap;
@@ -23,6 +23,8 @@ pub struct Cache {
     pub mode: CacheMode,
     pub pcs_version: u32,
     pub is_intel: bool,
+    amd_kds_uri: String,
+    amd_kds_cache_ttl_secs: u64,
     /// Per-key locks so N concurrent misses on the same key produce one
     /// upstream request; the losers re-read the store after acquiring.
     inflight: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -36,12 +38,54 @@ pub struct Cache {
 /// queued behind it. Short on purpose — this is stampede control, not caching.
 const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
+pub struct AmdKdsResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub content_disposition: Option<String>,
+    pub retry_after: Option<String>,
+}
+
+impl From<AmdKdsRecord> for AmdKdsResponse {
+    fn from(rec: AmdKdsRecord) -> Self {
+        Self {
+            status: 200,
+            body: rec.body,
+            content_type: rec.content_type,
+            content_disposition: rec.content_disposition,
+            retry_after: None,
+        }
+    }
+}
+
+fn unix_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// AMD KDS host. A legacy `.../vcek/v1` or `.../vlek/v1` suffix is stripped so
+/// `/vcek/` and `/vlek/` request paths can be appended without doubling.
+fn normalize_amd_kds_host(uri: &str) -> String {
+    let mut host = uri.trim().trim_end_matches('/').to_string();
+    for suffix in ["/vcek/v1", "/vlek/v1"] {
+        if let Some(stripped) = host.strip_suffix(suffix) {
+            host = stripped.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+    host
+}
+
 impl Cache {
     pub fn new(store: Store, pcs: PcsClient, cfg: &Config) -> Self {
         Self {
             mode: cfg.cache_mode,
             pcs_version: cfg.pcs_version(),
             is_intel: cfg.is_intel_upstream(),
+            amd_kds_uri: normalize_amd_kds_host(&cfg.amd_kds_uri),
+            amd_kds_cache_ttl_secs: cfg.amd_kds_cache_ttl_secs,
             store,
             pcs,
             inflight: Mutex::new(HashMap::new()),
@@ -128,6 +172,75 @@ impl Cache {
             return false;
         }
         true
+    }
+
+    pub async fn get_amd_kds(&self, path_and_query: &str) -> Result<AmdKdsResponse, PccsError> {
+        let path_and_query = if path_and_query.starts_with('/') {
+            path_and_query.to_string()
+        } else {
+            format!("/{path_and_query}")
+        };
+        let url = format!("{}{path_and_query}", self.amd_kds_uri);
+        let now = unix_time();
+        if let Some(rec) = self.store.get_amd_kds(&url) {
+            if now.saturating_sub(rec.fetched_at) < self.amd_kds_cache_ttl_secs {
+                self.store.record_hit();
+                tracing::debug!("cache hit amd kds");
+                return Ok(rec.into());
+            }
+        }
+        self.store.record_miss();
+        tracing::info!("cache miss amd kds url={url}");
+        if self.mode != CacheMode::Lazy {
+            return Err(error::NO_CACHE_DATA);
+        }
+
+        let key = keys::amd_kds(&url);
+        let _guard = self.key_lock(&key).await?;
+        let now = unix_time();
+        if let Some(rec) = self.store.get_amd_kds(&url) {
+            if now.saturating_sub(rec.fetched_at) < self.amd_kds_cache_ttl_secs {
+                return Ok(rec.into());
+            }
+        }
+
+        self.store.record_upstream();
+        let fetched = self
+            .pcs
+            .get_url(&url)
+            .await
+            .map_err(|_| error::AMD_KDS_ACCESS_FAILURE);
+        let (status, headers, body) = self.note(&key, fetched).await?;
+        let content_type = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let content_disposition = headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let retry_after = headers
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if status != 200 {
+            return Ok(AmdKdsResponse {
+                status,
+                body,
+                content_type,
+                content_disposition,
+                retry_after,
+            });
+        }
+        let rec = AmdKdsRecord {
+            url,
+            body,
+            content_type,
+            content_disposition,
+            fetched_at: unix_time(),
+        };
+        self.store.put_amd_kds(&rec)?;
+        Ok(rec.into())
     }
 
     // ---------------- pckcert ----------------
@@ -994,6 +1107,26 @@ pub fn build_cache(cfg: &Config) -> Result<Arc<Cache>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amd_kds_host_strips_legacy_vcek_and_vlek_suffixes() {
+        assert_eq!(
+            normalize_amd_kds_host("https://kdsintf.amd.com/vcek/v1"),
+            "https://kdsintf.amd.com"
+        );
+        assert_eq!(
+            normalize_amd_kds_host("https://kdsintf.amd.com/vlek/v1/"),
+            "https://kdsintf.amd.com"
+        );
+        assert_eq!(
+            normalize_amd_kds_host(" https://kdsintf.amd.com "),
+            "https://kdsintf.amd.com"
+        );
+        assert_eq!(
+            normalize_amd_kds_host("https://mirror.example/amd-kds/vcek/v1"),
+            "https://mirror.example/amd-kds"
+        );
+    }
 
     #[test]
     fn raw_cpusvn_matches_node_int_to_hex() {

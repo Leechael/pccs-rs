@@ -61,6 +61,36 @@ fn json_value(status: StatusCode, headers: HeaderMap, value: &Value, raw_body: &
     (status, h, body).into_response()
 }
 
+// --------------- AMD KDS ---------------
+
+fn amd_response(rec: crate::cache::AmdKdsResponse) -> Response {
+    let status = StatusCode::from_u16(rec.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut headers = HeaderMap::new();
+    if let Some(value) = rec.content_type.as_deref() {
+        insert(&mut headers, "content-type", value);
+    }
+    if let Some(value) = rec.content_disposition.as_deref() {
+        insert(&mut headers, "content-disposition", value);
+    }
+    if let Some(value) = rec.retry_after.as_deref() {
+        insert(&mut headers, "retry-after", value);
+    }
+    bytes(status, headers, rec.body)
+}
+
+pub async fn get_amd_kds(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, PccsError> {
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{}?{query}", uri.path()),
+        None => uri.path().to_string(),
+    };
+    Ok(amd_response(
+        state.cache.get_amd_kds(&path_and_query).await?,
+    ))
+}
+
 // --------------- pckcert ---------------
 
 pub async fn get_pckcert(

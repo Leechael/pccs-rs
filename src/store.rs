@@ -65,6 +65,15 @@ pub struct CrlRecord {
     pub crl: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmdKdsRecord {
+    pub url: String,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub content_disposition: Option<String>,
+    pub fetched_at: u64,
+}
+
 /// `GET /platforms?source=[fmspc]` row. Node's SQL selects exactly these six
 /// columns — `fmspc` and `ca` are filter/join columns and are not returned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,6 +534,19 @@ impl Store {
             .into_iter()
             .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
             .collect()
+    }
+
+    pub fn get_amd_kds(&self, url: &str) -> Option<AmdKdsRecord> {
+        let rec: AmdKdsRecord = self.get_json(&keys::amd_kds(url))?;
+        if rec.url != url {
+            tracing::warn!("amd kds record does not match its key; treating as a miss");
+            return None;
+        }
+        Some(rec)
+    }
+
+    pub fn put_amd_kds(&self, rec: &AmdKdsRecord) -> Result<(), PccsError> {
+        self.put_json(&keys::amd_kds(&rec.url), rec)
     }
 
     // ---------- registration queue ----------

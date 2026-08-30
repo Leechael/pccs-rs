@@ -2,7 +2,7 @@
 name = "pccs-rs"
 version = "0.3.0"
 edition = "2021"
-description = "Production Rust + Tokio replacement for Intel PCCS (RocksDB cache, 1:1 HTTP API)"
+description = "Rust collateral cache for Intel PCS and AMD KDS, backed by RocksDB"
 license = "Apache-2.0"
 default-run = "pccs-rs"
 
