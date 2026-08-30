@@ -21,6 +21,8 @@ db_path = "/var/lib/pccs-rs"
 # uri = "https://api.trustedservices.intel.com/sgx/certification/v4/"
 # amd_kds_uri = "https://kdsintf.amd.com"
 # amd_kds_cache_ttl_seconds = 2592000 # 30 days
+# nvidia_rim_uri = "https://rim.attestation.nvidia.com"
+# nvidia_rim_cache_ttl_seconds = 2592000 # 30 days
 # proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
 # user_token_hash = ""

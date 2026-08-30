@@ -3,7 +3,7 @@
 Rust + Tokio replacement for
 [Intel PCCS](https://github.com/intel/confidential-computing.tee.dcap.pccs)
 (Provisioning Certificate Caching Service). HTTP API is 1:1 with Node PCCS
-(SGX v3 + v4, TDX v4) and also provides a read-through AMD KDS cache for `/vcek/` and `/vlek/`.
+(SGX v3 + v4, TDX v4) and also provides read-through caches for AMD KDS (`/vcek/`, `/vlek/`) and NVIDIA RIM (`/v1/rim/`).
 The cache is RocksDB and survives restart.
 
 Sit it behind Caddy or nginx. This repo does not ship a reverse-proxy config.
@@ -102,6 +102,8 @@ db_path = "/var/lib/pccs-rs"
 # uri = "https://api.trustedservices.intel.com/sgx/certification/v4/"
 # amd_kds_uri = "https://kdsintf.amd.com"
 # amd_kds_cache_ttl_seconds = 2592000 # 30 days
+# nvidia_rim_uri = "https://rim.attestation.nvidia.com"
+# nvidia_rim_cache_ttl_seconds = 2592000 # 30 days
 # proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
 # user_token_hash = ""
@@ -124,9 +126,12 @@ db_path = "/var/lib/pccs-rs"
   `https://kdsintf.amd.com`. Request paths under `/vcek/` and `/vlek/` are
   forwarded unchanged. A legacy `.../vcek/v1` or `.../vlek/v1` suffix on the
   configured host is stripped.
-- AMD KDS responses are cached for 30 days by default. Only successful `200`
-  responses are stored; the full upstream URL, including the TCB query string,
-  is the cache key.
+- AMD KDS and NVIDIA RIM responses are cached for 30 days by default. Only
+  successful `200` responses are stored; the full upstream URL, including the
+  query string, is the cache key.
+- The NVIDIA RIM host defaults to `https://rim.attestation.nvidia.com`.
+  Request paths under `/v1/rim/` are forwarded unchanged. A legacy `.../v1/rim`
+  suffix on the configured host is stripped.
 - `api_key` is sent where Node sends it: on `pckcerts`, and on every request
   to `https://validation.api.trustedservices.intel.com/`. Never on CRL
   downloads.
@@ -313,6 +318,8 @@ REQ / OFFLINE answer `461` for those platforms until refilled.
   `/sgx/certification/v3`, `/sgx/certification/v4`, and `/tdx/certification/v4`
 - AMD KDS-compatible `GET /vcek/{*path}` and `GET /vlek/{*path}` (VCEK, VLEK,
   `cert_chain`, and `crl`), forwarding path and query to `kdsintf.amd.com`
+- NVIDIA RIM-compatible `GET /v1/rim/{*path}`, forwarding path and query to
+  `rim.attestation.nvidia.com`
 - Auth, Request-ID (always freshly generated), v3 Warning, Intel headers,
   `text/html` error bodies, body limit (413 `Content too large.`),
   `x-powered-by` not set

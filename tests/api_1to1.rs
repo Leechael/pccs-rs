@@ -522,6 +522,162 @@ async fn amd_vcek_cache_key_includes_the_complete_query() {
 }
 
 #[tokio::test]
+async fn nvidia_rim_is_cached_by_its_full_url() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/v1/rim/{id}",
+        axum::routing::get(move |uri: axum::http::Uri| {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                (
+                    [("content-type", "application/json")],
+                    format!("rim {}", uri.path()),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nvidia-rim-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: format!("http://{addr}/v1/rim"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for _ in 0..2 {
+        let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "rim /v1/rim/some-id");
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_rim_transport_failure_is_a_bad_gateway() {
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nvidia-transport-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: "http://127.0.0.1:9".into(),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    let (status, _, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        body,
+        "Unable to retrieve the collateral from the NVIDIA RIM service."
+    );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn non_lazy_nvidia_rim_miss_never_calls_upstream() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().fallback(move || {
+        let calls = mock_calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            "rim"
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    for mode in [CacheMode::Req, CacheMode::Offline] {
+        let db_path = std::env::temp_dir().join(format!(
+            "pccs-rs-nvidia-no-fill-{}-{}",
+            mode.as_str(),
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = Config {
+            uri: String::new(),
+            nvidia_rim_uri: format!("http://{addr}"),
+            cache_mode: mode,
+            db_path: db_path.clone(),
+            upstream_max_attempts: 1,
+            ..Config::test_default()
+        };
+        let app = create_app_from_config(cfg);
+        let (status, _, _) = send(app.clone(), get("/v1/rim/some-id")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{}", mode.as_str());
+        drop(app);
+        let _ = std::fs::remove_dir_all(db_path);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn nvidia_rim_error_response_is_relayed_and_not_cached() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/v1/rim/some-id",
+        axum::routing::get(move || {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "10")],
+                    "slow down",
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nvidia-error-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: format!("http://{addr}"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for _ in 0..2 {
+        let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers.get("retry-after").unwrap(), "10");
+        assert_eq!(body, "slow down");
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
 async fn every_documented_route_is_registered() {
     let routes: &[(&str, &str)] = &[
         ("POST", "/sgx/certification/v3/platforms"),
@@ -557,6 +713,7 @@ async fn every_documented_route_is_registered() {
         ("GET", "/vcek/v1/Genoa/cert_chain"),
         ("GET", "/vcek/v1/Genoa/crl"),
         ("GET", "/vlek/v1/Genoa/cert_chain"),
+        ("GET", "/v1/rim/some-id"),
     ];
 
     for (method, path) in routes {
