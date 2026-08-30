@@ -19,7 +19,7 @@ db_path = "/var/lib/pccs-rs"
 # key = "certs/private.pem"
 # cache_mode = "lazy" # lazy | offline | req
 # uri = "https://api.trustedservices.intel.com/sgx/certification/v4/"
-# amd_kds_uri = "https://kdsintf.amd.com/vcek/v1"
+# amd_kds_uri = "https://kdsintf.amd.com"
 # amd_kds_cache_ttl_seconds = 2592000 # 30 days
 # proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
