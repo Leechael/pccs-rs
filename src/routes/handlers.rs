@@ -78,16 +78,34 @@ fn amd_response(rec: crate::cache::AmdKdsResponse) -> Response {
     bytes(status, headers, rec.body)
 }
 
+fn original_path_and_query(uri: &Uri) -> String {
+    match uri.query() {
+        Some(query) => format!("{}?{query}", uri.path()),
+        None => uri.path().to_string(),
+    }
+}
+
 pub async fn get_amd_kds(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
-    let path_and_query = match uri.query() {
-        Some(query) => format!("{}?{query}", uri.path()),
-        None => uri.path().to_string(),
-    };
     Ok(amd_response(
-        state.cache.get_amd_kds(&path_and_query).await?,
+        state
+            .cache
+            .get_amd_kds(&original_path_and_query(&uri))
+            .await?,
+    ))
+}
+
+pub async fn get_nvidia_rim(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, PccsError> {
+    Ok(amd_response(
+        state
+            .cache
+            .get_nvidia_rim(&original_path_and_query(&uri))
+            .await?,
     ))
 }
 

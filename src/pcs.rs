@@ -135,9 +135,11 @@ impl PcsClient {
             .retry_canceled_requests(true);
         let uri = cfg.uri.trim();
         let amd_kds_uri = cfg.amd_kds_uri.trim();
+        let nvidia_rim_uri = cfg.nvidia_rim_uri.trim();
         let https = uri.starts_with("https://")
             || amd_kds_uri.starts_with("https://")
-            || (uri.is_empty() && amd_kds_uri.is_empty());
+            || nvidia_rim_uri.starts_with("https://")
+            || (uri.is_empty() && amd_kds_uri.is_empty() && nvidia_rim_uri.is_empty());
         let client = if https {
             http_conn.enforce_http(false);
             let https_conn = hyper_rustls::HttpsConnectorBuilder::new()
@@ -909,6 +911,18 @@ mod tests {
         let cfg = Config {
             uri: String::new(),
             amd_kds_uri: "  https://kds.example/vcek/v1  ".into(),
+            ..Config::default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        assert!(matches!(client.client, AnyClient::Https(_)));
+    }
+
+    #[test]
+    fn nvidia_rim_scheme_ignores_surrounding_whitespace() {
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: String::new(),
+            nvidia_rim_uri: "  https://rim.example/v1/rim  ".into(),
             ..Config::default()
         };
         let client = PcsClient::new(&cfg).unwrap();
