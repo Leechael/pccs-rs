@@ -128,7 +128,7 @@ async fn spawn_amd_kds(calls: Arc<AtomicU64>) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    format!("http://{addr}/vcek/v1")
+    format!("http://{addr}")
 }
 
 #[tokio::test]
@@ -162,19 +162,46 @@ async fn amd_kds_cert_chain_is_cached_by_its_full_url() {
 }
 
 #[tokio::test]
-async fn amd_kds_rejects_unknown_products_and_wrong_hardware_ids() {
+async fn amd_kds_forwards_vcek_vlek_and_crl_paths() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let calls = mock_calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            uri.path().to_string()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-amd-prefix-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: format!("http://{addr}/vcek/v1"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
     for path in [
-        "/vcek/v1/Rome/cert_chain".to_string(),
-        "/vcek/v1/Genoa/abcd?blSPL=1&teeSPL=2&snpSPL=3&ucodeSPL=4".to_string(),
-        format!(
-            "/vcek/v1/Turin/{}?fmcSPL=1&blSPL=2&teeSPL=3&snpSPL=4&ucodeSPL=5",
-            "ab".repeat(64)
-        ),
+        "/vcek/v1/Genoa/cert_chain",
+        "/vcek/v1/Genoa/crl",
+        "/vlek/v1/Genoa/cert_chain",
+        "/vlek/v1/Milan/abcd",
     ] {
-        let (status, _, body) = send(app(), get(&path)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
-        assert_eq!(body, "Invalid request parameters.");
+        let (status, _, body) = send(app.clone(), get(path)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(body, path, "{path}");
     }
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
 }
 
 #[tokio::test]
@@ -183,7 +210,7 @@ async fn amd_kds_transport_failure_is_a_bad_gateway() {
         std::env::temp_dir().join(format!("pccs-rs-amd-transport-{}", uuid::Uuid::new_v4()));
     let cfg = Config {
         uri: String::new(),
-        amd_kds_uri: "http://127.0.0.1:9/vcek/v1".into(),
+        amd_kds_uri: "http://127.0.0.1:9".into(),
         db_path: db_path.clone(),
         upstream_max_attempts: 1,
         ..Config::test_default()
@@ -217,7 +244,7 @@ async fn concurrent_amd_kds_transport_failures_issue_one_upstream_fetch() {
     ));
     let cfg = Config {
         uri: String::new(),
-        amd_kds_uri: format!("http://{addr}/vcek/v1"),
+        amd_kds_uri: format!("http://{addr}"),
         db_path: db_path.clone(),
         upstream_max_attempts: 1,
         ..Config::test_default()
@@ -259,7 +286,7 @@ async fn concurrent_amd_kds_misses_issue_one_upstream_fetch() {
         std::env::temp_dir().join(format!("pccs-rs-amd-concurrent-{}", uuid::Uuid::new_v4()));
     let cfg = Config {
         uri: String::new(),
-        amd_kds_uri: format!("http://{addr}/vcek/v1"),
+        amd_kds_uri: format!("http://{addr}"),
         db_path: db_path.clone(),
         upstream_max_attempts: 1,
         ..Config::test_default()
@@ -361,7 +388,7 @@ async fn amd_kds_error_response_is_relayed_and_not_cached() {
     let db_path = std::env::temp_dir().join(format!("pccs-rs-amd-error-{}", uuid::Uuid::new_v4()));
     let cfg = Config {
         uri: String::new(),
-        amd_kds_uri: format!("http://{addr}/vcek/v1"),
+        amd_kds_uri: format!("http://{addr}"),
         db_path: db_path.clone(),
         upstream_max_attempts: 1,
         ..Config::test_default()
@@ -405,7 +432,7 @@ async fn amd_kds_ttl_starts_after_the_upstream_response() {
         std::env::temp_dir().join(format!("pccs-rs-amd-ttl-start-{}", uuid::Uuid::new_v4()));
     let cfg = Config {
         uri: String::new(),
-        amd_kds_uri: format!("http://{addr}/vcek/v1"),
+        amd_kds_uri: format!("http://{addr}"),
         amd_kds_cache_ttl_secs: 1,
         db_path: db_path.clone(),
         upstream_max_attempts: 1,
@@ -472,7 +499,7 @@ async fn amd_vcek_cache_key_includes_the_complete_query() {
     let db_path = std::env::temp_dir().join(format!("pccs-rs-amd-vcek-{}", uuid::Uuid::new_v4()));
     let cfg = Config {
         uri: String::new(),
-        amd_kds_uri: format!("http://{addr}/vcek/v1"),
+        amd_kds_uri: format!("http://{addr}"),
         db_path: db_path.clone(),
         upstream_max_attempts: 1,
         ..Config::test_default()
@@ -527,6 +554,9 @@ async fn every_documented_route_is_registered() {
         ("GET", "/sgx/certification/v4/appraisalpolicy"),
         ("GET", "/tdx/certification/v4/tcb"),
         ("GET", "/tdx/certification/v4/qe/identity"),
+        ("GET", "/vcek/v1/Genoa/cert_chain"),
+        ("GET", "/vcek/v1/Genoa/crl"),
+        ("GET", "/vlek/v1/Genoa/cert_chain"),
     ];
 
     for (method, path) in routes {

@@ -65,13 +65,26 @@ fn unix_time() -> u64 {
         .as_secs()
 }
 
+/// AMD KDS host. A legacy `.../vcek/v1` or `.../vlek/v1` suffix is stripped so
+/// `/vcek/` and `/vlek/` request paths can be appended without doubling.
+fn normalize_amd_kds_host(uri: &str) -> String {
+    let mut host = uri.trim().trim_end_matches('/').to_string();
+    for suffix in ["/vcek/v1", "/vlek/v1"] {
+        if let Some(stripped) = host.strip_suffix(suffix) {
+            host = stripped.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+    host
+}
+
 impl Cache {
     pub fn new(store: Store, pcs: PcsClient, cfg: &Config) -> Self {
         Self {
             mode: cfg.cache_mode,
             pcs_version: cfg.pcs_version(),
             is_intel: cfg.is_intel_upstream(),
-            amd_kds_uri: cfg.amd_kds_uri.trim().trim_end_matches('/').to_string(),
+            amd_kds_uri: normalize_amd_kds_host(&cfg.amd_kds_uri),
             amd_kds_cache_ttl_secs: cfg.amd_kds_cache_ttl_secs,
             store,
             pcs,
@@ -161,12 +174,13 @@ impl Cache {
         true
     }
 
-    pub async fn get_amd_kds(&self, relative_url: &str) -> Result<AmdKdsResponse, PccsError> {
-        let url = format!(
-            "{}/{}",
-            self.amd_kds_uri,
-            relative_url.trim_start_matches('/')
-        );
+    pub async fn get_amd_kds(&self, path_and_query: &str) -> Result<AmdKdsResponse, PccsError> {
+        let path_and_query = if path_and_query.starts_with('/') {
+            path_and_query.to_string()
+        } else {
+            format!("/{path_and_query}")
+        };
+        let url = format!("{}{path_and_query}", self.amd_kds_uri);
         let now = unix_time();
         if let Some(rec) = self.store.get_amd_kds(&url) {
             if now.saturating_sub(rec.fetched_at) < self.amd_kds_cache_ttl_secs {
@@ -1093,6 +1107,26 @@ pub fn build_cache(cfg: &Config) -> Result<Arc<Cache>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amd_kds_host_strips_legacy_vcek_and_vlek_suffixes() {
+        assert_eq!(
+            normalize_amd_kds_host("https://kdsintf.amd.com/vcek/v1"),
+            "https://kdsintf.amd.com"
+        );
+        assert_eq!(
+            normalize_amd_kds_host("https://kdsintf.amd.com/vlek/v1/"),
+            "https://kdsintf.amd.com"
+        );
+        assert_eq!(
+            normalize_amd_kds_host(" https://kdsintf.amd.com "),
+            "https://kdsintf.amd.com"
+        );
+        assert_eq!(
+            normalize_amd_kds_host("https://mirror.example/amd-kds/vcek/v1"),
+            "https://mirror.example/amd-kds"
+        );
+    }
 
     #[test]
     fn raw_cpusvn_matches_node_int_to_hex() {

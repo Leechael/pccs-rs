@@ -50,7 +50,7 @@ pub fn create_app(state: AppState) -> Router {
 
     let mut app = Router::new()
         .nest("/sgx/certification/v3", sgx_v3)
-        .nest("/vcek/v1", routes::amd_kds_router());
+        .merge(routes::amd_kds_router());
     if pcs_ver == 4 {
         app = app
             .nest("/sgx/certification/v4", routes::sgx_router(state.clone()))

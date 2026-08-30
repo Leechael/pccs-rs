@@ -5,7 +5,7 @@ use crate::error::{self, PccsError, PccsJson};
 use crate::headers;
 use crate::store::RegisteredPlatform;
 use crate::validate::{self, PlatformsSource};
-use axum::extract::{FromRequestParts, OriginalUri, Path, State};
+use axum::extract::{FromRequestParts, OriginalUri, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -63,29 +63,6 @@ fn json_value(status: StatusCode, headers: HeaderMap, value: &Value, raw_body: &
 
 // --------------- AMD KDS ---------------
 
-fn amd_product(product: &str) -> Result<&str, PccsError> {
-    match product {
-        "Milan" | "Genoa" | "Turin" => Ok(product),
-        _ => Err(error::INVALID_REQ),
-    }
-}
-
-fn amd_hwid(product: &str, hwid: &str) -> Result<(), PccsError> {
-    let expected_len = if product == "Turin" { 16 } else { 128 };
-    if hwid.len() == expected_len && hwid.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err(error::INVALID_REQ)
-    }
-}
-
-fn amd_relative_url(path: &str, uri: &Uri) -> String {
-    match uri.query() {
-        Some(query) => format!("{path}?{query}"),
-        None => path.to_string(),
-    }
-}
-
 fn amd_response(rec: crate::cache::AmdKdsResponse) -> Response {
     let status = StatusCode::from_u16(rec.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut headers = HeaderMap::new();
@@ -101,25 +78,17 @@ fn amd_response(rec: crate::cache::AmdKdsResponse) -> Response {
     bytes(status, headers, rec.body)
 }
 
-pub async fn get_amd_cert_chain(
+pub async fn get_amd_kds(
     State(state): State<AppState>,
-    Path(product): Path<String>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
-    let product = amd_product(&product)?;
-    let relative = amd_relative_url(&format!("{product}/cert_chain"), &uri);
-    Ok(amd_response(state.cache.get_amd_kds(&relative).await?))
-}
-
-pub async fn get_amd_vcek(
-    State(state): State<AppState>,
-    Path((product, hwid)): Path<(String, String)>,
-    OriginalUri(uri): OriginalUri,
-) -> Result<Response, PccsError> {
-    let product = amd_product(&product)?;
-    amd_hwid(product, &hwid)?;
-    let relative = amd_relative_url(&format!("{product}/{hwid}"), &uri);
-    Ok(amd_response(state.cache.get_amd_kds(&relative).await?))
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{}?{query}", uri.path()),
+        None => uri.path().to_string(),
+    };
+    Ok(amd_response(
+        state.cache.get_amd_kds(&path_and_query).await?,
+    ))
 }
 
 // --------------- pckcert ---------------

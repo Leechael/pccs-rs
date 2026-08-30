@@ -17,7 +17,7 @@ pub const DEFAULT_ADMIN_TOKEN_HASH: &str =
 
 /// Intel PCS, same as Node `service/config/default.json`.
 pub const DEFAULT_URI: &str = "https://api.trustedservices.intel.com/sgx/certification/v4/";
-pub const DEFAULT_AMD_KDS_URI: &str = "https://kdsintf.amd.com/vcek/v1";
+pub const DEFAULT_AMD_KDS_URI: &str = "https://kdsintf.amd.com";
 pub const DEFAULT_AMD_KDS_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_REFRESH: &str = "0 0 1 * * *";
 
@@ -174,7 +174,7 @@ pub struct ServeArgs {
     #[arg(long, env = "PCCS_API_KEY")]
     pub api_key: Option<String>,
 
-    /// AMD KDS VCEK v1 upstream base URL.
+    /// AMD KDS host. Request paths under `/vcek/` and `/vlek/` are appended.
     #[arg(long, env = "PCCS_AMD_KDS_URI")]
     pub amd_kds_uri: Option<String>,
 
@@ -962,6 +962,7 @@ mod tests {
         assert!(cfg.user_token_hash.is_empty());
         assert!(cfg.admin_token_hash.is_empty());
         assert_eq!(cfg.uri, DEFAULT_URI);
+        assert_eq!(cfg.amd_kds_uri, DEFAULT_AMD_KDS_URI);
         assert!(is_sha512_hex(DEFAULT_USER_TOKEN_HASH));
         let test = Config::test_default();
         assert!(is_sha512_hex(test.admin_token_hash.as_str()));
