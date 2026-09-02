@@ -348,9 +348,33 @@ fn warn_on_dev_tokens(cfg: &Config) {
     }
 }
 
-/// `uri` pointing back at this service turns every cache miss into recursion.
+/// An upstream URI pointing back at this service turns every cache miss into recursion.
 fn warn_on_self_upstream(cfg: &Config, addr: SocketAddr) {
-    let Some(host) = cfg.uri_host() else {
+    warn_if_uri_is_self(
+        cfg,
+        addr,
+        &cfg.uri,
+        "upstream uri host",
+        "Set uri to the Intel PCS (or another PCCS).",
+    );
+    warn_if_uri_is_self(
+        cfg,
+        addr,
+        &cfg.amd_kds_uri,
+        "amd_kds_uri host",
+        "Set amd_kds_uri to the AMD KDS.",
+    );
+    warn_if_uri_is_self(
+        cfg,
+        addr,
+        &cfg.nvidia_rim_uri,
+        "nvidia_rim_uri host",
+        "Set nvidia_rim_uri to the NVIDIA RIM service.",
+    );
+}
+
+fn warn_if_uri_is_self(cfg: &Config, addr: SocketAddr, uri: &str, label: &str, advice: &str) {
+    let Some(host) = pccs_rs::config::uri_host(uri) else {
         return;
     };
     let same_host = host == cfg.host.to_ascii_lowercase()
@@ -360,8 +384,7 @@ fn warn_on_self_upstream(cfg: &Config, addr: SocketAddr) {
             .unwrap_or(false);
     if same_host {
         tracing::warn!(
-            "upstream uri host {host} looks like this service; a cache miss would call back into pccs-rs. \
-             Set uri to the Intel PCS (or another PCCS)."
+            "{label} {host} looks like this service; a cache miss would call back into pccs-rs. {advice}"
         );
     }
 }
@@ -500,6 +523,15 @@ mod tests {
         cfg.uri = "https://nonexistent.invalid/sgx/".into();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
         assert_eq!(log_count(&logs, self_upstream), before + 1);
+
+        cfg.uri = String::new();
+        cfg.amd_kds_uri = "http://127.0.0.1:8081/vcek/v1".into();
+        warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        assert_eq!(log_count(&logs, self_upstream), before + 2);
+        cfg.amd_kds_uri = String::new();
+        cfg.nvidia_rim_uri = "http://127.0.0.1:8081/v1/rim".into();
+        warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        assert_eq!(log_count(&logs, self_upstream), before + 3);
     }
 
     #[tokio::test]
