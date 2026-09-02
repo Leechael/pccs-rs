@@ -9,7 +9,7 @@ use pccs_rs::config::{Config, DEFAULT_ADMIN_TOKEN, DEFAULT_USER_TOKEN};
 use pccs_rs::{create_app_from_config, headers};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
@@ -672,6 +672,80 @@ async fn nvidia_rim_error_response_is_relayed_and_not_cached() {
         assert_eq!(body, "slow down");
     }
     assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+struct UpstreamHit {
+    path: String,
+    api_key: String,
+}
+
+async fn spawn_recording_upstream(
+    status: StatusCode,
+    extra_headers: &'static [(&'static str, &'static str)],
+    body: &'static str,
+) -> (String, Arc<Mutex<Vec<UpstreamHit>>>) {
+    let seen: Arc<Mutex<Vec<UpstreamHit>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let upstream_app =
+        axum::Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+            let seen = seen2.clone();
+            async move {
+                let api_key = req
+                    .headers()
+                    .get("ocp-apim-subscription-key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let path = req
+                    .uri()
+                    .path_and_query()
+                    .map(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                seen.lock().unwrap().push(UpstreamHit { path, api_key });
+                let mut builder = axum::http::Response::builder().status(status);
+                for (name, value) in extra_headers {
+                    builder = builder.header(*name, *value);
+                }
+                builder.body(axum::body::Body::from(body)).unwrap()
+            }
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    (format!("http://{addr}"), seen)
+}
+
+fn amd_cfg(upstream: String, db_name: &str) -> (Config, std::path::PathBuf) {
+    let db_path = std::env::temp_dir().join(format!("{db_name}-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    (cfg, db_path)
+}
+
+#[tokio::test]
+async fn amd_kds_does_not_forward_the_intel_api_key() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (mut cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-no-key");
+    cfg.api_key = "secret-key".into();
+    let app = create_app_from_config(cfg);
+
+    let (status, _, _) = send(app.clone(), get("/vcek/v1/x/pckcerts")).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/vcek/v1/x/pckcerts");
+    assert_eq!(seen[0].api_key, "");
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);

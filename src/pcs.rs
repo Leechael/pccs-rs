@@ -196,23 +196,30 @@ impl PcsClient {
         if !self.enabled() {
             return Err(error::NO_CACHE_DATA);
         }
-        self.send(url, None).await
+        self.send(url, None, true).await
     }
 
+    /// AMD KDS / NVIDIA RIM fetch. Never attaches the Intel API key and never
+    /// applies the Intel `/v3/` EOL check — those belong to Intel paths only.
     pub async fn get_url(&self, url: &str) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
-        self.send(url, None).await
+        self.send(url, None, false).await
     }
 
     /// `body = Some(json)` issues a POST with `Content-Type: application/json`
     /// (Node `pcs_client.getCertsWithManifest`); `None` issues a GET.
+    /// `attach_key` is Intel-only: it also enables the `/v3/` EOL check and the
+    /// `pckcerts` / early-access subscription key. AMD/NVIDIA callers pass false.
     async fn send(
         &self,
         url: &str,
         body: Option<Vec<u8>>,
+        attach_key: bool,
     ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
-        Self::check_v3(url)?;
+        if attach_key {
+            Self::check_v3(url)?;
+        }
         self.calls.fetch_add(1, Ordering::Relaxed);
-        let send_key = Self::wants_api_key(url) && !self.api_key.is_empty();
+        let send_key = attach_key && Self::wants_api_key(url) && !self.api_key.is_empty();
         let mut last = error::PCS_ACCESS_FAILURE;
         let mut throttled = 0u32;
         let mut delay: Option<Duration> = None;
@@ -393,7 +400,7 @@ impl PcsClient {
             "pceid": pceid,
         })
         .to_string();
-        let (status, h, body) = self.send(&url, Some(payload.into_bytes())).await?;
+        let (status, h, body) = self.send(&url, Some(payload.into_bytes()), true).await?;
         Self::parse_pckcerts(status, &h, &body)
     }
 
