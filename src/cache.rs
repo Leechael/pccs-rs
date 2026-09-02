@@ -32,14 +32,21 @@ pub struct Cache {
     inflight: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// Only one refresh at a time; a second admin call waits for the first.
     refresh_lock: Mutex<()>,
-    /// Recent upstream failures per key; see `key_lock`.
-    failures: Mutex<HashMap<String, (std::time::Instant, PccsError)>>,
+    /// Recent upstream failures / non-200 responses per key; see `key_lock`.
+    failures: Mutex<HashMap<String, (std::time::Instant, RecentOutcome)>>,
 }
 
 /// How long a failed upstream fetch suppresses a retry by the requests already
 /// queued behind it. Short on purpose — this is stampede control, not caching.
 const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
+#[derive(Clone)]
+enum RecentOutcome {
+    Err(PccsError),
+    Response(AmdKdsResponse),
+}
+
+#[derive(Clone)]
 pub struct AmdKdsResponse {
     pub status: u16,
     pub body: Vec<u8>,
@@ -96,6 +103,102 @@ fn join_host_path(host: &str, path_and_query: &str) -> String {
         format!("/{path_and_query}")
     };
     format!("{host}{path_and_query}")
+}
+
+fn split_path_query(path_and_query: &str) -> (&str, Option<&str>) {
+    match path_and_query.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path_and_query, None),
+    }
+}
+
+fn is_alnum_segment(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+const AMD_HWID_QUERY_PARAMS: &[&str] = &["blSPL", "snpSPL", "teeSPL", "ucodeSPL"];
+
+fn is_spl_value(value: &str) -> bool {
+    (1..=3).contains(&value.len())
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u8>().is_ok()
+}
+
+fn canonicalize_query(query: Option<&str>, allowed: &[&str]) -> Result<String, PccsError> {
+    let Some(query) = query.filter(|q| !q.is_empty()) else {
+        return Ok(String::new());
+    };
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key.is_empty() {
+            continue;
+        }
+        if !allowed.iter().any(|allowed| *allowed == key) {
+            return Err(error::INVALID_REQ);
+        }
+        if !is_spl_value(value) {
+            return Err(error::INVALID_REQ);
+        }
+        if seen.iter().any(|(k, _)| k == key) {
+            return Err(error::INVALID_REQ);
+        }
+        seen.push((key.to_string(), value.to_string()));
+    }
+    if seen.is_empty() {
+        return Ok(String::new());
+    }
+    seen.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let encoded = seen
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    Ok(format!("?{encoded}"))
+}
+
+fn canonicalize_amd_kds(path_and_query: &str) -> Result<String, PccsError> {
+    let (path, query) = split_path_query(path_and_query);
+    let (prefix, rest) = if let Some(rest) = path.strip_prefix("/vcek/") {
+        ("/vcek/", rest)
+    } else if let Some(rest) = path.strip_prefix("/vlek/") {
+        ("/vlek/", rest)
+    } else {
+        return Err(error::INVALID_REQ);
+    };
+    let segs: Vec<&str> = rest.split('/').collect();
+    if segs.len() != 3 || segs[0] != "v1" || !is_alnum_segment(segs[1]) {
+        return Err(error::INVALID_REQ);
+    }
+    let product = segs[1];
+    let last = segs[2];
+    let query = match last {
+        "cert_chain" | "crl" => canonicalize_query(query, &[])?,
+        hwid if is_alnum_segment(hwid) => canonicalize_query(query, AMD_HWID_QUERY_PARAMS)?,
+        _ => return Err(error::INVALID_REQ),
+    };
+    Ok(format!("{prefix}v1/{product}/{last}{query}"))
+}
+
+fn is_rim_id(s: &str) -> bool {
+    if s.is_empty() || s == "." || s == ".." {
+        return false;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+fn canonicalize_nvidia_rim(path_and_query: &str) -> Result<String, PccsError> {
+    let (path, query) = split_path_query(path_and_query);
+    let rest = path.strip_prefix("/v1/rim/").ok_or(error::INVALID_REQ)?;
+    if rest.contains('/') || !is_rim_id(rest) {
+        return Err(error::INVALID_REQ);
+    }
+    let query = canonicalize_query(query, &[])?;
+    Ok(format!("/v1/rim/{rest}{query}"))
 }
 
 impl Cache {
@@ -158,9 +261,23 @@ impl Cache {
 
     /// The error a sibling just got for this key, if it is still fresh.
     async fn recent_failure(&self, key: &str) -> Option<PccsError> {
+        match self.recent_outcome(key).await {
+            Some(RecentOutcome::Err(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    async fn recent_non200(&self, key: &str) -> Option<AmdKdsResponse> {
+        match self.recent_outcome(key).await {
+            Some(RecentOutcome::Response(r)) => Some(r),
+            _ => None,
+        }
+    }
+
+    async fn recent_outcome(&self, key: &str) -> Option<RecentOutcome> {
         let mut map = self.failures.lock().await;
         match map.get(key) {
-            Some((at, e)) if at.elapsed() < FAILURE_TTL => Some(e.clone()),
+            Some((at, outcome)) if at.elapsed() < FAILURE_TTL => Some(outcome.clone()),
             Some(_) => {
                 map.remove(key);
                 None
@@ -169,16 +286,20 @@ impl Cache {
         }
     }
 
+    async fn remember(&self, key: &str, outcome: RecentOutcome) {
+        let mut map = self.failures.lock().await;
+        if map.len() > 1024 {
+            map.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
+        }
+        map.insert(key.to_string(), (std::time::Instant::now(), outcome));
+    }
+
     /// Pass a fetch result through, remembering an upstream failure briefly so
     /// the waiters behind us do not each repeat it. Used as
     /// `self.note(&key, fetch().await)?`.
     async fn note<T>(&self, key: &str, result: Result<T, PccsError>) -> Result<T, PccsError> {
         if let Err(e) = &result {
-            let mut map = self.failures.lock().await;
-            if map.len() > 1024 {
-                map.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
-            }
-            map.insert(key.to_string(), (std::time::Instant::now(), e.clone()));
+            self.remember(key, RecentOutcome::Err(e.clone())).await;
         }
         result
     }
@@ -197,7 +318,8 @@ impl Cache {
     }
 
     pub async fn get_amd_kds(&self, path_and_query: &str) -> Result<AmdKdsResponse, PccsError> {
-        let url = join_host_path(&self.amd_kds_uri, path_and_query);
+        let path_and_query = canonicalize_amd_kds(path_and_query)?;
+        let url = join_host_path(&self.amd_kds_uri, &path_and_query);
         self.get_cached_url(
             url,
             self.amd_kds_cache_ttl_secs,
@@ -211,7 +333,8 @@ impl Cache {
     }
 
     pub async fn get_nvidia_rim(&self, path_and_query: &str) -> Result<AmdKdsResponse, PccsError> {
-        let url = join_host_path(&self.nvidia_rim_uri, path_and_query);
+        let path_and_query = canonicalize_nvidia_rim(path_and_query)?;
+        let url = join_host_path(&self.nvidia_rim_uri, &path_and_query);
         self.get_cached_url(
             url,
             self.nvidia_rim_cache_ttl_secs,
@@ -236,6 +359,7 @@ impl Cache {
     ) -> Result<AmdKdsResponse, PccsError> {
         let now = unix_time();
         if let Some(rec) = load(&self.store, &url) {
+            // deferred: stale-if-error for AMD/NVIDIA | impact: after TTL expiry a throttled upstream turns every request into 502 while a copy exists on disk | trigger: user decision
             if now.saturating_sub(rec.fetched_at) < ttl {
                 self.store.record_hit();
                 tracing::debug!("cache hit {kind}");
@@ -250,15 +374,23 @@ impl Cache {
 
         let key = key_for(&url);
         let _guard = self.key_lock(&key).await?;
+        if let Some(rec) = self.recent_non200(&key).await {
+            return Ok(rec);
+        }
         let now = unix_time();
         if let Some(rec) = load(&self.store, &url) {
+            // deferred: stale-if-error for AMD/NVIDIA | impact: after TTL expiry a throttled upstream turns every request into 502 while a copy exists on disk | trigger: user decision
             if now.saturating_sub(rec.fetched_at) < ttl {
                 return Ok(rec.into());
             }
         }
 
         self.store.record_upstream();
-        let fetched = self.pcs.get_url(&url).await.map_err(|_| access_failure);
+        let fetched = self
+            .pcs
+            .get_url(&url)
+            .await
+            .map_err(|_| access_failure.clone());
         let (status, headers, body) = self.note(&key, fetched).await?;
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
@@ -272,14 +404,20 @@ impl Cache {
             .get(axum::http::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        if (100..200).contains(&status) || (300..400).contains(&status) {
+            return self.note(&key, Err(access_failure)).await;
+        }
         if status != 200 {
-            return Ok(AmdKdsResponse {
+            let rec = AmdKdsResponse {
                 status,
                 body,
                 content_type,
                 content_disposition,
                 retry_after,
-            });
+            };
+            self.remember(&key, RecentOutcome::Response(rec.clone()))
+                .await;
+            return Ok(rec);
         }
         let rec = AmdKdsRecord {
             url,
@@ -1190,6 +1328,70 @@ mod tests {
         assert_eq!(
             normalize_nvidia_rim_host("https://rim.attestation.nvidia.com"),
             "https://rim.attestation.nvidia.com"
+        );
+    }
+
+    #[test]
+    fn amd_kds_path_is_whitelisted_and_query_is_sorted() {
+        assert_eq!(
+            canonicalize_amd_kds("/vcek/v1/Genoa/cert_chain").unwrap(),
+            "/vcek/v1/Genoa/cert_chain"
+        );
+        assert_eq!(
+            canonicalize_amd_kds("/vcek/v1/Genoa/abcd?teeSPL=2&blSPL=1").unwrap(),
+            "/vcek/v1/Genoa/abcd?blSPL=1&teeSPL=2"
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v1/Genoa/cert_chain?junk=1").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v1/../../x").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v3/Genoa/cert_chain").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_eq!(
+            canonicalize_amd_kds("/vcek/v1/Genoa/abcd?blSPL=255").unwrap(),
+            "/vcek/v1/Genoa/abcd?blSPL=255"
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v1/Genoa/abcd?blSPL=256").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v1/Genoa/abcd?blSPL=Nzzz").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v1/Genoa/abcd?blSPL=1&blSPL=2").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+    }
+
+    #[test]
+    fn nvidia_rim_path_is_whitelisted() {
+        assert_eq!(
+            canonicalize_nvidia_rim("/v1/rim/some-id").unwrap(),
+            "/v1/rim/some-id"
+        );
+        assert_eq!(
+            canonicalize_nvidia_rim("/v1/rim/NV_GPU_DRIVER_GH100_535.129.03").unwrap(),
+            "/v1/rim/NV_GPU_DRIVER_GH100_535.129.03"
+        );
+        assert_eq!(
+            canonicalize_nvidia_rim("/v1/rim/ids").unwrap(),
+            "/v1/rim/ids"
+        );
+        assert_err(
+            &canonicalize_nvidia_rim("/v1/rim/some-id?junk=1").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(
+            &canonicalize_nvidia_rim("/v1/rim/../x").unwrap_err(),
+            &error::INVALID_REQ,
         );
     }
 

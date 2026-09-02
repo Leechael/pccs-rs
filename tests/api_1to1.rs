@@ -9,7 +9,7 @@ use pccs_rs::config::{Config, DEFAULT_ADMIN_TOKEN, DEFAULT_USER_TOKEN};
 use pccs_rs::{create_app_from_config, headers};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
@@ -395,12 +395,15 @@ async fn amd_kds_error_response_is_relayed_and_not_cached() {
     };
     let app = create_app_from_config(cfg);
 
-    for _ in 0..2 {
-        let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(headers.get("retry-after").unwrap(), "10");
-        assert_eq!(body, "slow down");
-    }
+    let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 
     drop(app);
@@ -512,8 +515,8 @@ async fn amd_vcek_cache_key_includes_the_complete_query() {
     let (_, _, body_one) = send(app.clone(), get(&one)).await;
     let (_, _, body_two) = send(app.clone(), get(&two)).await;
     let (_, _, body_one_cached) = send(app.clone(), get(&one)).await;
-    assert_eq!(body_one, "blSPL=1&teeSPL=2&snpSPL=3&ucodeSPL=4");
-    assert_eq!(body_two, "blSPL=1&teeSPL=2&snpSPL=3&ucodeSPL=5");
+    assert_eq!(body_one, "blSPL=1&snpSPL=3&teeSPL=2&ucodeSPL=4");
+    assert_eq!(body_two, "blSPL=1&snpSPL=3&teeSPL=2&ucodeSPL=5");
     assert_eq!(body_one_cached, body_one);
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 
@@ -665,13 +668,243 @@ async fn nvidia_rim_error_response_is_relayed_and_not_cached() {
     };
     let app = create_app_from_config(cfg);
 
-    for _ in 0..2 {
-        let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(headers.get("retry-after").unwrap(), "10");
-        assert_eq!(body, "slow down");
-    }
+    let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
     assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+struct UpstreamHit {
+    path: String,
+    api_key: String,
+}
+
+async fn spawn_recording_upstream(
+    status: StatusCode,
+    extra_headers: &'static [(&'static str, &'static str)],
+    body: &'static str,
+) -> (String, Arc<Mutex<Vec<UpstreamHit>>>) {
+    let seen: Arc<Mutex<Vec<UpstreamHit>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let upstream_app =
+        axum::Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+            let seen = seen2.clone();
+            async move {
+                let api_key = req
+                    .headers()
+                    .get("ocp-apim-subscription-key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let path = req
+                    .uri()
+                    .path_and_query()
+                    .map(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                seen.lock().unwrap().push(UpstreamHit { path, api_key });
+                let mut builder = axum::http::Response::builder().status(status);
+                for (name, value) in extra_headers {
+                    builder = builder.header(*name, *value);
+                }
+                builder.body(axum::body::Body::from(body)).unwrap()
+            }
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    (format!("http://{addr}"), seen)
+}
+
+fn amd_cfg(upstream: String, db_name: &str) -> (Config, std::path::PathBuf) {
+    let db_path = std::env::temp_dir().join(format!("{db_name}-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    (cfg, db_path)
+}
+
+#[tokio::test]
+async fn amd_kds_does_not_forward_the_intel_api_key() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (mut cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-no-key");
+    cfg.api_key = "secret-key".into();
+    let app = create_app_from_config(cfg);
+
+    let (status, _, _) = send(app.clone(), get("/vcek/v1/x/pckcerts")).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/vcek/v1/x/pckcerts");
+    assert_eq!(seen[0].api_key, "");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn concurrent_amd_kds_throttled_responses_issue_one_upstream_fetch() {
+    let (upstream, seen) = spawn_recording_upstream(
+        StatusCode::TOO_MANY_REQUESTS,
+        &[("retry-after", "1")],
+        "slow down",
+    )
+    .await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-429-burst");
+    let app = create_app_from_config(cfg);
+    let path = "/vcek/v1/Genoa/cert_chain";
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move { send(app, get(path)).await }));
+    }
+    for h in handles {
+        let (status, _, _) = h.await.unwrap();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_unknown_query_is_rejected_and_known_params_are_canonicalised() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-canon");
+    let app = create_app_from_config(cfg);
+    let hwid = "ab".repeat(64);
+
+    let (status, _, body) = send(
+        app.clone(),
+        get(&format!("/vcek/v1/Genoa/cert_chain?junk=1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "Invalid request parameters.");
+    assert!(seen.lock().unwrap().is_empty());
+
+    let one = format!("/vcek/v1/Genoa/{hwid}?teeSPL=2&blSPL=1");
+    let two = format!("/vcek/v1/Genoa/{hwid}?blSPL=1&teeSPL=2");
+    let (status, _, _) = send(app.clone(), get(&one)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(app.clone(), get(&two)).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].path,
+        format!("/vcek/v1/Genoa/{hwid}?blSPL=1&teeSPL=2")
+    );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_redirect_is_a_bad_gateway_and_client_errors_pass_through() {
+    let (upstream, seen) = spawn_recording_upstream(
+        StatusCode::FOUND,
+        &[("location", "https://example.test/elsewhere")],
+        "moved",
+    )
+    .await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-302");
+    let app = create_app_from_config(cfg);
+
+    let (status, _, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "Unable to retrieve the collateral from the AMD KDS.");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::NOT_FOUND, &[], "missing").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-404");
+    let app = create_app_from_config(cfg);
+    let (status, _, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "missing");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_dot_segments_are_rejected_without_touching_upstream() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-dots");
+    let app = create_app_from_config(cfg);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/vcek/v1/../../x")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "Invalid request parameters.");
+    assert!(seen.lock().unwrap().is_empty());
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_v3_path_is_rejected_without_touching_upstream() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-v3");
+    let app = create_app_from_config(cfg);
+
+    let (status, _, body) = send(app.clone(), get("/vcek/v3/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "Invalid request parameters.");
+    assert!(seen.lock().unwrap().is_empty());
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_rim_accepts_dotted_driver_ids() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nvidia-dotted-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let path = "/v1/rim/NV_GPU_DRIVER_GH100_535.129.03";
+
+    for _ in 0..2 {
+        let (status, _, body) = send(app.clone(), get(path)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ok");
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, path);
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);
