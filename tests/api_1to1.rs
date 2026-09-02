@@ -395,12 +395,15 @@ async fn amd_kds_error_response_is_relayed_and_not_cached() {
     };
     let app = create_app_from_config(cfg);
 
-    for _ in 0..2 {
-        let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(headers.get("retry-after").unwrap(), "10");
-        assert_eq!(body, "slow down");
-    }
+    let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 
     drop(app);
@@ -665,12 +668,15 @@ async fn nvidia_rim_error_response_is_relayed_and_not_cached() {
     };
     let app = create_app_from_config(cfg);
 
-    for _ in 0..2 {
-        let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(headers.get("retry-after").unwrap(), "10");
-        assert_eq!(body, "slow down");
-    }
+    let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 
     drop(app);
@@ -752,6 +758,33 @@ async fn amd_kds_does_not_forward_the_intel_api_key() {
 }
 
 #[tokio::test]
+async fn concurrent_amd_kds_throttled_responses_issue_one_upstream_fetch() {
+    let (upstream, seen) = spawn_recording_upstream(
+        StatusCode::TOO_MANY_REQUESTS,
+        &[("retry-after", "1")],
+        "slow down",
+    )
+    .await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-429-burst");
+    let app = create_app_from_config(cfg);
+    let path = "/vcek/v1/Genoa/cert_chain";
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move { send(app, get(path)).await }));
+    }
+    for h in handles {
+        let (status, _, _) = h.await.unwrap();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
 async fn amd_kds_unknown_query_is_rejected_and_known_params_are_canonicalised() {
     let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
     let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-canon");
@@ -779,6 +812,36 @@ async fn amd_kds_unknown_query_is_rejected_and_known_params_are_canonicalised() 
         seen[0].path,
         format!("/vcek/v1/Genoa/{hwid}?blSPL=1&teeSPL=2")
     );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_redirect_is_a_bad_gateway_and_client_errors_pass_through() {
+    let (upstream, seen) = spawn_recording_upstream(
+        StatusCode::FOUND,
+        &[("location", "https://example.test/elsewhere")],
+        "moved",
+    )
+    .await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-302");
+    let app = create_app_from_config(cfg);
+
+    let (status, _, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "Unable to retrieve the collateral from the AMD KDS.");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::NOT_FOUND, &[], "missing").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-404");
+    let app = create_app_from_config(cfg);
+    let (status, _, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "missing");
+    assert_eq!(seen.lock().unwrap().len(), 1);
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);

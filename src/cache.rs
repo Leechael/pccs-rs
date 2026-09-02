@@ -32,14 +32,21 @@ pub struct Cache {
     inflight: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// Only one refresh at a time; a second admin call waits for the first.
     refresh_lock: Mutex<()>,
-    /// Recent upstream failures per key; see `key_lock`.
-    failures: Mutex<HashMap<String, (std::time::Instant, PccsError)>>,
+    /// Recent upstream failures / non-200 responses per key; see `key_lock`.
+    failures: Mutex<HashMap<String, (std::time::Instant, RecentOutcome)>>,
 }
 
 /// How long a failed upstream fetch suppresses a retry by the requests already
 /// queued behind it. Short on purpose — this is stampede control, not caching.
 const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
+#[derive(Clone)]
+enum RecentOutcome {
+    Err(PccsError),
+    Response(AmdKdsResponse),
+}
+
+#[derive(Clone)]
 pub struct AmdKdsResponse {
     pub status: u16,
     pub body: Vec<u8>,
@@ -254,9 +261,23 @@ impl Cache {
 
     /// The error a sibling just got for this key, if it is still fresh.
     async fn recent_failure(&self, key: &str) -> Option<PccsError> {
+        match self.recent_outcome(key).await {
+            Some(RecentOutcome::Err(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    async fn recent_non200(&self, key: &str) -> Option<AmdKdsResponse> {
+        match self.recent_outcome(key).await {
+            Some(RecentOutcome::Response(r)) => Some(r),
+            _ => None,
+        }
+    }
+
+    async fn recent_outcome(&self, key: &str) -> Option<RecentOutcome> {
         let mut map = self.failures.lock().await;
         match map.get(key) {
-            Some((at, e)) if at.elapsed() < FAILURE_TTL => Some(e.clone()),
+            Some((at, outcome)) if at.elapsed() < FAILURE_TTL => Some(outcome.clone()),
             Some(_) => {
                 map.remove(key);
                 None
@@ -265,16 +286,20 @@ impl Cache {
         }
     }
 
+    async fn remember(&self, key: &str, outcome: RecentOutcome) {
+        let mut map = self.failures.lock().await;
+        if map.len() > 1024 {
+            map.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
+        }
+        map.insert(key.to_string(), (std::time::Instant::now(), outcome));
+    }
+
     /// Pass a fetch result through, remembering an upstream failure briefly so
     /// the waiters behind us do not each repeat it. Used as
     /// `self.note(&key, fetch().await)?`.
     async fn note<T>(&self, key: &str, result: Result<T, PccsError>) -> Result<T, PccsError> {
         if let Err(e) = &result {
-            let mut map = self.failures.lock().await;
-            if map.len() > 1024 {
-                map.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
-            }
-            map.insert(key.to_string(), (std::time::Instant::now(), e.clone()));
+            self.remember(key, RecentOutcome::Err(e.clone())).await;
         }
         result
     }
@@ -334,6 +359,7 @@ impl Cache {
     ) -> Result<AmdKdsResponse, PccsError> {
         let now = unix_time();
         if let Some(rec) = load(&self.store, &url) {
+            // deferred: stale-if-error for AMD/NVIDIA | impact: after TTL expiry a throttled upstream turns every request into 502 while a copy exists on disk | trigger: user decision
             if now.saturating_sub(rec.fetched_at) < ttl {
                 self.store.record_hit();
                 tracing::debug!("cache hit {kind}");
@@ -348,15 +374,23 @@ impl Cache {
 
         let key = key_for(&url);
         let _guard = self.key_lock(&key).await?;
+        if let Some(rec) = self.recent_non200(&key).await {
+            return Ok(rec);
+        }
         let now = unix_time();
         if let Some(rec) = load(&self.store, &url) {
+            // deferred: stale-if-error for AMD/NVIDIA | impact: after TTL expiry a throttled upstream turns every request into 502 while a copy exists on disk | trigger: user decision
             if now.saturating_sub(rec.fetched_at) < ttl {
                 return Ok(rec.into());
             }
         }
 
         self.store.record_upstream();
-        let fetched = self.pcs.get_url(&url).await.map_err(|_| access_failure);
+        let fetched = self
+            .pcs
+            .get_url(&url)
+            .await
+            .map_err(|_| access_failure.clone());
         let (status, headers, body) = self.note(&key, fetched).await?;
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
@@ -370,14 +404,20 @@ impl Cache {
             .get(axum::http::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        if (100..200).contains(&status) || (300..400).contains(&status) {
+            return self.note(&key, Err(access_failure)).await;
+        }
         if status != 200 {
-            return Ok(AmdKdsResponse {
+            let rec = AmdKdsResponse {
                 status,
                 body,
                 content_type,
                 content_disposition,
                 retry_after,
-            });
+            };
+            self.remember(&key, RecentOutcome::Response(rec.clone()))
+                .await;
+            return Ok(rec);
         }
         let rec = AmdKdsRecord {
             url,
