@@ -22,9 +22,7 @@ fn parse_expected_hash(hex_hash: &str) -> Option<Vec<u8>> {
 
 pub fn verify_token(raw_token: Option<&str>, expected_hex: &str) -> Result<(), PccsError> {
     let expected = parse_expected_hash(expected_hex).ok_or(error::UNAUTHORIZED)?;
-    let token = raw_token
-        .filter(|t| !t.is_empty())
-        .ok_or(error::UNAUTHORIZED)?;
+    let token = raw_token.filter(|t| !t.is_empty()).ok_or(error::UNAUTHORIZED)?;
     let digest = Sha512::digest(token.as_bytes());
     if digest.as_slice().len() != expected.len()
         || bool::from(digest.as_slice().ct_eq(expected.as_slice())) == false

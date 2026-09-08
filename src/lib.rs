@@ -31,10 +31,7 @@ pub fn app_state(cfg: Config) -> AppState {
     let cache = build_cache(&cfg).unwrap_or_else(|e| {
         panic!("failed to initialise cache: {e}");
     });
-    AppState {
-        cache,
-        config: Arc::new(cfg),
-    }
+    AppState { cache, config: Arc::new(cfg) }
 }
 
 pub fn create_app(state: AppState) -> Router {

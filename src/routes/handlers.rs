@@ -49,10 +49,7 @@ fn bytes(status: StatusCode, headers: HeaderMap, body: Vec<u8>) -> Response {
 
 fn json_value(status: StatusCode, headers: HeaderMap, value: &Value, raw_body: &str) -> Response {
     let mut h = headers;
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(headers::CONTENT_TYPE_JSON),
-    );
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(headers::CONTENT_TYPE_JSON));
     let body = if raw_body.is_empty() {
         serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec())
     } else {
@@ -75,24 +72,15 @@ pub async fn get_pckcert(
     let pceid = validate::pceid(first(&q, "pceid"))?;
     let _enc = validate::encrypted_ppid(first(&q, "encrypted_ppid"))?;
 
-    let rec = state
-        .cache
-        .get_pckcert(&qeid, &cpusvn, &pcesvn, &pceid, _enc.as_deref(), version)
-        .await?;
+    let rec =
+        state.cache.get_pckcert(&qeid, &cpusvn, &pcesvn, &pceid, _enc.as_deref(), version).await?;
 
     let mut h = HeaderMap::new();
     insert(&mut h, headers::SGX_TCBM, &rec.tcbm);
     insert(&mut h, headers::SGX_FMSPC, &rec.fmspc);
     insert(&mut h, headers::SGX_PCK_CERTIFICATE_CA_TYPE, &rec.ca);
-    insert(
-        &mut h,
-        headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
-        &rec.issuer_chain,
-    );
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(headers::CONTENT_TYPE_PEM),
-    );
+    insert(&mut h, headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN, &rec.issuer_chain);
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(headers::CONTENT_TYPE_PEM));
     Ok(text(StatusCode::OK, h, rec.cert))
 }
 
@@ -111,22 +99,13 @@ pub async fn get_pckcrl(
     let mut h = HeaderMap::new();
     insert(&mut h, headers::SGX_PCK_CRL_ISSUER_CHAIN, &rec.issuer_chain);
 
-    let der = encoding
-        .as_deref()
-        .map(|s| s.eq_ignore_ascii_case("DER"))
-        .unwrap_or(false);
+    let der = encoding.as_deref().map(|s| s.eq_ignore_ascii_case("DER")).unwrap_or(false);
     if der {
-        h.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(headers::CONTENT_TYPE_CRL),
-        );
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static(headers::CONTENT_TYPE_CRL));
         Ok(bytes(StatusCode::OK, h, rec.pckcrl))
     } else {
         // Node: Buffer.from(pckcrl, 'utf8').toString('hex') + application/x-pem-file
-        h.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(headers::CONTENT_TYPE_PEM),
-        );
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static(headers::CONTENT_TYPE_PEM));
         Ok(text(StatusCode::OK, h, hex::encode(&rec.pckcrl)))
     }
 }
@@ -142,16 +121,9 @@ async fn get_tcb(
     let version = version(uri)?;
     let fmspc = validate::fmspc(first(q, "fmspc"))?;
     let update = validate::update_type(first(q, "update"), false)?;
-    let rec = state
-        .cache
-        .get_tcb(prod_type, &fmspc, version, update)
-        .await?;
+    let rec = state.cache.get_tcb(prod_type, &fmspc, version, update).await?;
     let mut h = HeaderMap::new();
-    insert(
-        &mut h,
-        headers::tcb_issuer_chain_name(version),
-        &rec.issuer_chain,
-    );
+    insert(&mut h, headers::tcb_issuer_chain_name(version), &rec.issuer_chain);
     Ok(json_value(StatusCode::OK, h, &rec.tcbinfo, &rec.raw_body))
 }
 
@@ -181,16 +153,9 @@ async fn get_identity(
 ) -> Result<Response, PccsError> {
     let version = version(uri)?;
     let update = validate::update_type(first(q, "update"), false)?;
-    let rec = state
-        .cache
-        .get_identity(enclave_id, version, update)
-        .await?;
+    let rec = state.cache.get_identity(enclave_id, version, update).await?;
     let mut h = HeaderMap::new();
-    insert(
-        &mut h,
-        headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
-        &rec.issuer_chain,
-    );
+    insert(&mut h, headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN, &rec.issuer_chain);
     Ok(json_value(StatusCode::OK, h, &rec.identity, &rec.raw_body))
 }
 
@@ -227,10 +192,7 @@ pub async fn get_rootcacrl(
     let version = version(&uri)?;
     let crl = state.cache.get_rootcacrl(version).await?;
     let mut h = HeaderMap::new();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(headers::CONTENT_TYPE_CRL),
-    );
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(headers::CONTENT_TYPE_CRL));
     // Node: hex-encode for backward compatibility
     Ok(text(StatusCode::OK, h, hex::encode(crl)))
 }
@@ -251,10 +213,7 @@ pub async fn get_crl(
     }
     let crl = state.cache.get_crl(crl_uri, version).await?;
     let mut h = HeaderMap::new();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(headers::CONTENT_TYPE_CRL),
-    );
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(headers::CONTENT_TYPE_CRL));
     Ok(bytes(StatusCode::OK, h, crl))
 }
 
@@ -304,10 +263,10 @@ pub async fn get_platforms(
             .store
             .take_registered(1)
             .map(|l| serde_json::to_value(l).unwrap_or(Value::Array(vec![]))),
-        PlatformsSource::Fmspc(fmspcs) => Ok(serde_json::to_value(
-            cache.store.cached_platforms_by_fmspc(&fmspcs),
-        )
-        .unwrap_or(Value::Array(vec![]))),
+        PlatformsSource::Fmspc(fmspcs) => {
+            Ok(serde_json::to_value(cache.store.cached_platforms_by_fmspc(&fmspcs))
+                .unwrap_or(Value::Array(vec![])))
+        }
     })
     .await
     .map_err(|_| error::INTERNAL_ERROR)??;
@@ -317,10 +276,7 @@ pub async fn get_platforms(
     // Node reaches Express `res.json` here (`res.send(array)` delegates to it),
     // which labels the body `application/json; charset=utf-8` — unlike the
     // collateral GETs, which set the bare `application/json` themselves.
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(headers::CONTENT_TYPE_JSON_UTF8),
-    );
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(headers::CONTENT_TYPE_JSON_UTF8));
     let body = serde_json::to_vec(&platforms_json).unwrap_or_else(|_| b"[]".to_vec());
     Ok((StatusCode::OK, h, body).into_response())
 }
@@ -343,10 +299,7 @@ pub async fn refresh(
     State(state): State<AppState>,
     PccsQuery(q): PccsQuery,
 ) -> Result<Response, PccsError> {
-    state
-        .cache
-        .refresh(first(&q, "type"), first(&q, "fmspc"))
-        .await?;
+    state.cache.refresh(first(&q, "type"), first(&q, "fmspc")).await?;
     Ok(error::success_response())
 }
 

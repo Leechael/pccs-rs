@@ -32,8 +32,7 @@ impl std::error::Error for PccsError {}
 impl IntoResponse for PccsError {
     fn into_response(self) -> Response {
         let mut resp = (self.status, self.message).into_response();
-        resp.headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static(ERROR_CONTENT_TYPE));
+        resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ERROR_CONTENT_TYPE));
         resp
     }
 }
@@ -102,19 +101,14 @@ pub fn platform_unknown() -> PccsError {
     PccsError::new(status(461), "The platform was not found in the cache.")
 }
 pub fn certs_unavailable() -> PccsError {
-    PccsError::new(
-        status(462),
-        "Certificates are not available for certain TCBs.",
-    )
+    PccsError::new(status(462), "Certificates are not available for certain TCBs.")
 }
 pub const PCS_V3_REACHED_EOL: PccsError = PccsError::new(
     StatusCode::GONE,
     "The Intel PCS API version 3 reached planned EOL. Accordingly, collateral from this API version cannot be retrieved any longer.",
 );
-pub const INTERNAL_ERROR: PccsError = PccsError::new(
-    StatusCode::INTERNAL_SERVER_ERROR,
-    "Internal server error occurred.",
-);
+pub const INTERNAL_ERROR: PccsError =
+    PccsError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error occurred.");
 pub const SERVICE_UNAVAILABLE: PccsError = PccsError::new(
     StatusCode::SERVICE_UNAVAILABLE,
     "Server is currently unable to process the request.",
@@ -129,8 +123,7 @@ pub const PCS_ACCESS_FAILURE: PccsError = PccsError::new(
 /// go through this to stay byte-for-byte compatible with Node.
 pub fn text_html(status: StatusCode, body: impl Into<axum::body::Body>) -> Response {
     let mut resp = (status, body.into()).into_response();
-    resp.headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(ERROR_CONTENT_TYPE));
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ERROR_CONTENT_TYPE));
     resp
 }
 
@@ -160,10 +153,7 @@ mod tests {
         assert_eq!(integrity_error().status.as_u16(), 460);
         assert_eq!(platform_unknown().status.as_u16(), 461);
         assert_eq!(certs_unavailable().status.as_u16(), 462);
-        assert_eq!(
-            platform_unknown().message,
-            "The platform was not found in the cache."
-        );
+        assert_eq!(platform_unknown().message, "The platform was not found in the cache.");
     }
 
     #[test]
@@ -177,24 +167,15 @@ mod tests {
     fn responses_are_text_html_like_express() {
         let resp = INVALID_REQ.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            resp.headers().get(CONTENT_TYPE).unwrap(),
-            ERROR_CONTENT_TYPE
-        );
+        assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), ERROR_CONTENT_TYPE);
 
         let resp = success_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get(CONTENT_TYPE).unwrap(),
-            ERROR_CONTENT_TYPE
-        );
+        assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), ERROR_CONTENT_TYPE);
 
         let resp = text_html(StatusCode::ACCEPTED, "body");
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        assert_eq!(
-            resp.headers().get(CONTENT_TYPE).unwrap(),
-            ERROR_CONTENT_TYPE
-        );
+        assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), ERROR_CONTENT_TYPE);
 
         assert_eq!(success_body(), "Operation successful.");
         assert_eq!(SUCCESS.0, 200);

@@ -117,10 +117,7 @@ pub struct PlatformPool {
 
 impl PlatformPool {
     pub fn cert_pairs(&self) -> Vec<(String, String)> {
-        self.certs
-            .iter()
-            .map(|c| (c.tcbm.clone(), c.cert.clone()))
-            .collect()
+        self.certs.iter().map(|c| (c.tcbm.clone(), c.cert.clone())).collect()
     }
 }
 
@@ -212,9 +209,7 @@ impl Store {
 
     fn put_json<T: Serialize>(&self, key: &str, val: &T) -> Result<(), PccsError> {
         let bytes = serde_json::to_vec(val).map_err(|_| error::INTERNAL_ERROR)?;
-        self.db
-            .put(key.as_bytes(), bytes)
-            .map_err(|_| error::INTERNAL_ERROR)
+        self.db.put(key.as_bytes(), bytes).map_err(|_| error::INTERNAL_ERROR)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<(), PccsError> {
@@ -223,9 +218,7 @@ impl Store {
 
     fn scan_prefix(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
-        let iter = self
-            .db
-            .iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let iter = self.db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward));
         for item in iter {
             let Ok((k, v)) = item else { break };
             if !k.starts_with(prefix.as_bytes()) {
@@ -261,10 +254,7 @@ impl Store {
     }
 
     pub fn put_pckcert(&self, rec: &PckCertRecord) -> Result<(), PccsError> {
-        self.put_json(
-            &keys::pckcert(&rec.qeid, &rec.pceid, &rec.cpusvn, &rec.pcesvn),
-            rec,
-        )
+        self.put_json(&keys::pckcert(&rec.qeid, &rec.pceid, &rec.cpusvn, &rec.pcesvn), rec)
     }
 
     // ---------- platform pool ----------
@@ -309,11 +299,7 @@ impl Store {
     /// the platform) just to answer "is this platform known?" is pure waste on
     /// a `/pckcert` cache hit, so this stops at the raw `DB::get`.
     pub fn has_platform(&self, qeid: &str, pceid: &str) -> bool {
-        self.db
-            .get_pinned(keys::platform(qeid, pceid).as_bytes())
-            .ok()
-            .flatten()
-            .is_some()
+        self.db.get_pinned(keys::platform(qeid, pceid).as_bytes()).ok().flatten().is_some()
     }
 
     pub fn list_platform_pools(&self) -> Vec<PlatformPool> {
@@ -403,12 +389,8 @@ impl Store {
         version: u32,
         update: UpdateType,
     ) -> Option<TcbRecord> {
-        let rec: TcbRecord = self.get_json(&keys::tcb(
-            keys::prod_name(prod_type),
-            version,
-            fmspc,
-            update.as_str(),
-        ))?;
+        let rec: TcbRecord =
+            self.get_json(&keys::tcb(keys::prod_name(prod_type), version, fmspc, update.as_str()))?;
         if rec.prod_type != prod_type
             || rec.version != version
             || !rec.fmspc.eq_ignore_ascii_case(fmspc)
@@ -422,12 +404,7 @@ impl Store {
 
     pub fn put_tcb(&self, rec: &TcbRecord) -> Result<(), PccsError> {
         self.put_json(
-            &keys::tcb(
-                keys::prod_name(rec.prod_type),
-                rec.version,
-                &rec.fmspc,
-                &rec.update_type,
-            ),
+            &keys::tcb(keys::prod_name(rec.prod_type), rec.version, &rec.fmspc, &rec.update_type),
             rec,
         )
     }
@@ -462,11 +439,7 @@ impl Store {
 
     pub fn put_identity(&self, rec: &IdentityRecord) -> Result<(), PccsError> {
         self.put_json(
-            &keys::identity(
-                keys::identity_name(rec.enclave_id),
-                rec.version,
-                &rec.update_type,
-            ),
+            &keys::identity(keys::identity_name(rec.enclave_id), rec.version, &rec.update_type),
             rec,
         )
     }
@@ -511,13 +484,7 @@ impl Store {
     }
 
     pub fn put_crl(&self, uri: &str, crl: &[u8]) -> Result<(), PccsError> {
-        self.put_json(
-            &keys::crl(uri),
-            &CrlRecord {
-                uri: uri.to_string(),
-                crl: crl.to_vec(),
-            },
-        )
+        self.put_json(&keys::crl(uri), &CrlRecord { uri: uri.to_string(), crl: crl.to_vec() })
     }
 
     pub fn list_crls(&self) -> Vec<CrlRecord> {
@@ -558,9 +525,7 @@ impl Store {
             &p.cpu_svn.to_ascii_uppercase(),
             &p.pce_svn.to_ascii_uppercase(),
         );
-        self.db
-            .delete(key.as_bytes())
-            .map_err(|_| error::INTERNAL_ERROR)
+        self.db.delete(key.as_bytes()).map_err(|_| error::INTERNAL_ERROR)
     }
 
     /// Node `getRegisteredPlatforms` + `deleteRegisteredPlatforms(state)` inside
@@ -594,10 +559,7 @@ impl Store {
         let id = sha384_hex(&reg.policy);
         let key = keys::appraisal(&reg.fmspc);
 
-        let _guard = self
-            .appraisal_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = self.appraisal_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut list: AppraisalList = self.get_json(&key).unwrap_or_default();
         if reg.is_default {
             for p in list.policies.iter_mut() {
@@ -625,10 +587,7 @@ impl Store {
         let fmspc = fmspc.to_ascii_uppercase();
         let id = sha384_hex(policy);
         let key = keys::appraisal(&fmspc);
-        let _guard = self
-            .appraisal_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = self.appraisal_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut list: AppraisalList = self.get_json(&key).unwrap_or_default();
         if is_default {
             for p in list.policies.iter_mut() {
@@ -650,15 +609,10 @@ impl Store {
     }
 
     pub fn get_default_policies(&self, fmspc: &str) -> Result<String, PccsError> {
-        let list: AppraisalList = self
-            .get_json(&keys::appraisal(fmspc))
-            .ok_or(error::NO_CACHE_DATA)?;
-        let defaults: Vec<&str> = list
-            .policies
-            .iter()
-            .filter(|p| p.is_default)
-            .map(|p| p.policy.as_str())
-            .collect();
+        let list: AppraisalList =
+            self.get_json(&keys::appraisal(fmspc)).ok_or(error::NO_CACHE_DATA)?;
+        let defaults: Vec<&str> =
+            list.policies.iter().filter(|p| p.is_default).map(|p| p.policy.as_str()).collect();
         if defaults.is_empty() {
             return Err(error::NO_CACHE_DATA);
         }
@@ -705,21 +659,12 @@ impl Store {
                     .and_then(|x| x.as_str())
                     .unwrap_or("PROCESSOR")
                     .to_ascii_uppercase();
-                let issuer = item
-                    .get("issuer_chain")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let hexv = item
-                    .get("pckcrl_hex")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("");
+                let issuer =
+                    item.get("issuer_chain").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let hexv = item.get("pckcrl_hex").and_then(|x| x.as_str()).unwrap_or("");
                 if let Ok(bytes) = hex::decode(hexv) {
-                    let _ = self.put_pckcrl(&PckCrlRecord {
-                        ca,
-                        pckcrl: bytes,
-                        issuer_chain: issuer,
-                    });
+                    let _ =
+                        self.put_pckcrl(&PckCrlRecord { ca, pckcrl: bytes, issuer_chain: issuer });
                 }
             }
         }
@@ -741,20 +686,10 @@ impl Store {
         }
         if let Some(arr) = v.get("appraisal_policies").and_then(|x| x.as_array()) {
             for item in arr {
-                let fmspc = item
-                    .get("fmspc")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_ascii_uppercase();
-                let policy = item
-                    .get("policy")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let is_default = item
-                    .get("is_default")
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or(true);
+                let fmspc =
+                    item.get("fmspc").and_then(|x| x.as_str()).unwrap_or("").to_ascii_uppercase();
+                let policy = item.get("policy").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let is_default = item.get("is_default").and_then(|x| x.as_bool()).unwrap_or(true);
                 if !fmspc.is_empty() && !policy.is_empty() {
                     self.upsert_appraisal_policy_raw(&fmspc, &policy, is_default);
                 }
@@ -775,21 +710,13 @@ impl Store {
             pceid,
             cpusvn,
             pcesvn,
-            cert: item
-                .get("cert")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
+            cert: item.get("cert").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             tcbm: upper(item, "tcbm"),
             fmspc: upper(item, "fmspc"),
             // Uppercase like every other writer, so the served
             // `SGX-PCK-Certificate-CA-Type` header is `PROCESSOR` / `PLATFORM`
             // whatever casing the seed file used.
-            ca: item
-                .get("ca")
-                .and_then(|x| x.as_str())
-                .unwrap_or("PROCESSOR")
-                .to_ascii_uppercase(),
+            ca: item.get("ca").and_then(|x| x.as_str()).unwrap_or("PROCESSOR").to_ascii_uppercase(),
             issuer_chain: item
                 .get("issuer_chain")
                 .and_then(|x| x.as_str())
@@ -809,9 +736,8 @@ impl Store {
         // A seeded raw-TCB record also establishes the platform, so
         // `has_platform` and the local-selection miss path work offline.
         let _guard = self.platform_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pool = self
-            .get_platform_pool(&rec.qeid, &rec.pceid)
-            .unwrap_or_else(|| PlatformPool {
+        let mut pool =
+            self.get_platform_pool(&rec.qeid, &rec.pceid).unwrap_or_else(|| PlatformPool {
                 qe_id: rec.qeid.clone(),
                 pce_id: rec.pceid.clone(),
                 enc_ppid: rec.encrypted_ppid.clone().unwrap_or_default(),
@@ -823,21 +749,14 @@ impl Store {
                 raw_tcbs: Vec::new(),
             });
         if !rec.tcbm.is_empty() && !pool.certs.iter().any(|c| c.tcbm == rec.tcbm) {
-            pool.certs.push(PlatformCert {
-                tcbm: rec.tcbm.clone(),
-                cert: rec.cert.clone(),
-            });
+            pool.certs.push(PlatformCert { tcbm: rec.tcbm.clone(), cert: rec.cert.clone() });
         }
         let raw = RawTcb {
             cpu_svn: rec.cpusvn.clone(),
             pce_svn: rec.pcesvn.clone(),
             tcbm: rec.tcbm.clone(),
         };
-        if !pool
-            .raw_tcbs
-            .iter()
-            .any(|r| r.cpu_svn == raw.cpu_svn && r.pce_svn == raw.pce_svn)
-        {
+        if !pool.raw_tcbs.iter().any(|r| r.cpu_svn == raw.cpu_svn && r.pce_svn == raw.pce_svn) {
             pool.raw_tcbs.push(raw);
         }
         let _ = self.put_platform_pool(&pool);
@@ -869,13 +788,11 @@ impl Store {
         let pce_svn = first_upper(item, &["pce_svn", "pcesvn"]);
 
         let _guard = self.platform_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pool = self
-            .get_platform_pool(&qe_id, &pce_id)
-            .unwrap_or_else(|| PlatformPool {
-                qe_id: qe_id.clone(),
-                pce_id: pce_id.clone(),
-                ..Default::default()
-            });
+        let mut pool = self.get_platform_pool(&qe_id, &pce_id).unwrap_or_else(|| PlatformPool {
+            qe_id: qe_id.clone(),
+            pce_id: pce_id.clone(),
+            ..Default::default()
+        });
         // Only fill blanks; a value already established by a seeded cert wins.
         if pool.enc_ppid.is_empty() {
             pool.enc_ppid = enc_ppid;
@@ -891,26 +808,15 @@ impl Store {
         // certificate is selected for it.
         if !cpu_svn.is_empty()
             && !pce_svn.is_empty()
-            && !pool
-                .raw_tcbs
-                .iter()
-                .any(|r| r.cpu_svn == cpu_svn && r.pce_svn == pce_svn)
+            && !pool.raw_tcbs.iter().any(|r| r.cpu_svn == cpu_svn && r.pce_svn == pce_svn)
         {
-            pool.raw_tcbs.push(RawTcb {
-                cpu_svn,
-                pce_svn,
-                tcbm: String::new(),
-            });
+            pool.raw_tcbs.push(RawTcb { cpu_svn, pce_svn, tcbm: String::new() });
         }
         let _ = self.put_platform_pool(&pool);
     }
 
     fn upsert_tcb_from_json(&self, item: &Value) {
-        let prod = match item
-            .get("prod_type")
-            .and_then(|x| x.as_str())
-            .unwrap_or("sgx")
-        {
+        let prod = match item.get("prod_type").and_then(|x| x.as_str()).unwrap_or("sgx") {
             "tdx" | "TDX" => 1u8,
             _ => 0,
         };
@@ -963,15 +869,10 @@ impl Store {
     /// as GET-shaped records plus one platform pool per (qe_id, pce_id).
     pub fn put_platform_collateral(&self, body: &Value, version: u32) -> Result<(), PccsError> {
         crate::validate::platform_collateral(body, version)?;
-        let platforms = body
-            .get("platforms")
-            .and_then(|x| x.as_array())
-            .ok_or(error::INVALID_REQ)?;
+        let platforms =
+            body.get("platforms").and_then(|x| x.as_array()).ok_or(error::INVALID_REQ)?;
         let collaterals = body.get("collaterals").cloned().unwrap_or(Value::Null);
-        let certificates = collaterals
-            .get("certificates")
-            .cloned()
-            .unwrap_or(Value::Null);
+        let certificates = collaterals.get("certificates").cloned().unwrap_or(Value::Null);
 
         // ---- TCB infos ----
         let tcb_issuer = first_str(
@@ -1037,10 +938,7 @@ impl Store {
             // The schema declares these as strings; a JSON object is also
             // accepted. Either way the stored body is what was sent.
             let (identity, raw_body) = if let Some(s) = ident.as_str() {
-                (
-                    serde_json::from_str(s).unwrap_or_else(|_| ident.clone()),
-                    s.to_string(),
-                )
+                (serde_json::from_str(s).unwrap_or_else(|_| ident.clone()), s.to_string())
             } else {
                 (ident.clone(), raw_json(ident))
             };
@@ -1057,10 +955,7 @@ impl Store {
         // ---- CRLs ----
         let pck_chain = |ca: &str| -> String {
             certificates
-                .pointer(&format!(
-                    "/{}/{ca}",
-                    crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN
-                ))
+                .pointer(&format!("/{}/{ca}", crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN))
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string()
@@ -1089,14 +984,8 @@ impl Store {
 
         // ---- PCK certs: one pool per platform, selection per raw TCB ----
         let empty = Vec::new();
-        let pck_certs = collaterals
-            .get("pck_certs")
-            .and_then(|x| x.as_array())
-            .unwrap_or(&empty);
-        let tcbinfos = collaterals
-            .get("tcbinfos")
-            .and_then(|x| x.as_array())
-            .unwrap_or(&empty);
+        let pck_certs = collaterals.get("pck_certs").and_then(|x| x.as_array()).unwrap_or(&empty);
+        let tcbinfos = collaterals.get("tcbinfos").and_then(|x| x.as_array()).unwrap_or(&empty);
 
         let mut batch = WriteBatch::default();
         // Held across every read-modify-write below *and* the final
@@ -1155,21 +1044,14 @@ impl Store {
                 })
                 .collect();
 
-            let mut pool =
-                self.get_platform_pool(&qe_id, &pce_id)
-                    .unwrap_or_else(|| PlatformPool {
-                        qe_id: qe_id.clone(),
-                        pce_id: pce_id.clone(),
-                        ..Default::default()
-                    });
+            let mut pool = self.get_platform_pool(&qe_id, &pce_id).unwrap_or_else(|| {
+                PlatformPool { qe_id: qe_id.clone(), pce_id: pce_id.clone(), ..Default::default() }
+            });
             pool.fmspc = info.fmspc.clone();
             pool.ca = info.ca.clone();
             pool.certs = certs
                 .iter()
-                .map(|(tcbm, cert)| PlatformCert {
-                    tcbm: tcbm.clone(),
-                    cert: cert.clone(),
-                })
+                .map(|(tcbm, cert)| PlatformCert { tcbm: tcbm.clone(), cert: cert.clone() })
                 .collect();
             let issuer = if pck_chain(&info.ca).is_empty() {
                 new_platforms
@@ -1192,11 +1074,8 @@ impl Store {
             }
 
             // Node: cached platform_tcbs plus the raw TCBs in this request.
-            let mut raw_tcbs: Vec<(String, String)> = pool
-                .raw_tcbs
-                .iter()
-                .map(|r| (r.cpu_svn.clone(), r.pce_svn.clone()))
-                .collect();
+            let mut raw_tcbs: Vec<(String, String)> =
+                pool.raw_tcbs.iter().map(|r| (r.cpu_svn.clone(), r.pce_svn.clone())).collect();
             for p in &new_platforms {
                 let cpu = first_upper(p, &["cpu_svn", "cpusvn"]);
                 let pce = first_upper(p, &["pce_svn", "pcesvn"]);
@@ -1250,10 +1129,7 @@ impl Store {
                 );
             }
             let k = keys::platform(&pool.qe_id, &pool.pce_id);
-            batch.put(
-                k.as_bytes(),
-                serde_json::to_vec(&pool).map_err(|_| error::INTERNAL_ERROR)?,
-            );
+            batch.put(k.as_bytes(), serde_json::to_vec(&pool).map_err(|_| error::INTERNAL_ERROR)?);
         }
 
         self.write_batch(batch)
@@ -1298,10 +1174,7 @@ fn raw_json(v: &Value) -> String {
 }
 
 fn upper(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_ascii_uppercase()
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_ascii_uppercase()
 }
 
 fn first_upper(v: &Value, keys: &[&str]) -> String {
@@ -1444,23 +1317,17 @@ mod tests {
         let rec = pckcert_rec("QEID1");
         s.put_pckcert(&rec).unwrap();
         // Case-insensitive on every field, like Node's SQL.
-        let got = s
-            .get_pckcert("qeid1", &"ab".repeat(16), "00ff", "0001")
-            .unwrap();
+        let got = s.get_pckcert("qeid1", &"ab".repeat(16), "00ff", "0001").unwrap();
         assert_eq!(got.qeid, "QEID1");
         // A different raw TCB is a different key.
-        assert!(s
-            .get_pckcert("QEID1", &"CD".repeat(16), "00FF", "0001")
-            .is_none());
+        assert!(s.get_pckcert("QEID1", &"CD".repeat(16), "00FF", "0001").is_none());
 
         // A record stored under a key it does not match reads as a miss, never
         // as another platform's certificate.
         let other = pckcert_rec("QEID2");
         let key = keys::pckcert("QEID3", "0001", &"AB".repeat(16), "00FF");
         s.put_json(&key, &other).unwrap();
-        assert!(s
-            .get_pckcert("QEID3", &"AB".repeat(16), "00FF", "0001")
-            .is_none());
+        assert!(s.get_pckcert("QEID3", &"AB".repeat(16), "00FF", "0001").is_none());
     }
 
     #[test]
@@ -1501,20 +1368,13 @@ mod tests {
         let fresh = PlatformPool {
             qe_id: "QE".into(),
             pce_id: "0001".into(),
-            certs: vec![PlatformCert {
-                tcbm: "T".into(),
-                cert: "C".into(),
-            }],
+            certs: vec![PlatformCert { tcbm: "T".into(), cert: "C".into() }],
             ..Default::default()
         };
         let previous = s.replace_platform_certs(&fresh).unwrap();
         assert_eq!(previous.len(), 2);
         let pool = s.get_platform_pool("QE", "0001").unwrap();
-        assert_eq!(
-            pool.raw_tcbs.len(),
-            2,
-            "raw TCBs must survive a cert refresh"
-        );
+        assert_eq!(pool.raw_tcbs.len(), 2, "raw TCBs must survive a cert refresh");
         assert_eq!(pool.cert_pairs(), vec![("T".to_string(), "C".to_string())]);
 
         s.remove_raw_tcb("QE", "0001", "aa", "bb").unwrap();
@@ -1537,16 +1397,8 @@ mod tests {
             enc_ppid: "PP".into(),
             fmspc: "00906EA10000".into(),
             raw_tcbs: vec![
-                RawTcb {
-                    cpu_svn: "A".into(),
-                    pce_svn: "B".into(),
-                    tcbm: String::new(),
-                },
-                RawTcb {
-                    cpu_svn: "C".into(),
-                    pce_svn: "D".into(),
-                    tcbm: String::new(),
-                },
+                RawTcb { cpu_svn: "A".into(), pce_svn: "B".into(), tcbm: String::new() },
+                RawTcb { cpu_svn: "C".into(), pce_svn: "D".into(), tcbm: String::new() },
             ],
             ..Default::default()
         };
@@ -1559,9 +1411,7 @@ mod tests {
         // Filtered by fmspc, case-insensitively.
         let hit = s.cached_platforms_by_fmspc(&["00906ea10000".to_string()]);
         assert_eq!(hit.len(), 2);
-        assert!(s
-            .cached_platforms_by_fmspc(&["FFFFFFFFFFFF".to_string()])
-            .is_empty());
+        assert!(s.cached_platforms_by_fmspc(&["FFFFFFFFFFFF".to_string()]).is_empty());
     }
 
     fn tcb_rec(version: u32, update: &str) -> TcbRecord {
@@ -1580,24 +1430,16 @@ mod tests {
     fn tcb_identity_crl_round_trips_and_mismatches() {
         let (_dir, s) = temp_store();
         s.put_tcb(&tcb_rec(4, "STANDARD")).unwrap();
-        assert!(s
-            .get_tcb(0, "00906ea10000", 4, UpdateType::Standard)
-            .is_some());
+        assert!(s.get_tcb(0, "00906ea10000", 4, UpdateType::Standard).is_some());
         // Version / update / prod type are part of the identity of a record.
-        assert!(s
-            .get_tcb(0, "00906EA10000", 3, UpdateType::Standard)
-            .is_none());
+        assert!(s.get_tcb(0, "00906EA10000", 3, UpdateType::Standard).is_none());
         assert!(s.get_tcb(0, "00906EA10000", 4, UpdateType::Early).is_none());
-        assert!(s
-            .get_tcb(1, "00906EA10000", 4, UpdateType::Standard)
-            .is_none());
+        assert!(s.get_tcb(1, "00906EA10000", 4, UpdateType::Standard).is_none());
         assert_eq!(s.list_tcbs().len(), 1);
         // Tampered record under a foreign key is a miss.
         let key = keys::tcb("sgx", 4, "FFFFFFFFFFFF", "STANDARD");
         s.put_json(&key, &tcb_rec(4, "STANDARD")).unwrap();
-        assert!(s
-            .get_tcb(0, "FFFFFFFFFFFF", 4, UpdateType::Standard)
-            .is_none());
+        assert!(s.get_tcb(0, "FFFFFFFFFFFF", 4, UpdateType::Standard).is_none());
 
         let id = IdentityRecord {
             enclave_id: 1,
@@ -1626,10 +1468,7 @@ mod tests {
         assert_eq!(s.list_pckcrls().len(), 1);
         let key = keys::pckcrl("PLATFORM");
         s.put_json(&key, &crl).unwrap();
-        assert!(
-            s.get_pckcrl("PLATFORM").is_none(),
-            "ca mismatch reads as a miss"
-        );
+        assert!(s.get_pckcrl("PLATFORM").is_none(), "ca mismatch reads as a miss");
 
         s.put_rootcacrl(&[9, 9]).unwrap();
         assert_eq!(s.get_rootcacrl().unwrap(), vec![9, 9]);
@@ -1770,9 +1609,7 @@ mod tests {
         let pool = s.get_platform_pool("QE", "0001").unwrap();
         assert_eq!(pool.certs.len(), 1);
         // The alternate key spelling (qeid/pceid) is accepted.
-        assert!(s
-            .get_pckcert("QE", &"AB".repeat(16), "00FF", "0001")
-            .is_some());
+        assert!(s.get_pckcert("QE", &"AB".repeat(16), "00FF", "0001").is_some());
     }
 
     /// A synthetic PCK certificate (Platform CA) matching the TCB below.
@@ -1783,9 +1620,8 @@ mod tests {
     const FMSPC: &str = "1234567890AB";
 
     fn tcb_info_json() -> serde_json::Value {
-        let comps: Vec<serde_json::Value> = (0..16)
-            .map(|_| serde_json::json!({ "svn": 0x22 }))
-            .collect();
+        let comps: Vec<serde_json::Value> =
+            (0..16).map(|_| serde_json::json!({ "svn": 0x22 })).collect();
         serde_json::json!({
             "id": "SGX", "fmspc": FMSPC, "pceId": PCEID, "tcbType": 0,
             "tcbLevels": [{
@@ -1852,8 +1688,7 @@ mod tests {
         assert_eq!(platform.issuer_chain, "pck-chain");
         assert_eq!(s.get_rootcacrl().unwrap(), vec![0x0d, 0x0e]);
         assert_eq!(
-            s.get_crl("https://certificates.trustedservices.intel.com/IntelSGXRootCA.crl")
-                .unwrap(),
+            s.get_crl("https://certificates.trustedservices.intel.com/IntelSGXRootCA.crl").unwrap(),
             vec![0x0d, 0x0e]
         );
 
@@ -1950,9 +1785,7 @@ mod tests {
         // A missing explicit path falls through to the built-in candidates;
         // the repo ships fixtures/seed.json, so this is always Some here.
         let missing = std::path::Path::new("/definitely/not/here.json");
-        assert!(find_seed_path(Some(missing))
-            .unwrap()
-            .ends_with("seed.json"));
+        assert!(find_seed_path(Some(missing)).unwrap().ends_with("seed.json"));
         let _ = std::fs::remove_file(&explicit);
     }
 }

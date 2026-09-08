@@ -8,23 +8,14 @@ use axum::Router;
 pub fn sgx_router(state: AppState) -> Router<AppState> {
     let admin = Router::new()
         .route("/platforms", get(handlers::get_platforms))
-        .route(
-            "/platformcollateral",
-            put(handlers::put_platform_collateral),
-        )
+        .route("/platformcollateral", put(handlers::put_platform_collateral))
         .route("/refresh", get(handlers::refresh).post(handlers::refresh))
         .route("/appraisalpolicy", put(handlers::put_appraisal_policy))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_admin,
-        ));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
     let user = Router::new()
         .route("/platforms", post(handlers::post_platforms))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_user,
-        ));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_user));
 
     Router::new()
         .merge(admin)

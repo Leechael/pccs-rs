@@ -28,11 +28,7 @@ pub const PREG: &str = "preg/";
 pub const PLATFORM: &str = "platform/";
 
 fn join_lower(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|p| p.to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join("/")
+    parts.iter().map(|p| p.to_ascii_lowercase()).collect::<Vec<_>>().join("/")
 }
 
 fn make(prefix: &str, parts: &[&str]) -> String {

@@ -29,11 +29,7 @@ async fn send(
 }
 
 fn get(path: &str) -> Request<Body> {
-    Request::builder()
-        .method("GET")
-        .uri(path)
-        .body(Body::empty())
-        .unwrap()
+    Request::builder().method("GET").uri(path).body(Body::empty()).unwrap()
 }
 
 fn get_admin(path: &str) -> Request<Body> {
@@ -154,11 +150,7 @@ async fn every_documented_route_is_registered() {
             .header(headers::ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN)
             .header(headers::USER_TOKEN, DEFAULT_USER_TOKEN)
             .header("content-type", "application/json")
-            .body(if *method == "GET" {
-                Body::empty()
-            } else {
-                Body::from("{}")
-            })
+            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
             .unwrap();
         let (status, _, _) = send(app(), req).await;
         assert_ne!(
@@ -166,11 +158,7 @@ async fn every_documented_route_is_registered() {
             StatusCode::NOT_FOUND,
             "{method} {path} should be registered, got {status}"
         );
-        assert_ne!(
-            status,
-            StatusCode::METHOD_NOT_ALLOWED,
-            "{method} {path} method not allowed"
-        );
+        assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path} method not allowed");
     }
 }
 
@@ -194,29 +182,18 @@ async fn request_id_is_always_generated() {
         .body(Body::empty())
         .unwrap();
     let (_, headers, _) = send(app(), req).await;
-    let id = headers
-        .get(headers::REQUEST_ID)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
+    let id = headers.get(headers::REQUEST_ID).unwrap().to_str().unwrap().to_string();
     assert_ne!(id, "abc123clientid");
     assert_eq!(id.len(), 32, "uuid without dashes");
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
 
     let (_, headers2, _) = send(app(), get("/no/such/route")).await;
-    assert_ne!(
-        headers2.get(headers::REQUEST_ID).unwrap().to_str().unwrap(),
-        id
-    );
+    assert_ne!(headers2.get(headers::REQUEST_ID).unwrap().to_str().unwrap(), id);
 }
 
 #[tokio::test]
 async fn admin_auth_missing_and_wrong_are_401() {
-    for path in [
-        "/sgx/certification/v4/platforms",
-        "/sgx/certification/v4/refresh",
-    ] {
+    for path in ["/sgx/certification/v4/platforms", "/sgx/certification/v4/refresh"] {
         let (status, _, body) = send(app(), get(path)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} missing token");
         assert_eq!(body.as_ref(), b"Authentication failed.");
@@ -246,19 +223,13 @@ async fn unset_token_hash_rejects_every_request() {
     cfg.user_token_hash = "not-a-sha512-hash".into();
     let router = app_cfg(cfg);
 
-    let (status, _, body) = send(
-        router.clone(),
-        get_admin("/sgx/certification/v4/platforms?source=reg"),
-    )
-    .await;
+    let (status, _, body) =
+        send(router.clone(), get_admin("/sgx/certification/v4/platforms?source=reg")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body.as_ref(), b"Authentication failed.");
 
-    let (status, _, _) = send(
-        router,
-        post_user("/sgx/certification/v4/platforms", json!({})),
-    )
-    .await;
+    let (status, _, _) =
+        send(router, post_user("/sgx/certification/v4/platforms", json!({}))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -278,10 +249,7 @@ async fn oversize_and_malformed_bodies_are_pccs_errors() {
     let (status, h, body) = send(router.clone(), big).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(body.as_ref(), b"Content too large.");
-    assert_eq!(
-        h.get(axum::http::header::CONTENT_TYPE).unwrap(),
-        "text/html; charset=utf-8"
-    );
+    assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), "text/html; charset=utf-8");
 
     for (ctype, payload) in [("application/json", "{not json"), ("text/plain", "{}")] {
         let req = Request::builder()
@@ -313,40 +281,24 @@ async fn user_auth_on_post_platforms() {
 async fn seeded_v4_pckcert_tcb_identity_pckcrl_200_with_intel_headers() {
     // pckcert
     let (status, h, body) = send(app(), get(PCKCERT)).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "pckcert {}",
-        String::from_utf8_lossy(&body)
-    );
+    assert_eq!(status, StatusCode::OK, "pckcert {}", String::from_utf8_lossy(&body));
     assert!(h.get(headers::SGX_TCBM).is_some());
     assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), "ABCDABCDABCD");
     // The seed says "processor" in lowercase; every writer normalises the CA
     // type, so the served header must be the uppercase PROCESSOR / PLATFORM
     // that Intel's clients expect.
-    assert_eq!(
-        h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(),
-        "PROCESSOR"
-    );
+    assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(), "PROCESSOR");
     assert!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).is_some());
-    assert_eq!(
-        h.get(axum::http::header::CONTENT_TYPE).unwrap(),
-        headers::CONTENT_TYPE_PEM
-    );
+    assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), headers::CONTENT_TYPE_PEM);
     assert!(h.get(headers::REQUEST_ID).is_some());
-    assert!(body
-        .windows(b"BEGIN CERTIFICATE".len())
-        .any(|w| w == b"BEGIN CERTIFICATE"));
+    assert!(body.windows(b"BEGIN CERTIFICATE".len()).any(|w| w == b"BEGIN CERTIFICATE"));
     assert!(h.get("x-powered-by").is_none());
 
     // tcb
     let (status, h, body) = send(app(), get(TCB)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(h.get(headers::TCB_INFO_ISSUER_CHAIN).is_some());
-    assert_eq!(
-        h.get(axum::http::header::CONTENT_TYPE).unwrap(),
-        headers::CONTENT_TYPE_JSON
-    );
+    assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), headers::CONTENT_TYPE_JSON);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v.get("tcbInfo").is_some());
 
@@ -354,10 +306,7 @@ async fn seeded_v4_pckcert_tcb_identity_pckcrl_200_with_intel_headers() {
     let (status, h, body) = send(app(), get(QE)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(h.get(headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN).is_some());
-    assert_eq!(
-        h.get(axum::http::header::CONTENT_TYPE).unwrap(),
-        headers::CONTENT_TYPE_JSON
-    );
+    assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), headers::CONTENT_TYPE_JSON);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v.get("enclaveIdentity").is_some());
 
@@ -365,22 +314,13 @@ async fn seeded_v4_pckcert_tcb_identity_pckcrl_200_with_intel_headers() {
     let (status, h, _) = send(app(), get(PCKCRL)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(h.get(headers::SGX_PCK_CRL_ISSUER_CHAIN).is_some());
-    assert_eq!(
-        h.get(axum::http::header::CONTENT_TYPE).unwrap(),
-        headers::CONTENT_TYPE_PEM
-    );
+    assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), headers::CONTENT_TYPE_PEM);
 
     // pckcrl DER
-    let (status, h, _) = send(
-        app(),
-        get("/sgx/certification/v4/pckcrl?ca=platform&encoding=DER"),
-    )
-    .await;
+    let (status, h, _) =
+        send(app(), get("/sgx/certification/v4/pckcrl?ca=platform&encoding=DER")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.get(axum::http::header::CONTENT_TYPE).unwrap(),
-        headers::CONTENT_TYPE_CRL
-    );
+    assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), headers::CONTENT_TYPE_CRL);
 }
 
 #[tokio::test]
@@ -391,11 +331,7 @@ async fn v3_requests_include_warning_header() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let warn = h
-        .get(headers::WARNING)
-        .expect("Warning header")
-        .to_str()
-        .unwrap();
+    let warn = h.get(headers::WARNING).expect("Warning header").to_str().unwrap();
     assert!(warn.contains("PCS API version 3 is no longer available"));
     assert!(warn.starts_with("299 - "));
 
@@ -477,17 +413,9 @@ async fn put_collateral_then_get_pckcert_is_cache_hit() {
         }
     });
 
-    let (status, _, body_txt) = send(
-        router.clone(),
-        put_admin("/sgx/certification/v4/platformcollateral", body),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body_txt)
-    );
+    let (status, _, body_txt) =
+        send(router.clone(), put_admin("/sgx/certification/v4/platformcollateral", body)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body_txt));
     assert_eq!(body_txt.as_ref(), b"Operation successful.");
 
     let path = format!(
@@ -497,18 +425,12 @@ async fn put_collateral_then_get_pckcert_is_cache_hit() {
     assert_eq!(status, StatusCode::OK);
     // fmspc and CA come from the certificate, as in Node.
     assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), PCK_FMSPC);
-    assert_eq!(
-        h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(),
-        "PLATFORM"
-    );
+    assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(), "PLATFORM");
     assert_eq!(
         h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
         "put-collateral-issuer-chain"
     );
-    assert_eq!(
-        h.get(headers::SGX_TCBM).unwrap(),
-        format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str()
-    );
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str());
     assert!(String::from_utf8_lossy(&cert).contains("BEGIN CERTIFICATE"));
 
     // A raw TCB that was never PUT is selected locally from the stored pool.
@@ -531,17 +453,12 @@ async fn put_collateral_then_get_pckcert_is_cache_hit() {
     );
     let (status, h, _) = send(router.clone(), get(&path)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.get(headers::SGX_TCBM).unwrap(),
-        format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str()
-    );
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str());
 
     // GET /platforms?source=[fmspc] returns only Node's six columns.
     let (status, h, body) = send(
         router,
-        get_admin(&format!(
-            "/sgx/certification/v4/platforms?source=%5B{PCK_FMSPC}%5D"
-        )),
+        get_admin(&format!("/sgx/certification/v4/platforms?source=%5B{PCK_FMSPC}%5D")),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -552,14 +469,7 @@ async fn put_collateral_then_get_pckcert_is_cache_hit() {
     fields.sort_unstable();
     assert_eq!(
         fields,
-        vec![
-            "cpu_svn",
-            "enc_ppid",
-            "pce_id",
-            "pce_svn",
-            "platform_manifest",
-            "qe_id"
-        ]
+        vec!["cpu_svn", "enc_ppid", "pce_id", "pce_svn", "platform_manifest", "qe_id"]
     );
 }
 
@@ -609,18 +519,12 @@ async fn put_collateral_preserves_tcbinfo_byte_order() {
             }
         }
     });
-    let (status, _, txt) = send(
-        router.clone(),
-        put_admin("/sgx/certification/v4/platformcollateral", body),
-    )
-    .await;
+    let (status, _, txt) =
+        send(router.clone(), put_admin("/sgx/certification/v4/platformcollateral", body)).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&txt));
 
-    let (status, h, got) = send(
-        router,
-        get(&format!("/sgx/certification/v4/tcb?fmspc={PCK_FMSPC}")),
-    )
-    .await;
+    let (status, h, got) =
+        send(router, get(&format!("/sgx/certification/v4/tcb?fmspc={PCK_FMSPC}"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h.get(headers::TCB_INFO_ISSUER_CHAIN).unwrap(), "tcb-chain");
     assert_eq!(
@@ -656,22 +560,13 @@ async fn put_collateral_rejects_schema_violations() {
     c["collaterals"].as_object_mut().unwrap().remove("tcbinfos");
     cases.push(("tcbinfos missing", c));
     let mut c = base.clone();
-    c["collaterals"]
-        .as_object_mut()
-        .unwrap()
-        .remove("certificates");
+    c["collaterals"].as_object_mut().unwrap().remove("certificates");
     cases.push(("certificates missing", c));
-    cases.push((
-        "platforms not an array",
-        json!({ "platforms": {}, "collaterals": {} }),
-    ));
+    cases.push(("platforms not an array", json!({ "platforms": {}, "collaterals": {} })));
 
     for (what, body) in cases {
-        let (status, _, txt) = send(
-            app(),
-            put_admin("/sgx/certification/v4/platformcollateral", body),
-        )
-        .await;
+        let (status, _, txt) =
+            send(app(), put_admin("/sgx/certification/v4/platformcollateral", body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{what}");
         assert_eq!(txt.as_ref(), b"Invalid request parameters.");
     }
@@ -691,11 +586,8 @@ async fn post_then_get_platforms_reg_queue() {
         "pce_svn": "0001",
         "enc_ppid": "A".repeat(768)
     });
-    let (status, _, txt) = send(
-        router.clone(),
-        post_user("/sgx/certification/v4/platforms", body),
-    )
-    .await;
+    let (status, _, txt) =
+        send(router.clone(), post_user("/sgx/certification/v4/platforms", body)).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&txt));
 
     let (status, h, body) =
@@ -730,11 +622,8 @@ async fn post_platforms_rejects_arrays_and_bad_fields() {
         json!({ "qe_id": "QEID", "pce_id": "zzzz" }),
         json!({ "qe_id": "", "pce_id": "0001" }),
     ] {
-        let (status, _, txt) = send(
-            router.clone(),
-            post_user("/sgx/certification/v4/platforms", body),
-        )
-        .await;
+        let (status, _, txt) =
+            send(router.clone(), post_user("/sgx/certification/v4/platforms", body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(txt.as_ref(), b"Invalid request parameters.");
     }
@@ -761,10 +650,7 @@ async fn qve_identity_and_rootcacrl_and_crl() {
 
     let (status, h, _) = send(app(), get("/sgx/certification/v4/rootcacrl")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.get(axum::http::header::CONTENT_TYPE).unwrap(),
-        headers::CONTENT_TYPE_CRL
-    );
+    assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), headers::CONTENT_TYPE_CRL);
 
     let (status, h, _) = send(
         app(),
@@ -772,20 +658,14 @@ async fn qve_identity_and_rootcacrl_and_crl() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.get(axum::http::header::CONTENT_TYPE).unwrap(),
-        headers::CONTENT_TYPE_CRL
-    );
+    assert_eq!(h.get(axum::http::header::CONTENT_TYPE).unwrap(), headers::CONTENT_TYPE_CRL);
 }
 
 #[tokio::test]
 async fn appraisal_policy_put_get() {
     let router = app();
-    let (status, _, body) = send(
-        router.clone(),
-        get("/sgx/certification/v4/appraisalpolicy?fmspc=ABCDABCDABCD"),
-    )
-    .await;
+    let (status, _, body) =
+        send(router.clone(), get("/sgx/certification/v4/appraisalpolicy?fmspc=ABCDABCDABCD")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(String::from_utf8_lossy(&body).contains("seed.policy.default"));
 
@@ -801,11 +681,8 @@ async fn appraisal_policy_put_get() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&id));
     assert_eq!(id.len(), 96); // sha384 hex
 
-    let (status, _, body) = send(
-        router.clone(),
-        get("/sgx/certification/v4/appraisalpolicy?fmspc=AAAAAAAAAAAA"),
-    )
-    .await;
+    let (status, _, body) =
+        send(router.clone(), get("/sgx/certification/v4/appraisalpolicy?fmspc=AAAAAAAAAAAA")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(String::from_utf8_lossy(&body), policy);
 
@@ -821,17 +698,10 @@ async fn appraisal_policy_put_get() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_ne!(id2, id);
-    let (status, _, body) = send(
-        router.clone(),
-        get("/sgx/certification/v4/appraisalpolicy?fmspc=AAAAAAAAAAAA"),
-    )
-    .await;
+    let (status, _, body) =
+        send(router.clone(), get("/sgx/certification/v4/appraisalpolicy?fmspc=AAAAAAAAAAAA")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        String::from_utf8_lossy(&body),
-        policy2,
-        "only the newest default is returned"
-    );
+    assert_eq!(String::from_utf8_lossy(&body), policy2, "only the newest default is returned");
 
     // Re-PUTting the same policy upserts by id instead of appending.
     let (status, _, id3) = send(
@@ -844,11 +714,8 @@ async fn appraisal_policy_put_get() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(id3, id2);
-    let (_, _, body) = send(
-        router.clone(),
-        get("/sgx/certification/v4/appraisalpolicy?fmspc=AAAAAAAAAAAA"),
-    )
-    .await;
+    let (_, _, body) =
+        send(router.clone(), get("/sgx/certification/v4/appraisalpolicy?fmspc=AAAAAAAAAAAA")).await;
     assert_eq!(String::from_utf8_lossy(&body), policy2);
 
     // Node validates the policy payload: no '.', bad base64url, or an unknown
@@ -863,11 +730,8 @@ async fn appraisal_policy_put_get() {
             "policy": jws_policy("00000000-0000-0000-0000-000000000000", "x")
         }),
     ] {
-        let (status, _, txt) = send(
-            router.clone(),
-            put_admin("/sgx/certification/v4/appraisalpolicy", bad),
-        )
-        .await;
+        let (status, _, txt) =
+            send(router.clone(), put_admin("/sgx/certification/v4/appraisalpolicy", bad)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(txt.as_ref(), b"Invalid request parameters.");
     }
@@ -887,11 +751,8 @@ async fn refresh_invalid_type_400() {
 
 #[tokio::test]
 async fn platforms_source_fmspc_list() {
-    let (status, h, _) = send(
-        app(),
-        get_admin("/sgx/certification/v4/platforms?source=%5BABCDABCDABCD%5D"),
-    )
-    .await;
+    let (status, h, _) =
+        send(app(), get_admin("/sgx/certification/v4/platforms?source=%5BABCDABCDABCD%5D")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h.get(headers::PLATFORM_COUNT).unwrap(), "1");
 }
@@ -1023,11 +884,7 @@ async fn lazy_miss_fetches_mock_then_hit() {
 
     let (status, _, body) = send(router, get(path)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        calls.load(Ordering::Relaxed),
-        1,
-        "second GET must be RocksDB hit"
-    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "second GET must be RocksDB hit");
     assert_eq!(body.as_ref(), expected);
 }
 
@@ -1051,11 +908,7 @@ async fn lazy_cache_preserves_identity_body_bytes() {
     let (status, _, body) = send(router, get(path)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_ref(), expected);
-    assert_eq!(
-        calls.load(Ordering::Relaxed),
-        1,
-        "second GET must be RocksDB hit"
-    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "second GET must be RocksDB hit");
 }
 
 #[tokio::test]
@@ -1066,11 +919,8 @@ async fn offline_miss_is_404_no_upstream() {
     let mut cfg = cfg_empty();
     cfg.uri = uri;
     cfg.cache_mode = CacheMode::Offline;
-    let (status, _, body) = send(
-        app_cfg(cfg),
-        get("/sgx/certification/v4/tcb?fmspc=00A067110000"),
-    )
-    .await;
+    let (status, _, body) =
+        send(app_cfg(cfg), get("/sgx/certification/v4/tcb?fmspc=00A067110000")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body.as_ref(), b"No cache data for this platform.");
     assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -1125,32 +975,20 @@ async fn put_collateral_then_get_tcb_and_identity() {
             }
         }
     });
-    let (status, _, txt) = send(
-        router.clone(),
-        put_admin("/sgx/certification/v4/platformcollateral", body),
-    )
-    .await;
+    let (status, _, txt) =
+        send(router.clone(), put_admin("/sgx/certification/v4/platformcollateral", body)).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&txt));
 
-    let (status, h, body) = send(
-        router.clone(),
-        get(&format!("/sgx/certification/v4/tcb?fmspc={PCK_FMSPC}")),
-    )
-    .await;
+    let (status, h, body) =
+        send(router.clone(), get(&format!("/sgx/certification/v4/tcb?fmspc={PCK_FMSPC}"))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.get(headers::TCB_INFO_ISSUER_CHAIN).unwrap(),
-        "put-tcb-issuer"
-    );
+    assert_eq!(h.get(headers::TCB_INFO_ISSUER_CHAIN).unwrap(), "put-tcb-issuer");
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["signature"], "put-tcb");
 
     let (status, h, body) = send(router, get("/sgx/certification/v4/qe/identity")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        h.get(headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN).unwrap(),
-        "put-qe-issuer"
-    );
+    assert_eq!(h.get(headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN).unwrap(), "put-qe-issuer");
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["enclaveIdentity"]["id"], "QE-PUT");
 }
@@ -1201,11 +1039,7 @@ async fn spawn_server() -> Option<(ServerGuard, String)> {
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .build_http::<http_body_util::Empty<bytes::Bytes>>();
     for _ in 0..3 {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let db = std::env::temp_dir().join(format!("pccs-rs-e2e-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&db).unwrap();
         let cfg = db.join("empty.toml");
@@ -1273,23 +1107,10 @@ async fn binary_serves_seeded_cache_and_shuts_down_on_sigterm() {
 
     // The load generator runs its full main against this server.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_loadgen"))
-        .args([
-            "--url",
-            &url,
-            "--duration",
-            "1",
-            "--concurrency",
-            "2",
-            "--warmup",
-            "1",
-        ])
+        .args(["--url", &url, "--duration", "1", "--concurrency", "2", "--warmup", "1"])
         .output()
         .expect("run loadgen");
-    assert!(
-        out.status.success(),
-        "loadgen failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "loadgen failed: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("rps:"), "{stdout}");
     assert!(stdout.contains("p99_ms:"), "{stdout}");
@@ -1322,24 +1143,11 @@ async fn live_phala_tcb_and_qe_identity() {
     cfg.uri = "https://pccs.phala.network/sgx/certification/v4/".into();
     cfg.cache_mode = CacheMode::Lazy;
     let router = app_cfg(cfg);
-    let (status, _, body) = send(
-        router.clone(),
-        get("/sgx/certification/v4/tcb?fmspc=00A067110000"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "live tcb {}",
-        String::from_utf8_lossy(&body)
-    );
+    let (status, _, body) =
+        send(router.clone(), get("/sgx/certification/v4/tcb?fmspc=00A067110000")).await;
+    assert_eq!(status, StatusCode::OK, "live tcb {}", String::from_utf8_lossy(&body));
     let (status, _, body) = send(router, get("/sgx/certification/v4/qe/identity")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "live qe {}",
-        String::from_utf8_lossy(&body)
-    );
+    assert_eq!(status, StatusCode::OK, "live qe {}", String::from_utf8_lossy(&body));
 }
 
 /// Finding F: N concurrent misses on the same key must produce ONE upstream
@@ -1485,6 +1293,119 @@ async fn spawn_refresh_mock(
     (format!("http://{addr}/sgx/certification/v4/"), h)
 }
 
+/// Intel PCCS 2026-09-04 commit 4d077a7 security fix: Express allowed `//` in
+/// URLs which bypassed app-level middleware while still matching route handlers.
+///
+/// Axum behavior: duplicate slashes cause routes to NOT MATCH at all (404), which
+/// is inherently safe—no handler runs, so no auth bypass is possible. This test
+/// verifies that Axum's routing is NOT vulnerable to the class of bypass Intel fixed:
+///
+/// - Normal paths WITH auth work (200/OK or other success based on payload)
+/// - Normal paths WITHOUT auth fail with 401
+/// - Double-slash paths return 404 (route doesn't match), proving no handler bypass
+#[tokio::test]
+async fn auth_not_bypassed_by_duplicate_slashes() {
+    let router = app();
+
+    // Protected admin routes: expected status when authed (may be 200, 400, etc.)
+    // The key test is: without auth = 401, with auth = not 401 or 404
+    let admin_test_cases = [
+        ("GET", "/sgx/certification/v4/platforms?source=reg"),
+        ("PUT", "/sgx/certification/v4/platformcollateral"),
+        ("GET", "/sgx/certification/v4/refresh"),
+        ("POST", "/sgx/certification/v4/refresh"),
+        ("PUT", "/sgx/certification/v4/appraisalpolicy"),
+    ];
+
+    for (method, path) in &admin_test_cases {
+        // Normal path WITHOUT auth: must be 401
+        let req = Request::builder()
+            .method(*method)
+            .uri(*path)
+            .header("content-type", "application/json")
+            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
+            .unwrap();
+        let (status, _, body) = send(router.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path} without token must be 401");
+        assert_eq!(body.as_ref(), b"Authentication failed.");
+
+        // Normal path WITH valid auth: must NOT be 401 or 404 (auth passed, handler ran)
+        let req = Request::builder()
+            .method(*method)
+            .uri(*path)
+            .header(headers::ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN)
+            .header("content-type", "application/json")
+            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
+            .unwrap();
+        let (status, _, _) = send(router.clone(), req).await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::NOT_FOUND,
+            "{method} {path} with valid token got {status}; must not be 401 (auth bypass) or 404 (route not found)"
+        );
+
+        // Double-slash variant: must be 404 (route doesn't match)
+        // This proves Axum is NOT vulnerable to the Express bypass class
+        let double_slash_path = path.replace("/v4/", "/v4//");
+        let req = Request::builder()
+            .method(*method)
+            .uri(&double_slash_path)
+            .header("content-type", "application/json")
+            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
+            .unwrap();
+        let (status, _, _) = send(router.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {double_slash_path} must be 404 (route not matched); if 401 or 200, handler ran (bypass!)"
+        );
+
+        // Double-slash WITH auth: still 404 (route never matches, so auth never runs)
+        let req = Request::builder()
+            .method(*method)
+            .uri(&double_slash_path)
+            .header(headers::ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN)
+            .header("content-type", "application/json")
+            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
+            .unwrap();
+        let (status, _, _) = send(router.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {double_slash_path} even with auth must be 404"
+        );
+    }
+
+    // Protected user route: POST /platforms
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sgx/certification/v4/platforms")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, _, _) = send(router.clone(), req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sgx/certification/v4/platforms")
+        .header(headers::USER_TOKEN, DEFAULT_USER_TOKEN)
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, _, _) = send(router.clone(), req).await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+
+    // Double-slash: 404
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sgx/certification/v4//platforms")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, _, _) = send(router.clone(), req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "double-slash POST must be 404");
+}
+
 /// Finding G: concurrent refreshes are serialised, and an upstream failure is
 /// reported instead of swallowed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1499,11 +1420,8 @@ async fn refresh_is_serialised_and_propagates_failures() {
     let router = app_cfg(cfg);
 
     // Seed one TCB info, so a later /refresh actually has something to refresh.
-    let (status, _, _) = send(
-        router.clone(),
-        get("/sgx/certification/v4/tcb?fmspc=00A067110000"),
-    )
-    .await;
+    let (status, _, _) =
+        send(router.clone(), get("/sgx/certification/v4/tcb?fmspc=00A067110000")).await;
     assert_eq!(status, StatusCode::OK);
     log.lock().await.clear();
 
@@ -1545,10 +1463,7 @@ async fn refresh_is_serialised_and_propagates_failures() {
         StatusCode::SERVICE_UNAVAILABLE,
         "a failing upstream must surface as 503, not a silent 200"
     );
-    assert_eq!(
-        body.as_ref(),
-        b"Server is currently unable to process the request."
-    );
+    assert_eq!(body.as_ref(), b"Server is currently unable to process the request.");
 
     // And it recovers once the upstream does.
     fail.store(false, Ordering::SeqCst);
@@ -1563,11 +1478,9 @@ async fn offline_refresh_validates_before_503() {
     cfg.cache_mode = CacheMode::Offline;
     let router = app_cfg(cfg);
 
-    let (status, _, body) = send(
-        router.clone(),
-        get_admin("/sgx/certification/v4/refresh?type=certs&fmspc=nothex"),
-    )
-    .await;
+    let (status, _, body) =
+        send(router.clone(), get_admin("/sgx/certification/v4/refresh?type=certs&fmspc=nothex"))
+            .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body.as_ref(), b"Invalid request parameters.");
 
@@ -1580,19 +1493,13 @@ async fn offline_refresh_validates_before_503() {
 #[tokio::test]
 async fn query_parsing_matches_node() {
     // first occurrence wins: a valid fmspc followed by junk still resolves
-    let (status, _, _) = send(
-        app(),
-        get("/sgx/certification/v4/tcb?fmspc=ABCDABCDABCD&fmspc=nothex"),
-    )
-    .await;
+    let (status, _, _) =
+        send(app(), get("/sgx/certification/v4/tcb?fmspc=ABCDABCDABCD&fmspc=nothex")).await;
     assert_eq!(status, StatusCode::OK);
 
     // ...and junk first is a 400 even when a valid value follows
-    let (status, _, _) = send(
-        app(),
-        get("/sgx/certification/v4/tcb?fmspc=nothex&fmspc=ABCDABCDABCD"),
-    )
-    .await;
+    let (status, _, _) =
+        send(app(), get("/sgx/certification/v4/tcb?fmspc=nothex&fmspc=ABCDABCDABCD")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // encrypted_ppid present but empty fails isHex('', 768)
@@ -1653,24 +1560,14 @@ async fn lazy_pckcert_fill_from_pccs_then_hit() {
     assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), "00A067110000");
     // The mock sends "processor" in lowercase; the served header is the
     // normalised uppercase form.
-    assert_eq!(
-        h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(),
-        "PROCESSOR"
-    );
-    assert_eq!(
-        h.get(headers::SGX_TCBM).unwrap(),
-        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBCCCC"
-    );
+    assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(), "PROCESSOR");
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBCCCC");
     assert!(String::from_utf8_lossy(&body).contains("BEGIN CERTIFICATE"));
     let pck_calls = calls.load(Ordering::Relaxed);
 
     let (status, _, _) = send(router, get(&path)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        calls.load(Ordering::Relaxed),
-        pck_calls,
-        "second GET is a store hit"
-    );
+    assert_eq!(calls.load(Ordering::Relaxed), pck_calls, "second GET is a store hit");
 }
 
 /// A request body that delivers one chunk and then never completes, without
@@ -1707,9 +1604,7 @@ async fn stalled_request_body_is_408_with_request_id() {
         .uri("/sgx/certification/v4/platforms")
         .header("content-type", "application/json")
         .header("user-token", DEFAULT_USER_TOKEN)
-        .body(Body::new(StalledBody(Some(bytes::Bytes::from_static(
-            b"{\"qe_id\":",
-        )))))
+        .body(Body::new(StalledBody(Some(bytes::Bytes::from_static(b"{\"qe_id\":")))))
         .unwrap();
 
     let started = std::time::Instant::now();
