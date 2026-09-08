@@ -1487,18 +1487,18 @@ async fn spawn_refresh_mock(
 
 /// Intel PCCS 2026-09-04 commit 4d077a7 security fix: Express allowed `//` in
 /// URLs which bypassed app-level middleware while still matching route handlers.
-/// 
+///
 /// Axum behavior: duplicate slashes cause routes to NOT MATCH at all (404), which
 /// is inherently safe—no handler runs, so no auth bypass is possible. This test
 /// verifies that Axum's routing is NOT vulnerable to the class of bypass Intel fixed:
-/// 
+///
 /// - Normal paths WITH auth work (200/OK or other success based on payload)
 /// - Normal paths WITHOUT auth fail with 401
 /// - Double-slash paths return 404 (route doesn't match), proving no handler bypass
 #[tokio::test]
 async fn auth_not_bypassed_by_duplicate_slashes() {
     let router = app();
-    
+
     // Protected admin routes: expected status when authed (may be 200, 400, etc.)
     // The key test is: without auth = 401, with auth = not 401 or 404
     let admin_test_cases = [
@@ -1615,7 +1615,11 @@ async fn auth_not_bypassed_by_duplicate_slashes() {
         .body(Body::from("{}"))
         .unwrap();
     let (status, _, _) = send(router.clone(), req).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "double-slash POST must be 404");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "double-slash POST must be 404"
+    );
 }
 
 /// Finding G: concurrent refreshes are serialised, and an upstream failure is
