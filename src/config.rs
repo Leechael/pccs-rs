@@ -52,12 +52,7 @@ pub struct RocksDbOpts {
 
 impl Default for RocksDbOpts {
     fn default() -> Self {
-        Self {
-            block_cache_mb: 8,
-            write_buffer_mb: 64,
-            max_write_buffers: 2,
-            max_open_files: -1,
-        }
+        Self { block_cache_mb: 8, write_buffer_mb: 64, max_write_buffers: 2, max_open_files: -1 }
     }
 }
 
@@ -413,16 +408,8 @@ impl Config {
     /// hash disables the endpoints guarded by that token (they answer 401).
     pub fn validate_token_hashes(&self) {
         for (name, hash, what) in [
-            (
-                "UserTokenHash",
-                &self.user_token_hash,
-                "user-token endpoints",
-            ),
-            (
-                "AdminTokenHash",
-                &self.admin_token_hash,
-                "admin-token endpoints",
-            ),
+            ("UserTokenHash", &self.user_token_hash, "user-token endpoints"),
+            ("AdminTokenHash", &self.admin_token_hash, "admin-token endpoints"),
         ] {
             if !is_sha512_hex(hash) {
                 tracing::error!("{name} not configured: {what} disabled");
@@ -467,9 +454,7 @@ impl Config {
     pub fn from_serve_args(c: ServeArgs, implicit_config: Option<&Path>) -> Self {
         let path = match c.config.as_deref() {
             Some(p) => Some(p.to_path_buf()),
-            None => implicit_config
-                .filter(|p| p.is_file())
-                .map(Path::to_path_buf),
+            None => implicit_config.filter(|p| p.is_file()).map(Path::to_path_buf),
         };
         let file = path.as_deref().map(load_toml).unwrap_or_default();
 
@@ -519,9 +504,7 @@ fn parse_body_size_reporting(s: &str, warnings: &mut Vec<String>) -> usize {
     match try_parse_body_size(s) {
         Some(n) => n,
         None => {
-            warnings.push(format!(
-                "MaxRequestBodySize {s:?} is not a valid size; using 2MB"
-            ));
+            warnings.push(format!("MaxRequestBodySize {s:?} is not a valid size; using 2MB"));
             DEFAULT_MAX_BODY_SIZE
         }
     }
@@ -826,12 +809,9 @@ pub fn import_pccs_json(from: &Path, to: &Path) -> Result<(), String> {
     let src = load_json(from)?;
     let mut doc = if to.is_file() {
         let s = std::fs::read_to_string(to).map_err(|e| format!("{}: {e}", to.display()))?;
-        s.parse::<DocumentMut>()
-            .map_err(|e| format!("{}: invalid TOML: {e}", to.display()))?
+        s.parse::<DocumentMut>().map_err(|e| format!("{}: invalid TOML: {e}", to.display()))?
     } else {
-        DEFAULT_CONFIG_TOML
-            .parse::<DocumentMut>()
-            .expect("packaged config.toml is valid TOML")
+        DEFAULT_CONFIG_TOML.parse::<DocumentMut>().expect("packaged config.toml is valid TOML")
     };
     apply_json_to_toml(&mut doc, &src);
     if let Some(parent) = to.parent() {
@@ -907,19 +887,9 @@ mod tests {
 
     #[test]
     fn intel_upstream_is_a_host_check() {
-        let intel = |uri: &str| {
-            Config {
-                uri: uri.into(),
-                ..Config::default()
-            }
-            .is_intel_upstream()
-        };
-        assert!(intel(
-            "https://api.trustedservices.intel.com/sgx/certification/v4/"
-        ));
-        assert!(intel(
-            "https://validation.api.trustedservices.intel.com/sgx/certification/v4/"
-        ));
+        let intel = |uri: &str| Config { uri: uri.into(), ..Config::default() }.is_intel_upstream();
+        assert!(intel("https://api.trustedservices.intel.com/sgx/certification/v4/"));
+        assert!(intel("https://validation.api.trustedservices.intel.com/sgx/certification/v4/"));
         // Substring matches that must NOT leak the Intel API key.
         assert!(!intel("https://trustedservices.intel.com.evil.test/sgx/"));
         assert!(!intel("https://evil.test/?x=api.trustedservices.intel.com"));
@@ -934,9 +904,7 @@ mod tests {
         assert!(cfg.admin_token_hash.is_empty());
         assert_eq!(cfg.uri, DEFAULT_URI);
         assert!(is_sha512_hex(DEFAULT_USER_TOKEN_HASH));
-        assert!(is_sha512_hex(
-            Config::test_default().admin_token_hash.as_str()
-        ));
+        assert!(is_sha512_hex(Config::test_default().admin_token_hash.as_str()));
     }
 
     #[test]
@@ -957,15 +925,9 @@ mod tests {
             Some("api.example.com")
         );
         // No scheme is tolerated (`host:port/path`).
-        assert_eq!(
-            uri_host("example.com:8081/x").as_deref(),
-            Some("example.com")
-        );
+        assert_eq!(uri_host("example.com:8081/x").as_deref(), Some("example.com"));
         // Userinfo is stripped.
-        assert_eq!(
-            uri_host("https://user:pass@example.com/x").as_deref(),
-            Some("example.com")
-        );
+        assert_eq!(uri_host("https://user:pass@example.com/x").as_deref(), Some("example.com"));
         // IPv6 literal in brackets.
         assert_eq!(uri_host("http://[::1]:8081/").as_deref(), Some("::1"));
         assert_eq!(uri_host(""), None);
@@ -985,10 +947,7 @@ mod tests {
         assert!(cfg.has_upstream());
         // A URI without a version segment falls back to v4.
         assert_eq!(Config::default().pcs_version(), 4);
-        let empty = Config {
-            uri: "  ".into(),
-            ..Config::default()
-        };
+        let empty = Config { uri: "  ".into(), ..Config::default() };
         assert!(!empty.has_upstream());
     }
 
@@ -1143,11 +1102,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pccs-rs-https-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(
-            &path,
-            "https = true\ncert = \"/tmp/c.crt\"\nkey = \"/tmp/k.pem\"\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "https = true\ncert = \"/tmp/c.crt\"\nkey = \"/tmp/k.pem\"\n")
+            .unwrap();
         let cfg = parse_serve(["pccs-rs", "--config", path.to_str().unwrap()]);
         assert!(cfg.https);
         assert!(!cfg.http);
@@ -1282,11 +1238,8 @@ mod tests {
         assert_eq!(file.rocksdb_max_open_files, Some(-1));
 
         // Merge: keep keys the JSON does not mention, update those it does.
-        std::fs::write(
-            &toml_path,
-            "# keep me\napi_key = \"old\"\nlog_level = \"trace\"\n",
-        )
-        .unwrap();
+        std::fs::write(&toml_path, "# keep me\napi_key = \"old\"\nlog_level = \"trace\"\n")
+            .unwrap();
         std::fs::write(&json, r#"{"ApiKey":"new-key"}"#).unwrap();
         import_pccs_json(&json, &toml_path).unwrap();
         let text = std::fs::read_to_string(&toml_path).unwrap();

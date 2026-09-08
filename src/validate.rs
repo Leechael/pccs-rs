@@ -207,9 +207,7 @@ fn is_root_crl_uri(uri: &str) -> bool {
     };
     let host_ok = host == "certprx.adsdcsp.com"
         || (host.ends_with("certificates.trustedservices.intel.com")
-            && host[..host
-                .len()
-                .saturating_sub("certificates.trustedservices.intel.com".len())]
+            && host[..host.len().saturating_sub("certificates.trustedservices.intel.com".len())]
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-'));
     host_ok && path.starts_with("IntelSGXRootCA.") && path.len() > "IntelSGXRootCA.".len()
@@ -250,13 +248,9 @@ fn is_intermediate_host(host: &str) -> bool {
     // [a-zA-Z0-9-]*\.?api\.trustedservices\.intel\.com
     // or [a-zA-Z0-9-]+\.az\.sgx(prod|np)\.adsdcsp\.com
     if host == "api.trustedservices.intel.com" || host.ends_with(".api.trustedservices.intel.com") {
-        let prefix = host
-            .strip_suffix("api.trustedservices.intel.com")
-            .unwrap_or("");
+        let prefix = host.strip_suffix("api.trustedservices.intel.com").unwrap_or("");
         let prefix = prefix.strip_suffix('.').unwrap_or(prefix);
-        return prefix
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        return prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     }
     if let Some(left) = host.strip_suffix(".az.sgxprod.adsdcsp.com") {
         return !left.is_empty() && left.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
@@ -477,11 +471,8 @@ pub fn platform_collateral(body: &Value, version: u32) -> Result<(), PccsError> 
     // `additionalProperties: false`, so Node ignores them at the schema step
     // (and still stores them afterwards). Validating them here would 400 a body
     // Node accepts.
-    let tcb_fields: &[&str] = if version < 4 {
-        &["tcbinfo"]
-    } else {
-        &["sgx_tcbinfo", "tdx_tcbinfo"]
-    };
+    let tcb_fields: &[&str] =
+        if version < 4 { &["tcbinfo"] } else { &["sgx_tcbinfo", "tdx_tcbinfo"] };
     for t in tcbinfos {
         if !t.is_object() {
             return Err(reject("tcbinfos[] entry must be an object"));
@@ -527,11 +518,9 @@ pub fn platform_collateral(body: &Value, version: u32) -> Result<(), PccsError> 
     for ca in ["PROCESSOR", "PLATFORM"] {
         opt_str(issuer_chains, ca)?;
     }
-    for key in [
-        "SGX-TCB-Info-Issuer-Chain",
-        "TCB-Info-Issuer-Chain",
-        "SGX-Enclave-Identity-Issuer-Chain",
-    ] {
+    for key in
+        ["SGX-TCB-Info-Issuer-Chain", "TCB-Info-Issuer-Chain", "SGX-Enclave-Identity-Issuer-Chain"]
+    {
         opt_str(certificates, key)?;
     }
     Ok(())
@@ -553,9 +542,7 @@ const CLASS_ID_TDQE: &str = "3769258c-75e6-4bc7-8d72-d2b0e224cad2";
 
 fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(s.trim_end_matches('='))
-        .ok()
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).ok()
 }
 
 pub fn appraisal_policy(body: &Value) -> Result<AppraisalPolicyReg, PccsError> {
@@ -736,10 +723,7 @@ mod tests {
         assert!(platform_collateral(&bad, 4).is_err());
 
         let mut bad = good.clone();
-        bad["collaterals"]
-            .as_object_mut()
-            .unwrap()
-            .remove("certificates");
+        bad["collaterals"].as_object_mut().unwrap().remove("certificates");
         assert!(platform_collateral(&bad, 4).is_err());
 
         let mut bad = good.clone();
@@ -779,14 +763,8 @@ mod tests {
 
     #[test]
     fn version_from_url() {
-        assert_eq!(
-            api_version_from_url("/sgx/certification/v4/tcb").unwrap(),
-            4
-        );
-        assert_eq!(
-            api_version_from_url("/sgx/certification/v3/pckcert").unwrap(),
-            3
-        );
+        assert_eq!(api_version_from_url("/sgx/certification/v4/tcb").unwrap(), 4);
+        assert_eq!(api_version_from_url("/sgx/certification/v3/pckcert").unwrap(), 3);
     }
 
     #[test]
@@ -805,14 +783,8 @@ mod tests {
     #[test]
     fn update_type_parsing() {
         assert_eq!(update_type(None, false).unwrap(), UpdateType::Standard);
-        assert_eq!(
-            update_type(Some("standard"), false).unwrap(),
-            UpdateType::Standard
-        );
-        assert_eq!(
-            update_type(Some("early"), false).unwrap(),
-            UpdateType::Early
-        );
+        assert_eq!(update_type(Some("standard"), false).unwrap(), UpdateType::Standard);
+        assert_eq!(update_type(Some("early"), false).unwrap(), UpdateType::Early);
         // ALL is only accepted where Node allows it (POST /platforms).
         assert_eq!(update_type(Some("all"), true).unwrap(), UpdateType::All);
         assert!(update_type(Some("all"), false).is_err());
@@ -855,22 +827,10 @@ mod tests {
 
     #[test]
     fn platforms_source_variants() {
-        assert!(matches!(
-            platforms_source(None).unwrap(),
-            PlatformsSource::Reg
-        ));
-        assert!(matches!(
-            platforms_source(Some("")).unwrap(),
-            PlatformsSource::Reg
-        ));
-        assert!(matches!(
-            platforms_source(Some("reg")).unwrap(),
-            PlatformsSource::Reg
-        ));
-        assert!(matches!(
-            platforms_source(Some("reg_na")).unwrap(),
-            PlatformsSource::RegNa
-        ));
+        assert!(matches!(platforms_source(None).unwrap(), PlatformsSource::Reg));
+        assert!(matches!(platforms_source(Some("")).unwrap(), PlatformsSource::Reg));
+        assert!(matches!(platforms_source(Some("reg")).unwrap(), PlatformsSource::Reg));
+        assert!(matches!(platforms_source(Some("reg_na")).unwrap(), PlatformsSource::RegNa));
         // Empty list is allowed; downstream an empty filter matches every
         // cached platform (cached_platforms_by_fmspc skips the fmspc check).
         match platforms_source(Some("[]")).unwrap() {
@@ -1052,9 +1012,7 @@ mod tests {
             "https://evil_certificates.trustedservices.intel.com/IntelSGXRootCA.crl"
         ));
         // The alternate root-CRL host from Node's regex.
-        assert!(is_valid_crl_uri(
-            "https://certprx.adsdcsp.com/IntelSGXRootCA.crl"
-        ));
+        assert!(is_valid_crl_uri("https://certprx.adsdcsp.com/IntelSGXRootCA.crl"));
         // Root CA path must have something after `IntelSGXRootCA.`.
         assert!(!is_valid_crl_uri(
             "https://certificates.trustedservices.intel.com/IntelSGXRootCA."

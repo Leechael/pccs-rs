@@ -97,9 +97,7 @@ async fn run(cfg: Config) {
     let app = create_app(state.clone());
 
     if cfg.https {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        rustls::crypto::ring::default_provider().install_default().ok();
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cfg.cert, &cfg.key)
             .await
             .unwrap_or_else(|e| {
@@ -133,12 +131,10 @@ async fn run(cfg: Config) {
         }
     } else {
         tracing::info!("HTTP Server is running on: http://{}", addr);
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("bind {addr}: {e}");
-                std::process::exit(1);
-            });
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
+            eprintln!("bind {addr}: {e}");
+            std::process::exit(1);
+        });
         serve_http(listener, app, &cfg).await;
     }
 
@@ -239,9 +235,8 @@ fn tune_tcp(stream: &tokio::net::TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!("set_nodelay: {e}");
     }
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(TCP_KEEPALIVE)
-        .with_interval(TCP_KEEPALIVE);
+    let keepalive =
+        socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE).with_interval(TCP_KEEPALIVE);
     if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
         tracing::debug!("set_tcp_keepalive: {e}");
     }
@@ -286,11 +281,8 @@ fn configure_http(builder: &mut auto::Builder<TokioExecutor>, cfg: &Config) {
     let keep_alive = cfg.keepalive_timeout_secs > 0;
     // With keep-alive off there is no idle wait to bound, so the headers timeout
     // is the only meaningful value for the single request head.
-    let idle = if keep_alive {
-        cfg.keepalive_timeout_secs
-    } else {
-        cfg.headers_timeout_secs.max(1)
-    };
+    let idle =
+        if keep_alive { cfg.keepalive_timeout_secs } else { cfg.headers_timeout_secs.max(1) };
     builder
         .http1()
         .timer(TokioTimer::new())
@@ -354,10 +346,7 @@ fn warn_on_self_upstream(cfg: &Config, addr: SocketAddr) {
         return;
     };
     let same_host = host == cfg.host.to_ascii_lowercase()
-        || host
-            .to_socket_addrs()
-            .map(|mut a| a.any(|a| a.ip() == addr.ip()))
-            .unwrap_or(false);
+        || host.to_socket_addrs().map(|mut a| a.any(|a| a.ip() == addr.ip())).unwrap_or(false);
     if same_host {
         tracing::warn!(
             "upstream uri host {host} looks like this service; a cache miss would call back into pccs-rs. \
@@ -386,9 +375,7 @@ fn spawn_refresh_scheduler(
                 );
                 break;
             };
-            let wait = (next - now)
-                .to_std()
-                .unwrap_or(std::time::Duration::from_secs(60));
+            let wait = (next - now).to_std().unwrap_or(std::time::Duration::from_secs(60));
             tracing::info!("next scheduled refresh at {next} (in {wait:?})");
             tokio::time::sleep(wait).await;
             match cache.refresh(None, None).await {
@@ -460,9 +447,7 @@ mod tests {
     /// process-global and tests run in parallel, so every assertion is a
     /// before/after count on a needle only this test can produce.
     fn log_count(logs: &std::sync::Mutex<Vec<u8>>, needle: &str) -> usize {
-        String::from_utf8_lossy(&logs.lock().unwrap())
-            .matches(needle)
-            .count()
+        String::from_utf8_lossy(&logs.lock().unwrap()).matches(needle).count()
     }
 
     #[test]
@@ -474,11 +459,7 @@ mod tests {
 
         let before = log_count(&logs, dev_tokens);
         warn_on_dev_tokens(&cfg);
-        assert_eq!(
-            log_count(&logs, dev_tokens),
-            before,
-            "no dev tokens configured: no warning"
-        );
+        assert_eq!(log_count(&logs, dev_tokens), before, "no dev tokens configured: no warning");
         cfg.user_token_hash = DEFAULT_USER_TOKEN_HASH.into();
         warn_on_dev_tokens(&cfg);
         assert_eq!(log_count(&logs, dev_tokens), before + 1);
@@ -487,11 +468,7 @@ mod tests {
         let before = log_count(&logs, self_upstream);
         cfg.uri = String::new();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
-        assert_eq!(
-            log_count(&logs, self_upstream),
-            before,
-            "empty upstream must not warn"
-        );
+        assert_eq!(log_count(&logs, self_upstream), before, "empty upstream must not warn");
         // Upstream on this very address: warns.
         cfg.uri = "http://127.0.0.1:8081/sgx/certification/v4/".into();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());

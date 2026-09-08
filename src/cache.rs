@@ -161,11 +161,8 @@ impl Cache {
         if let Some(rec) = self.store.get_pckcert(qeid, cpusvn, pcesvn, pceid) {
             return Ok(rec);
         }
-        let platform = if known_platform {
-            self.store.get_platform_pool(qeid, pceid)
-        } else {
-            None
-        };
+        let platform =
+            if known_platform { self.store.get_platform_pool(qeid, pceid) } else { None };
 
         // Node `pckCertSelection`: a cached platform is treated as cached
         // collateral — select the best cert for this new raw TCB locally.
@@ -187,10 +184,8 @@ impl Cache {
                 if version == 3 {
                     return Err(error::PCS_V3_REACHED_EOL);
                 }
-                let manifest = platform
-                    .as_ref()
-                    .map(|p| p.platform_manifest.clone())
-                    .unwrap_or_default();
+                let manifest =
+                    platform.as_ref().map(|p| p.platform_manifest.clone()).unwrap_or_default();
                 self.note(
                     &key,
                     self.fill_pckcert(
@@ -223,10 +218,7 @@ impl Cache {
         let tcb = self
             .store
             .get_tcb(0, &pool.fmspc, self.pcs_version, UpdateType::Early)
-            .or_else(|| {
-                self.store
-                    .get_tcb(0, &pool.fmspc, self.pcs_version, UpdateType::Standard)
-            })
+            .or_else(|| self.store.get_tcb(0, &pool.fmspc, self.pcs_version, UpdateType::Standard))
             .ok_or_else(|| {
                 tracing::error!("No TCB info for the fmspc : {}", pool.fmspc);
                 error::NO_CACHE_DATA
@@ -257,8 +249,7 @@ impl Cache {
             platform_manifest: pool.platform_manifest.clone(),
         };
         self.store.put_pckcert(&rec)?;
-        self.store
-            .upsert_raw_tcb(&rec.qeid, &rec.pceid, &rec.cpusvn, &rec.pcesvn, &rec.tcbm)?;
+        self.store.upsert_raw_tcb(&rec.qeid, &rec.pceid, &rec.cpusvn, &rec.pcesvn, &rec.tcbm)?;
         Ok(rec)
     }
 
@@ -283,14 +274,10 @@ impl Cache {
 
         // A PCCS upstream without a platform manifest serves a single cert.
         if !self.is_intel && platform_manifest.is_empty() {
-            let rec = self
-                .pcs
-                .fetch_pckcert_pccs(qeid, cpusvn, pcesvn, pceid, Some(enc_ppid))
-                .await?;
-            if !Self::cacheable(
-                crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
-                &rec.issuer_chain,
-            ) {
+            let rec =
+                self.pcs.fetch_pckcert_pccs(qeid, cpusvn, pcesvn, pceid, Some(enc_ppid)).await?;
+            if !Self::cacheable(crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN, &rec.issuer_chain)
+            {
                 return Ok(rec);
             }
             // Keep the single cert in the pool as well, so `has_platform` is a
@@ -303,10 +290,7 @@ impl Cache {
                 fmspc: rec.fmspc.clone(),
                 ca: rec.ca.to_ascii_uppercase(),
                 issuer_chain: rec.issuer_chain.clone(),
-                certs: vec![PlatformCert {
-                    tcbm: rec.tcbm.clone(),
-                    cert: rec.cert.clone(),
-                }],
+                certs: vec![PlatformCert { tcbm: rec.tcbm.clone(), cert: rec.cert.clone() }],
                 raw_tcbs: Vec::new(),
             };
             self.store.put_platform_pool(&pool)?;
@@ -324,21 +308,15 @@ impl Cache {
         let resp = if platform_manifest.is_empty() {
             self.pcs.fetch_pckcerts_intel(enc_ppid, pceid).await?
         } else {
-            self.pcs
-                .fetch_pckcerts_intel_manifest(platform_manifest, pceid)
-                .await?
+            self.pcs.fetch_pckcerts_intel_manifest(platform_manifest, pceid).await?
         };
-        self.store_pckcerts(qeid, pceid, enc_ppid, platform_manifest, &resp)
-            .await?;
+        self.store_pckcerts(qeid, pceid, enc_ppid, platform_manifest, &resp).await?;
 
         if cpusvn.is_empty() || pcesvn.is_empty() {
             // Node returns `{}` when no raw TCB was supplied.
             return Err(error::NO_CACHE_DATA);
         }
-        let pool = self
-            .store
-            .get_platform_pool(qeid, pceid)
-            .ok_or(error::NO_CACHE_DATA)?;
+        let pool = self.store.get_platform_pool(qeid, pceid).ok_or(error::NO_CACHE_DATA)?;
         let rec = self.select_from_pool(&pool, cpusvn, pcesvn, pceid)?;
         // Node `needUpdatePlatformTcbs`: LAZY does not record the raw TCB when
         // some levels came back "Not available" — a later refresh must redo it.
@@ -363,10 +341,7 @@ impl Cache {
             tracing::error!("No valid PCK certificates in the response.");
             return Err(error::NO_CACHE_DATA);
         }
-        if !Self::cacheable(
-            crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
-            &resp.issuer_chain,
-        ) {
+        if !Self::cacheable(crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN, &resp.issuer_chain) {
             return Err(error::PCS_ACCESS_FAILURE);
         }
         // Node `fetchTcbInfo`: SGX standard is mandatory.
@@ -383,10 +358,7 @@ impl Cache {
             certs: resp
                 .certs
                 .iter()
-                .map(|(tcbm, cert)| PlatformCert {
-                    tcbm: tcbm.clone(),
-                    cert: cert.clone(),
-                })
+                .map(|(tcbm, cert)| PlatformCert { tcbm: tcbm.clone(), cert: cert.clone() })
                 .collect(),
             // Filled in by `replace_platform_certs` from the existing record;
             // the pool must never be written with these dropped.
@@ -459,11 +431,7 @@ impl Cache {
         }
         let mut sgx_standard = false;
         for (prod, update) in wanted {
-            match self
-                .pcs
-                .fetch_tcb(prod, fmspc, self.pcs_version, update)
-                .await
-            {
+            match self.pcs.fetch_tcb(prod, fmspc, self.pcs_version, update).await {
                 Ok(rec) => {
                     if prod == 0 && update == UpdateType::Standard {
                         sgx_standard = true;
@@ -514,16 +482,9 @@ impl Cache {
             return Ok(rec);
         }
         self.store.record_upstream();
-        let rec = self
-            .note(
-                &key,
-                self.pcs.fetch_tcb(prod_type, fmspc, version, update).await,
-            )
-            .await?;
-        if Self::cacheable(
-            crate::headers::tcb_issuer_chain_name(version),
-            &rec.issuer_chain,
-        ) {
+        let rec =
+            self.note(&key, self.pcs.fetch_tcb(prod_type, fmspc, version, update).await).await?;
+        if Self::cacheable(crate::headers::tcb_issuer_chain_name(version), &rec.issuer_chain) {
             self.store.put_tcb(&rec)?;
         }
         Ok(rec)
@@ -555,16 +516,9 @@ impl Cache {
             return Ok(rec);
         }
         self.store.record_upstream();
-        let rec = self
-            .note(
-                &key,
-                self.pcs.fetch_identity(enclave_id, version, update).await,
-            )
-            .await?;
-        if Self::cacheable(
-            crate::headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
-            &rec.issuer_chain,
-        ) {
+        let rec =
+            self.note(&key, self.pcs.fetch_identity(enclave_id, version, update).await).await?;
+        if Self::cacheable(crate::headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN, &rec.issuer_chain) {
             self.store.put_identity(&rec)?;
         }
         Ok(rec)
@@ -657,10 +611,7 @@ impl Cache {
         if p.platform_manifest.is_empty() {
             // Node: a cached manifest counts as a match when the request omits it.
             p.platform_manifest = platform.platform_manifest.clone();
-            return self
-                .store
-                .get_pckcert(&p.qe_id, &p.cpu_svn, &p.pce_svn, &p.pce_id)
-                .is_some();
+            return self.store.get_pckcert(&p.qe_id, &p.cpu_svn, &p.pce_svn, &p.pce_id).is_some();
         }
         platform.platform_manifest == p.platform_manifest
     }
@@ -675,19 +626,14 @@ impl Cache {
         match self.mode {
             CacheMode::Offline => {
                 if !cached {
-                    self.store.register_platform(RegisteredPlatform {
-                        state: PLATF_REG_NEW,
-                        ..p
-                    })?;
+                    self.store
+                        .register_platform(RegisteredPlatform { state: PLATF_REG_NEW, ..p })?;
                 }
                 Ok(())
             }
             CacheMode::Req => {
                 if !cached {
-                    let queued = RegisteredPlatform {
-                        state: PLATF_REG_NEW,
-                        ..p.clone()
-                    };
+                    let queued = RegisteredPlatform { state: PLATF_REG_NEW, ..p.clone() };
                     self.store.register_platform(queued.clone())?;
                     // Node propagates a fill failure and leaves the NEW row in
                     // the queue; the POST must not answer 200.
@@ -803,10 +749,7 @@ impl Cache {
                 tracing::error!("Failed to refresh PCK CRL for {}: {e}", rec.ca);
                 error::SERVICE_UNAVAILABLE
             })?;
-            if Self::cacheable(
-                crate::headers::SGX_PCK_CRL_ISSUER_CHAIN,
-                &fresh.issuer_chain,
-            ) {
+            if Self::cacheable(crate::headers::SGX_PCK_CRL_ISSUER_CHAIN, &fresh.issuer_chain) {
                 self.store.put_pckcrl(&fresh)?;
             }
         }
@@ -821,14 +764,13 @@ impl Cache {
             } else {
                 UpdateType::Standard
             };
-            let fresh = self
-                .pcs
-                .fetch_tcb(rec.prod_type, &rec.fmspc, rec.version, upd)
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to get tcbinfo for fmspc:{} ({e})", rec.fmspc);
-                    error::SERVICE_UNAVAILABLE
-                })?;
+            let fresh =
+                self.pcs.fetch_tcb(rec.prod_type, &rec.fmspc, rec.version, upd).await.map_err(
+                    |e| {
+                        tracing::error!("Failed to get tcbinfo for fmspc:{} ({e})", rec.fmspc);
+                        error::SERVICE_UNAVAILABLE
+                    },
+                )?;
             if Self::cacheable(
                 crate::headers::tcb_issuer_chain_name(rec.version),
                 &fresh.issuer_chain,
@@ -847,11 +789,7 @@ impl Cache {
             } else {
                 UpdateType::Standard
             };
-            match self
-                .pcs
-                .fetch_identity(rec.enclave_id, rec.version, upd)
-                .await
-            {
+            match self.pcs.fetch_identity(rec.enclave_id, rec.version, upd).await {
                 Ok(fresh) => {
                     if Self::cacheable(
                         crate::headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
@@ -905,13 +843,9 @@ impl Cache {
                 continue;
             }
             let resp = if !pool.platform_manifest.is_empty() {
-                self.pcs
-                    .fetch_pckcerts_intel_manifest(&pool.platform_manifest, &pool.pce_id)
-                    .await
+                self.pcs.fetch_pckcerts_intel_manifest(&pool.platform_manifest, &pool.pce_id).await
             } else if self.is_intel {
-                self.pcs
-                    .fetch_pckcerts_intel(&pool.enc_ppid, &pool.pce_id)
-                    .await
+                self.pcs.fetch_pckcerts_intel(&pool.enc_ppid, &pool.pce_id).await
             } else {
                 // A PCCS upstream has no cert-pool endpoint; re-fetch the
                 // selected cert for every known raw TCB instead.
@@ -955,9 +889,7 @@ impl Cache {
         F: FnOnce(&Cache) -> T + Send + 'static,
     {
         let me = self.clone();
-        tokio::task::spawn_blocking(move || f(&me))
-            .await
-            .map_err(|_| error::INTERNAL_ERROR)
+        tokio::task::spawn_blocking(move || f(&me)).await.map_err(|_| error::INTERNAL_ERROR)
     }
 }
 
@@ -1229,16 +1161,10 @@ mod tests {
         let base = spawn_pccs(calls.clone()).await;
         let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
 
-        cache
-            .register_platform(platform("QE1"), UpdateType::All)
-            .await
-            .unwrap();
+        cache.register_platform(platform("QE1"), UpdateType::All).await.unwrap();
 
         // The cert itself, plus one pool so later raw TCBs select locally.
-        let rec = cache
-            .store
-            .get_pckcert("QE1", &"AB".repeat(16), "00FF", "0001")
-            .unwrap();
+        let rec = cache.store.get_pckcert("QE1", &"AB".repeat(16), "00FF", "0001").unwrap();
         assert_eq!(rec.ca, "PROCESSOR");
         assert!(cache.store.has_platform("QE1", "0001"));
         let pool = cache.store.get_platform_pool("QE1", "0001").unwrap();
@@ -1259,10 +1185,7 @@ mod tests {
         // upstream calls at all. (The mock's counter, not `upstream_fetches`
         // — the direct QV-collateral fetches bypass that metric.)
         let before = calls.load(Ordering::Relaxed);
-        cache
-            .register_platform(platform("QE1"), UpdateType::Standard)
-            .await
-            .unwrap();
+        cache.register_platform(platform("QE1"), UpdateType::Standard).await.unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), before);
     }
 
@@ -1276,10 +1199,7 @@ mod tests {
         let base = spawn(app).await;
         let (_dir, cache) = cache_with(&base, CacheMode::Req);
 
-        let err = cache
-            .register_platform(platform("QE2"), UpdateType::Standard)
-            .await
-            .unwrap_err();
+        let err = cache.register_platform(platform("QE2"), UpdateType::Standard).await.unwrap_err();
         assert_err(&err, &error::NO_CACHE_DATA);
         // Node leaves the NEW row in the queue when the fill fails.
         let queued = cache.store.take_registered(0).unwrap();
@@ -1292,10 +1212,8 @@ mod tests {
         let calls = Arc::new(AtomicU64::new(0));
         let base = spawn_pccs(calls.clone()).await;
         let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
-        let err = cache
-            .get_pckcert("QE9", &"AB".repeat(16), "00FF", "0001", None, 4)
-            .await
-            .unwrap_err();
+        let err =
+            cache.get_pckcert("QE9", &"AB".repeat(16), "00FF", "0001", None, 4).await.unwrap_err();
         assert_err(&err, &error::INVALID_REQ);
         assert_eq!(calls.load(Ordering::Relaxed), 0, "rejected before upstream");
     }
@@ -1333,16 +1251,9 @@ mod tests {
 
         let rec = cache.get_pckcrl("PROCESSOR", 4).await.unwrap();
         assert_eq!(rec.pckcrl, vec![0x30]);
-        assert!(
-            cache.store.get_pckcrl("PROCESSOR").is_none(),
-            "chain-less CRL is not cached"
-        );
+        assert!(cache.store.get_pckcrl("PROCESSOR").is_none(), "chain-less CRL is not cached");
         cache.get_pckcrl("PROCESSOR", 4).await.unwrap();
-        assert_eq!(
-            calls.load(Ordering::Relaxed),
-            2,
-            "every request retries upstream"
-        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "every request retries upstream");
     }
 
     #[tokio::test]
@@ -1356,11 +1267,7 @@ mod tests {
         let der = cache.get_rootcacrl(4).await.unwrap();
         assert_eq!(der, vec![0x30, 0x82]);
         cache.get_rootcacrl(4).await.unwrap();
-        assert_eq!(
-            calls.load(Ordering::Relaxed),
-            crl_calls + 1,
-            "second GET is a store hit"
-        );
+        assert_eq!(calls.load(Ordering::Relaxed), crl_calls + 1, "second GET is a store hit");
 
         // A v3 *miss* is EOL, never a network call (a cached record is still
         // served — the store hit above comes first, as in Node).
@@ -1427,31 +1334,18 @@ mod tests {
 
         let first = tokio::spawn({
             let cache = cache.clone();
-            async move {
-                cache
-                    .get_tcb(0, "00A067110000", 4, UpdateType::Standard)
-                    .await
-            }
+            async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
         });
         // The first request has taken the key lock and reached the upstream.
         received.notified().await;
         let second = tokio::spawn({
             let cache = cache.clone();
-            async move {
-                cache
-                    .get_tcb(0, "00A067110000", 4, UpdateType::Standard)
-                    .await
-            }
+            async move { cache.get_tcb(0, "00A067110000", 4, UpdateType::Standard).await }
         });
         // Wait until the second request is deterministically queued on the
         // key lock: the first request holds the lock Arc plus its guard, so a
         // third strong reference is the second request inside `key_lock`.
-        let key = keys::tcb(
-            keys::prod_name(0),
-            4,
-            "00A067110000",
-            UpdateType::Standard.as_str(),
-        );
+        let key = keys::tcb(keys::prod_name(0), 4, "00A067110000", UpdateType::Standard.as_str());
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let strong = {
@@ -1507,21 +1401,11 @@ mod tests {
         cache.store.put_platform_pool(&pool).unwrap();
 
         let before = calls.load(Ordering::Relaxed);
-        cache
-            .refresh(Some("certs"), Some("00a067110000"))
-            .await
-            .unwrap();
-        assert_eq!(
-            calls.load(Ordering::Relaxed),
-            before + 2,
-            "one re-fetch per raw TCB"
-        );
+        cache.refresh(Some("certs"), Some("00a067110000")).await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), before + 2, "one re-fetch per raw TCB");
 
         // A non-matching fmspc is skipped entirely.
-        cache
-            .refresh(Some("certs"), Some("FFFFFFFFFFFF"))
-            .await
-            .unwrap();
+        cache.refresh(Some("certs"), Some("FFFFFFFFFFFF")).await.unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), before + 2);
     }
 
@@ -1564,10 +1448,7 @@ mod tests {
     async fn refresh_without_upstream_is_a_noop() {
         let (_dir, cache) = cache_with("", CacheMode::Lazy);
         cache.refresh(None, None).await.unwrap();
-        cache
-            .refresh(Some("certs"), Some("00A067110000"))
-            .await
-            .unwrap();
+        cache.refresh(Some("certs"), Some("00A067110000")).await.unwrap();
     }
 
     #[tokio::test]
@@ -1591,9 +1472,7 @@ mod tests {
             ca: "PROCESSOR".into(),
             issuer_chain: "chain".into(),
         };
-        cache
-            .process_not_available("QE4", "0001", "PP", "", &resp)
-            .unwrap();
+        cache.process_not_available("QE4", "0001", "PP", "", &resp).unwrap();
         let queued = cache.store.take_registered(1).unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].qe_id, "QE4");
@@ -1603,9 +1482,7 @@ mod tests {
 
         // LAZY / OFFLINE never queue these rows.
         let (_dir, cache) = cache_with("", CacheMode::Lazy);
-        cache
-            .process_not_available("QE4", "0001", "PP", "", &resp)
-            .unwrap();
+        cache.process_not_available("QE4", "0001", "PP", "", &resp).unwrap();
         assert!(cache.store.take_registered(1).unwrap().is_empty());
     }
 
@@ -1628,9 +1505,8 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
 ";
 
     fn pck_tcb_info() -> serde_json::Value {
-        let comps: Vec<serde_json::Value> = (0..16)
-            .map(|_| serde_json::json!({ "svn": 0x22 }))
-            .collect();
+        let comps: Vec<serde_json::Value> =
+            (0..16).map(|_| serde_json::json!({ "svn": 0x22 })).collect();
         serde_json::json!({
             "id": "SGX", "fmspc": "1234567890AB", "pceId": "4444", "tcbType": 0,
             "tcbLevels": [{
@@ -1646,10 +1522,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
     async fn spawn_intel_pckcerts_mock(not_available: bool) -> String {
         use axum::routing::{get, post};
         let cert = PCK_PEM.replace('\n', "%0A").replace('-', "%2D");
-        let mut entries = format!(
-            "{{\"tcbm\":\"{}3333\",\"cert\":\"{cert}\"}}",
-            "22".repeat(16)
-        );
+        let mut entries = format!("{{\"tcbm\":\"{}3333\",\"cert\":\"{cert}\"}}", "22".repeat(16));
         if not_available {
             entries.push_str(
                 ", {\"tcbm\":\"00\",\"cert\":\"Not%20available\",\"tcb\":{\"pcesvn\":1}}",
@@ -1713,10 +1586,8 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             })
             .unwrap();
 
-        let rec = cache
-            .get_pckcert("QEM", &"22".repeat(16), "3333", "4444", None, 4)
-            .await
-            .unwrap();
+        let rec =
+            cache.get_pckcert("QEM", &"22".repeat(16), "3333", "4444", None, 4).await.unwrap();
         assert_eq!(rec.cert, PCK_PEM);
         assert_eq!(rec.fmspc, "1234567890AB");
         assert_eq!(rec.ca, "PLATFORM");
@@ -1726,10 +1597,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
         assert_eq!(pool.certs.len(), 1);
         assert_eq!(pool.raw_tcbs.len(), 1);
         // The SGX standard TCB info was fetched as part of the fill.
-        assert!(cache
-            .store
-            .get_tcb(0, "1234567890AB", 4, UpdateType::Standard)
-            .is_some());
+        assert!(cache.store.get_tcb(0, "1234567890AB", 4, UpdateType::Standard).is_some());
     }
 
     #[tokio::test]
@@ -1745,10 +1613,8 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
                 ..Default::default()
             })
             .unwrap();
-        let rec = cache
-            .get_pckcert("QEN", &"22".repeat(16), "3333", "4444", None, 4)
-            .await
-            .unwrap();
+        let rec =
+            cache.get_pckcert("QEN", &"22".repeat(16), "3333", "4444", None, 4).await.unwrap();
         assert_eq!(rec.cert, PCK_PEM);
         let pool = cache.store.get_platform_pool("QEN", "4444").unwrap();
         assert!(
@@ -1762,15 +1628,9 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
         let calls = Arc::new(AtomicU64::new(0));
         let base = spawn_pccs(calls.clone()).await;
         let (_dir, cache) = cache_with(&base, CacheMode::Req);
-        cache
-            .register_platform(platform("QER"), UpdateType::Standard)
-            .await
-            .unwrap();
+        cache.register_platform(platform("QER"), UpdateType::Standard).await.unwrap();
         // Filled, and the registration row is gone (Node PLATF_REG_DELETED).
-        assert!(cache
-            .store
-            .get_pckcert("QER", &"AB".repeat(16), "00FF", "0001")
-            .is_some());
+        assert!(cache.store.get_pckcert("QER", &"AB".repeat(16), "00FF", "0001").is_some());
         assert!(cache.store.take_registered(0).unwrap().is_empty());
     }
 
@@ -1791,10 +1651,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             ca: "PROCESSOR".into(),
             issuer_chain: "pck-chain".into(),
         };
-        let err = cache
-            .store_pckcerts("QET", "0001", "PP", "", &resp)
-            .await
-            .unwrap_err();
+        let err = cache.store_pckcerts("QET", "0001", "PP", "", &resp).await.unwrap_err();
         assert_err(&err, &error::NO_CACHE_DATA);
         assert!(cache.store.get_platform_pool("QET", "0001").is_none());
     }
@@ -1829,26 +1686,17 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             .unwrap();
         cache.store.put_rootcacrl(&[1]).unwrap();
         // Not an Intel CRL URI: skipped, never fetched.
-        cache
-            .store
-            .put_crl("https://evil.test/x.crl", &[2])
-            .unwrap();
+        cache.store.put_crl("https://evil.test/x.crl", &[2]).unwrap();
 
         cache.refresh(None, None).await.unwrap();
         assert_eq!(cache.store.get_rootcacrl().unwrap(), vec![0x0A]);
-        assert_eq!(
-            cache.store.get_crl("https://evil.test/x.crl").unwrap(),
-            vec![2]
-        );
+        assert_eq!(cache.store.get_crl("https://evil.test/x.crl").unwrap(), vec![2]);
     }
 
     #[tokio::test]
     async fn v3_and_non_lazy_short_circuits() {
         let (_dir, cache) = cache_with("", CacheMode::Req);
-        let err = cache
-            .get_identity(1, 4, UpdateType::Standard)
-            .await
-            .unwrap_err();
+        let err = cache.get_identity(1, 4, UpdateType::Standard).await.unwrap_err();
         assert_err(&err, &error::NO_CACHE_DATA);
         let err = cache.get_pckcrl("PROCESSOR", 4).await.unwrap_err();
         assert_err(&err, &error::NO_CACHE_DATA);
@@ -1856,10 +1704,7 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
         assert_err(&err, &error::NO_CACHE_DATA);
 
         let (_dir, cache) = cache_with("", CacheMode::Lazy);
-        let err = cache
-            .get_identity(1, 3, UpdateType::Standard)
-            .await
-            .unwrap_err();
+        let err = cache.get_identity(1, 3, UpdateType::Standard).await.unwrap_err();
         assert_err(&err, &error::PCS_V3_REACHED_EOL);
         let err = cache.get_pckcrl("PROCESSOR", 3).await.unwrap_err();
         assert_err(&err, &error::PCS_V3_REACHED_EOL);
@@ -1890,18 +1735,12 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             ca: "PROCESSOR".into(),
             issuer_chain: "pck-chain".into(),
         };
-        cache
-            .store_pckcerts("QE5", "0001", "PP", "", &resp)
-            .await
-            .unwrap();
+        cache.store_pckcerts("QE5", "0001", "PP", "", &resp).await.unwrap();
         let pool = cache.store.get_platform_pool("QE5", "0001").unwrap();
         assert_eq!(pool.certs.len(), 1);
         assert_eq!(pool.issuer_chain, "pck-chain");
         // SGX standard TCB info is mandatory and was stored.
-        assert!(cache
-            .store
-            .get_tcb(0, "00A067110000", 4, UpdateType::Standard)
-            .is_some());
+        assert!(cache.store.get_tcb(0, "00A067110000", 4, UpdateType::Standard).is_some());
 
         // No certs at all is an error.
         let empty = PckCertsResponse {
@@ -1911,19 +1750,10 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             ca: "PROCESSOR".into(),
             issuer_chain: "pck-chain".into(),
         };
-        assert!(cache
-            .store_pckcerts("QE5", "0001", "PP", "", &empty)
-            .await
-            .is_err());
+        assert!(cache.store_pckcerts("QE5", "0001", "PP", "", &empty).await.is_err());
 
         // A chain-less response is not persisted.
-        let chainless = PckCertsResponse {
-            issuer_chain: String::new(),
-            ..resp.clone()
-        };
-        assert!(cache
-            .store_pckcerts("QE6", "0001", "PP", "", &chainless)
-            .await
-            .is_err());
+        let chainless = PckCertsResponse { issuer_chain: String::new(), ..resp.clone() };
+        assert!(cache.store_pckcerts("QE6", "0001", "PP", "", &chainless).await.is_err());
     }
 }

@@ -41,11 +41,7 @@ impl Tcb {
             );
         }
         components[16] = pcesvn;
-        Ok(Self {
-            cpusvn: cpusvn.to_ascii_uppercase(),
-            pcesvn,
-            components,
-        })
+        Ok(Self { cpusvn: cpusvn.to_ascii_uppercase(), pcesvn, components })
     }
 
     /// Node `new Tcb(cpusvn, littleEndianHexStringToInteger(pcesvn))`.
@@ -85,12 +81,8 @@ pub fn little_endian_hex_to_int(le_hex: &str) -> Option<u32> {
     if !le_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let be: String = le_hex
-        .as_bytes()
-        .chunks(2)
-        .rev()
-        .map(|c| std::str::from_utf8(c).unwrap_or("00"))
-        .collect();
+    let be: String =
+        le_hex.as_bytes().chunks(2).rev().map(|c| std::str::from_utf8(c).unwrap_or("00")).collect();
     u32::from_str_radix(&be, 16).ok()
 }
 
@@ -197,9 +189,7 @@ fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
         .chars()
         .filter(|c| !c.is_ascii_whitespace())
         .collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .ok()
+    base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).ok()
 }
 
 /// Node `X509.parseCert`. Returns `Err` where Node returns `false`.
@@ -288,9 +278,7 @@ pub fn parse_pck_cert(pem: &str) -> Result<PckCertInfo, String> {
                 kids.get(1).copied()
             };
             pcesvn = field(16).and_then(|(_, b)| der_int(b));
-            cpusvn = field(17)
-                .map(|(_, b)| hex::encode_upper(b))
-                .unwrap_or_default();
+            cpusvn = field(17).map(|(_, b)| hex::encode_upper(b)).unwrap_or_default();
         }
     }
 
@@ -298,15 +286,7 @@ pub fn parse_pck_cert(pem: &str) -> Result<PckCertInfo, String> {
     if cpusvn.is_empty() || fmspc.is_empty() || pce_id.is_empty() {
         return Err("Invalid SGX extension in PCK cert".into());
     }
-    Ok(PckCertInfo {
-        version,
-        fmspc,
-        pce_id,
-        ppid,
-        cpusvn,
-        pcesvn,
-        ca,
-    })
+    Ok(PckCertInfo { version, fmspc, pce_id, ppid, cpusvn, pcesvn, ca })
 }
 
 // --------------------------------------------------------------------------
@@ -336,12 +316,7 @@ fn parse_pck_certs(certs: &[(String, String)]) -> Result<Vec<ParsedCert>, String
         .map(|(tcbm, cert)| {
             let info = parse_pck_cert(cert)?;
             let tcb = Tcb::new(&info.cpusvn, info.pcesvn)?;
-            Ok(ParsedCert {
-                tcbm: tcbm.to_ascii_uppercase(),
-                cert: cert.clone(),
-                info,
-                tcb,
-            })
+            Ok(ParsedCert { tcbm: tcbm.to_ascii_uppercase(), cert: cert.clone(), info, tcb })
         })
         .collect()
 }
@@ -350,14 +325,10 @@ fn parse_pck_certs(certs: &[(String, String)]) -> Result<Vec<ParsedCert>, String
 fn validate_input(pce_id: &str, certs: &[ParsedCert], tcb_info: &Value) -> Result<(), String> {
     let tcb_type = tcb_info.get("tcbType").and_then(|v| v.as_i64());
     if tcb_type != Some(0) {
-        return Err(format!(
-            "TCB_TYPE in TCB Info ({tcb_type:?}) is different than 0"
-        ));
+        return Err(format!("TCB_TYPE in TCB Info ({tcb_type:?}) is different than 0"));
     }
-    let info_pceid = tcb_info
-        .get("pceId")
-        .and_then(|v| v.as_str())
-        .ok_or("PCEID missing in TCB Info")?;
+    let info_pceid =
+        tcb_info.get("pceId").and_then(|v| v.as_str()).ok_or("PCEID missing in TCB Info")?;
     if !info_pceid.eq_ignore_ascii_case(pce_id) {
         return Err(format!(
             "PCEID in TCB Info ({info_pceid}) is different than platform PCEID ({pce_id})"
@@ -369,13 +340,11 @@ fn validate_input(pce_id: &str, certs: &[ParsedCert], tcb_info: &Value) -> Resul
         .filter(|a| !a.is_empty())
         .ok_or("Empty TCB Levels in in TCB Info")?;
     for (index, level) in levels.iter().enumerate() {
-        let tcb = level.get("tcb").ok_or(format!(
-            "Invalid TCB levels: Level {index} missing sgxtcbcomponents"
-        ))?;
+        let tcb = level
+            .get("tcb")
+            .ok_or(format!("Invalid TCB levels: Level {index} missing sgxtcbcomponents"))?;
         if level_cpusvn(tcb).is_none() {
-            return Err(format!(
-                "Invalid TCB levels: Level {index} missing sgxtcbcomponents"
-            ));
+            return Err(format!("Invalid TCB levels: Level {index} missing sgxtcbcomponents"));
         }
         match tcb.get("pcesvn").and_then(|v| v.as_u64()) {
             Some(_) => {}
@@ -441,9 +410,7 @@ fn level_cpusvn(tcb: &Value) -> Option<String> {
     }
     let mut out = String::with_capacity(32);
     for i in 1..=16 {
-        let svn = tcb
-            .get(format!("sgxtcbcomp{i:02}svn"))
-            .and_then(|v| v.as_u64())?;
+        let svn = tcb.get(format!("sgxtcbcomp{i:02}svn")).and_then(|v| v.as_u64())?;
         if svn > 255 {
             return None;
         }
@@ -462,16 +429,10 @@ fn create_buckets(tcb_info: &Value) -> Result<Vec<Bucket>, String> {
     for level in levels {
         let tcb = level.get("tcb").ok_or("Invalid TCB levels")?;
         let cpusvn = level_cpusvn(tcb).ok_or("Invalid TCB levels")?;
-        let pcesvn = u32::try_from(
-            tcb.get("pcesvn")
-                .and_then(|v| v.as_u64())
-                .ok_or("Invalid TCB levels")?,
-        )
-        .map_err(|_| "Invalid TCB levels")?;
-        buckets.push(Bucket {
-            tcb: Some(Tcb::new(&cpusvn, pcesvn)?),
-            certs: Vec::new(),
-        });
+        let pcesvn =
+            u32::try_from(tcb.get("pcesvn").and_then(|v| v.as_u64()).ok_or("Invalid TCB levels")?)
+                .map_err(|_| "Invalid TCB levels")?;
+        buckets.push(Bucket { tcb: Some(Tcb::new(&cpusvn, pcesvn)?), certs: Vec::new() });
     }
     // Node sorts with `(x, y) => y.tcb.compare(x.tcb)` (descending), treating
     // non-comparable pairs as 0.
@@ -597,10 +558,7 @@ pub fn select_best_pck_cert(
             not_matching.push(i);
         }
     }
-    buckets.push(Bucket {
-        tcb: None,
-        certs: not_matching,
-    });
+    buckets.push(Bucket { tcb: None, certs: not_matching });
 
     let raw = Tcb::from_hex(raw_cpusvn, raw_pcesvn)?;
     // Node `selectBestPckCertFromTcbBuckets`.
@@ -736,29 +694,17 @@ mod tests {
         let lower_cpusvn_higher_pcesvn = Tcb::new("00011111000000000000000000000000", 11).unwrap();
         let mixed_cpusvn = Tcb::new("02020100000000000000000000000000", 10).unwrap();
 
-        assert_eq!(
-            base.compare(&higher_cpusvn_lower_pcesvn),
-            Err(TcbNonComparable)
-        );
-        assert_eq!(
-            base.compare(&lower_cpusvn_higher_pcesvn),
-            Err(TcbNonComparable)
-        );
+        assert_eq!(base.compare(&higher_cpusvn_lower_pcesvn), Err(TcbNonComparable));
+        assert_eq!(base.compare(&lower_cpusvn_higher_pcesvn), Err(TcbNonComparable));
         assert_eq!(base.compare(&mixed_cpusvn), Err(TcbNonComparable));
     }
 
     #[test]
     fn compare_returns_zero_minus_one_and_one() {
         let base = Tcb::new("01011111000100000000000000000000", 9).unwrap();
-        assert_eq!(
-            base.compare(&Tcb::new("01011111000100000000000000000000", 9).unwrap()),
-            Ok(0)
-        );
+        assert_eq!(base.compare(&Tcb::new("01011111000100000000000000000000", 9).unwrap()), Ok(0));
         // parameter higher
-        assert_eq!(
-            base.compare(&Tcb::new("02011111000200000000000000000000", 9).unwrap()),
-            Ok(-1)
-        );
+        assert_eq!(base.compare(&Tcb::new("02011111000200000000000000000000", 9).unwrap()), Ok(-1));
         assert_eq!(
             base.compare(&Tcb::new("01011111000100000000000000000000", 10).unwrap()),
             Ok(-1)
@@ -768,18 +714,9 @@ mod tests {
             Ok(-1)
         );
         // parameter lower
-        assert_eq!(
-            base.compare(&Tcb::new("00010000000100000000000000000000", 9).unwrap()),
-            Ok(1)
-        );
-        assert_eq!(
-            base.compare(&Tcb::new("01011111000100000000000000000000", 8).unwrap()),
-            Ok(1)
-        );
-        assert_eq!(
-            base.compare(&Tcb::new("00010000000100000000000000000000", 8).unwrap()),
-            Ok(1)
-        );
+        assert_eq!(base.compare(&Tcb::new("00010000000100000000000000000000", 9).unwrap()), Ok(1));
+        assert_eq!(base.compare(&Tcb::new("01011111000100000000000000000000", 8).unwrap()), Ok(1));
+        assert_eq!(base.compare(&Tcb::new("00010000000100000000000000000000", 8).unwrap()), Ok(1));
     }
 
     /// PCESVN is a full integer, not a byte: 256 must beat 255.
@@ -930,10 +867,7 @@ mod tests {
             ("02020202020202020202020202020202", 2),
         ]);
         let buckets = create_buckets(&info).unwrap();
-        let svns: Vec<u32> = buckets
-            .iter()
-            .map(|b| b.tcb.as_ref().unwrap().pcesvn)
-            .collect();
+        let svns: Vec<u32> = buckets.iter().map(|b| b.tcb.as_ref().unwrap().pcesvn).collect();
         assert_eq!(svns, vec![3, 2, 1]);
     }
 
@@ -1038,9 +972,6 @@ mod tests {
         }
         tcb.insert("pcesvn".into(), serde_json::json!(7));
         let v = Value::Object(tcb);
-        assert_eq!(
-            level_cpusvn(&v).as_deref(),
-            Some("0102030405060708090A0B0C0D0E0F10")
-        );
+        assert_eq!(level_cpusvn(&v).as_deref(), Some("0102030405060708090A0B0C0D0E0F10"));
     }
 }

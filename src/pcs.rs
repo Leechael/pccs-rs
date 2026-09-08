@@ -43,11 +43,8 @@ pub const INTEL_ROOT_CA_CRL_URL: &str =
 const EARLY_ACCESS_PREFIX: &str = "https://validation.api.trustedservices.intel.com/";
 
 /// Everything outside the RFC 3986 unreserved set is escaped.
-const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'~');
+const QUERY_VALUE: &AsciiSet =
+    &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
 fn q(value: &str) -> String {
     utf8_percent_encode(value, QUERY_VALUE).to_string()
@@ -107,7 +104,7 @@ impl PcsClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         if !cfg.proxy.trim().is_empty() {
             return Err(
-                "proxy is not supported by pccs-rs; remove it from the configuration".to_string(),
+                "proxy is not supported by pccs-rs; remove it from the configuration".to_string()
             );
         }
         let mut http_conn = HttpConnector::new();
@@ -208,9 +205,8 @@ impl PcsClient {
         let mut delay: Option<Duration> = None;
         for attempt in 0..self.max_attempts {
             if attempt > 0 {
-                let backoff = delay
-                    .take()
-                    .unwrap_or(Duration::from_millis(50u64 << attempt.min(5)));
+                let backoff =
+                    delay.take().unwrap_or(Duration::from_millis(50u64 << attempt.min(5)));
                 tokio::time::sleep(backoff).await;
             }
             let uri: Uri = url.parse().map_err(|_| error::INTERNAL_ERROR)?;
@@ -221,9 +217,8 @@ impl PcsClient {
                 }
                 None => Request::get(uri),
             };
-            let mut req = builder
-                .body(Full::new(Bytes::from(payload)))
-                .map_err(|_| error::INTERNAL_ERROR)?;
+            let mut req =
+                builder.body(Full::new(Bytes::from(payload))).map_err(|_| error::INTERNAL_ERROR)?;
             if send_key {
                 if let (Ok(n), Ok(v)) = (
                     HeaderName::from_bytes(b"Ocp-Apim-Subscription-Key"),
@@ -356,12 +351,8 @@ impl PcsClient {
             tracing::error!("Encrypted ppid is all zeros.");
             return Err(error::NO_CACHE_DATA);
         }
-        let url = format!(
-            "{}pckcerts?encrypted_ppid={}&pceid={}",
-            self.base,
-            q(enc_ppid),
-            q(pceid)
-        );
+        let url =
+            format!("{}pckcerts?encrypted_ppid={}&pceid={}", self.base, q(enc_ppid), q(pceid));
         let (status, h, body) = self.get(&url).await?;
         Self::parse_pckcerts(status, &h, &body)
     }
@@ -405,11 +396,7 @@ impl PcsClient {
         let mut certs = Vec::new();
         let mut not_available = Vec::new();
         for c in arr {
-            let tcbm = c
-                .get("tcbm")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_ascii_uppercase();
+            let tcbm = c.get("tcbm").and_then(|x| x.as_str()).unwrap_or("").to_ascii_uppercase();
             let cert = crate::validate::percent_decode(
                 c.get("cert").and_then(|x| x.as_str()).unwrap_or(""),
             );
@@ -514,11 +501,7 @@ impl PcsClient {
     }
 
     pub async fn fetch_pckcrl(&self, ca: &str) -> Result<PckCrlRecord, PccsError> {
-        let url = format!(
-            "{}pckcrl?ca={}&encoding=der",
-            self.base,
-            q(&ca.to_ascii_lowercase())
-        );
+        let url = format!("{}pckcrl?ca={}&encoding=der", self.base, q(&ca.to_ascii_lowercase()));
         let (status, h, body) = self.get(&url).await?;
         if status != 200 {
             return Err(error::NO_CACHE_DATA);
@@ -578,10 +561,7 @@ impl PcsClient {
             tracing::error!("Failed to download file for the given uri.");
             return Err(error::INTERNAL_ERROR);
         }
-        if body
-            .iter()
-            .all(|b| b.is_ascii_hexdigit() || b.is_ascii_whitespace())
-        {
+        if body.iter().all(|b| b.is_ascii_hexdigit() || b.is_ascii_whitespace()) {
             let s = String::from_utf8_lossy(&body);
             let cleaned: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
             if let Ok(bytes) = hex::decode(&cleaned) {
@@ -610,13 +590,7 @@ impl PcsClient {
 
 /// `Retry-After: <seconds>`, capped. HTTP-date form is ignored (Intel sends seconds).
 fn retry_after(h: &HeaderMap) -> Option<Duration> {
-    let secs: u64 = h
-        .get(hyper::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    let secs: u64 = h.get(hyper::header::RETRY_AFTER)?.to_str().ok()?.trim().parse().ok()?;
     Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
 }
 
@@ -770,10 +744,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("5"));
         assert_eq!(retry_after(&h), Some(Duration::from_secs(5)));
-        h.insert(
-            hyper::header::RETRY_AFTER,
-            HeaderValue::from_static("99999"),
-        );
+        h.insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("99999"));
         assert_eq!(retry_after(&h), Some(MAX_RETRY_AFTER));
         h.insert(
             hyper::header::RETRY_AFTER,
@@ -833,24 +804,15 @@ mod tests {
         assert_eq!(redact_url(&url), url, "50 chars is not redacted");
         let over = "B".repeat(51);
         let url = format!("https://x/pckcerts?encrypted_ppid={over}");
-        assert_eq!(
-            redact_url(&url),
-            "https://x/pckcerts?encrypted_ppid=BBBB...BBBB"
-        );
+        assert_eq!(redact_url(&url), "https://x/pckcerts?encrypted_ppid=BBBB...BBBB");
     }
 
     #[test]
     fn parse_pckcerts_status_and_shape_checks() {
         let mut h = HeaderMap::new();
         h.insert(headers::SGX_FMSPC, HeaderValue::from_static("00a067110000"));
-        h.insert(
-            headers::SGX_PCK_CERTIFICATE_CA_TYPE,
-            HeaderValue::from_static("processor"),
-        );
-        h.insert(
-            headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
-            HeaderValue::from_static("chain"),
-        );
+        h.insert(headers::SGX_PCK_CERTIFICATE_CA_TYPE, HeaderValue::from_static("processor"));
+        h.insert(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN, HeaderValue::from_static("chain"));
 
         // Non-200 is a cache miss.
         assert!(PcsClient::parse_pckcerts(404, &h, b"[]").is_err());
@@ -913,12 +875,7 @@ mod tests {
             let seen = seen2.clone();
             async move {
                 let method = req.method().to_string();
-                let pq = req
-                    .uri()
-                    .path_and_query()
-                    .map(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let pq = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string();
                 let key = req
                     .headers()
                     .get("Ocp-Apim-Subscription-Key")
@@ -926,10 +883,7 @@ mod tests {
                     .unwrap_or("")
                     .to_string();
                 seen.lock().unwrap().push((method, pq, key));
-                hyper::Response::builder()
-                    .status(404)
-                    .body(axum::body::Body::empty())
-                    .unwrap()
+                hyper::Response::builder().status(404).body(axum::body::Body::empty()).unwrap()
             }
         }));
         (seen, app)
@@ -942,17 +896,10 @@ mod tests {
         let client = client_for(&base);
 
         // 404 upstream → NO_CACHE_DATA.
-        assert!(client
-            .fetch_pckcert_pccs("qe", "aa", "bb", "cc", None)
-            .await
-            .is_err());
+        assert!(client.fetch_pckcert_pccs("qe", "aa", "bb", "cc", None).await.is_err());
         let req = seen.lock().unwrap()[0].clone();
         assert_eq!(req.0, "GET");
-        assert!(
-            req.1.starts_with("/sgx/certification/v4/pckcert?"),
-            "{}",
-            req.1
-        );
+        assert!(req.1.starts_with("/sgx/certification/v4/pckcert?"), "{}", req.1);
         // No enc_ppid param when None; the key is not sent on plain collateral.
         assert!(!req.1.contains("encrypted_ppid"), "{}", req.1);
         assert_eq!(req.2, "");
@@ -991,10 +938,8 @@ mod tests {
         };
         let base = spawn(app2).await;
         let client = client_for(&base);
-        let rec = client
-            .fetch_pckcert_pccs("qeid", "ab", "cd", "ef", Some("p p&id"))
-            .await
-            .unwrap();
+        let rec =
+            client.fetch_pckcert_pccs("qeid", "ab", "cd", "ef", Some("p p&id")).await.unwrap();
         assert_eq!(rec.qeid, "QEID");
         assert_eq!(rec.pceid, "EF");
         assert_eq!(rec.cpusvn, "AB");
@@ -1014,10 +959,7 @@ mod tests {
         let client = client_for("");
         assert!(!client.enabled());
         assert!(client.fetch_pckcerts_intel("", "0000").await.is_err());
-        assert!(client
-            .fetch_pckcerts_intel("00000000", "0000")
-            .await
-            .is_err());
+        assert!(client.fetch_pckcerts_intel("00000000", "0000").await.is_err());
         assert_eq!(client.call_count(), 0, "no network call may happen");
     }
 
@@ -1037,9 +979,7 @@ mod tests {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_string();
-                    seen.lock()
-                        .unwrap()
-                        .push((req.method().to_string(), String::new(), key));
+                    seen.lock().unwrap().push((req.method().to_string(), String::new(), key));
                     let mut resp = axum::response::Response::new(axum::body::Body::from("[]"));
                     let h = resp.headers_mut();
                     h.insert(headers::SGX_FMSPC, HeaderValue::from_static("00A067110000"));
@@ -1060,10 +1000,7 @@ mod tests {
 
         let resp = client.fetch_pckcerts_intel("AA", "0000").await.unwrap();
         assert!(resp.certs.is_empty());
-        let resp = client
-            .fetch_pckcerts_intel_manifest("{}", "0000")
-            .await
-            .unwrap();
+        let resp = client.fetch_pckcerts_intel_manifest("{}", "0000").await.unwrap();
         assert!(resp.certs.is_empty());
 
         let seen = seen.lock().unwrap();
@@ -1084,11 +1021,7 @@ mod tests {
             async move {
                 seen.lock().unwrap().push((
                     String::new(),
-                    req.uri()
-                        .path_and_query()
-                        .map(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+                    req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string(),
                     String::new(),
                 ));
                 let mut resp = axum::response::Response::new(axum::body::Body::from(
@@ -1099,8 +1032,7 @@ mod tests {
                 } else {
                     headers::TCB_INFO_ISSUER_CHAIN
                 };
-                resp.headers_mut()
-                    .insert(name, HeaderValue::from_static("tcb-chain"));
+                resp.headers_mut().insert(name, HeaderValue::from_static("tcb-chain"));
                 resp
             }
         };
@@ -1136,37 +1068,22 @@ mod tests {
         let client = client_for(&base);
 
         // v3 is refused before any network call.
-        assert!(client
-            .fetch_tcb(0, "00A067110000", 3, UpdateType::Standard)
-            .await
-            .is_err());
+        assert!(client.fetch_tcb(0, "00A067110000", 3, UpdateType::Standard).await.is_err());
         assert_eq!(client.call_count(), 0);
 
-        let rec = client
-            .fetch_tcb(0, "00a067110000", 4, UpdateType::Early)
-            .await
-            .unwrap();
+        let rec = client.fetch_tcb(0, "00a067110000", 4, UpdateType::Early).await.unwrap();
         assert_eq!(rec.fmspc, "00A067110000");
         assert_eq!(rec.update_type, "EARLY");
         assert_eq!(rec.issuer_chain, "tcb-chain");
         assert!(rec.raw_body.contains("SGX"));
 
         // TDX swaps /sgx/ for /tdx/ and falls back to the legacy header name.
-        let rec = client
-            .fetch_tcb(1, "00A067110000", 4, UpdateType::Standard)
-            .await
-            .unwrap();
+        let rec = client.fetch_tcb(1, "00A067110000", 4, UpdateType::Standard).await.unwrap();
         assert_eq!(rec.issuer_chain, "legacy-chain");
 
         let seen = seen.lock().unwrap();
-        assert_eq!(
-            seen[0].1,
-            "/sgx/certification/v4/tcb?fmspc=00a067110000&update=early"
-        );
-        assert_eq!(
-            seen[1].1,
-            "/tdx/certification/v4/tcb?fmspc=00A067110000&update=standard"
-        );
+        assert_eq!(seen[0].1, "/sgx/certification/v4/tcb?fmspc=00a067110000&update=early");
+        assert_eq!(seen[1].1, "/tdx/certification/v4/tcb?fmspc=00A067110000&update=standard");
     }
 
     #[tokio::test]
@@ -1178,10 +1095,7 @@ mod tests {
         );
         let base = spawn(app).await;
         let client = client_for(&base);
-        assert!(client
-            .fetch_tcb(0, "00A067110000", 4, UpdateType::Standard)
-            .await
-            .is_err());
+        assert!(client.fetch_tcb(0, "00A067110000", 4, UpdateType::Standard).await.is_err());
     }
 
     #[tokio::test]
@@ -1191,32 +1105,14 @@ mod tests {
         let client = client_for(&base);
 
         // 404s are cache misses, but the URLs are still observable.
-        assert!(client
-            .fetch_identity(1, 4, UpdateType::Standard)
-            .await
-            .is_err());
-        assert!(client
-            .fetch_identity(2, 4, UpdateType::Early)
-            .await
-            .is_err());
-        assert!(client
-            .fetch_identity(3, 4, UpdateType::Standard)
-            .await
-            .is_err());
-        assert!(client
-            .fetch_identity(1, 3, UpdateType::Standard)
-            .await
-            .is_err());
+        assert!(client.fetch_identity(1, 4, UpdateType::Standard).await.is_err());
+        assert!(client.fetch_identity(2, 4, UpdateType::Early).await.is_err());
+        assert!(client.fetch_identity(3, 4, UpdateType::Standard).await.is_err());
+        assert!(client.fetch_identity(1, 3, UpdateType::Standard).await.is_err());
         let seen = seen.lock().unwrap();
-        assert_eq!(
-            seen[0].1,
-            "/sgx/certification/v4/qe/identity?update=standard"
-        );
+        assert_eq!(seen[0].1, "/sgx/certification/v4/qe/identity?update=standard");
         assert_eq!(seen[1].1, "/sgx/certification/v4/qve/identity?update=early");
-        assert_eq!(
-            seen[2].1,
-            "/tdx/certification/v4/qe/identity?update=standard"
-        );
+        assert_eq!(seen[2].1, "/tdx/certification/v4/qe/identity?update=standard");
         assert_eq!(seen.len(), 3, "v3 never reaches the network");
     }
 
@@ -1238,10 +1134,7 @@ mod tests {
         );
         let base = spawn(app).await;
         let client = client_for(&base);
-        let rec = client
-            .fetch_identity(2, 4, UpdateType::Standard)
-            .await
-            .unwrap();
+        let rec = client.fetch_identity(2, 4, UpdateType::Standard).await.unwrap();
         assert_eq!(rec.enclave_id, 2);
         assert_eq!(rec.issuer_chain, "id-chain");
         assert!(rec.raw_body.contains("QvE"));
@@ -1320,10 +1213,7 @@ mod tests {
             .await
             .is_err());
         // v3 CRL URLs are refused before the network.
-        assert!(client
-            .fetch_crl("https://x/v3/pckcrl?ca=processor")
-            .await
-            .is_err());
+        assert!(client.fetch_crl("https://x/v3/pckcrl?ca=processor").await.is_err());
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -1347,18 +1237,10 @@ mod tests {
             }),
         );
         let base = spawn(app).await;
-        let cfg = Config {
-            uri: base,
-            upstream_max_attempts: 6,
-            ..Config::default()
-        };
+        let cfg = Config { uri: base, upstream_max_attempts: 6, ..Config::default() };
         let client = PcsClient::new(&cfg).unwrap();
         let err = client.fetch_pckcrl("processor").await.unwrap_err();
-        assert_eq!(
-            err.status,
-            StatusCode::NOT_FOUND,
-            "final 503 surfaces as a miss"
-        );
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "final 503 surfaces as a miss");
         assert_eq!(
             calls.load(Ordering::Relaxed),
             u64::from(MAX_THROTTLED_ATTEMPTS),

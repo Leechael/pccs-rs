@@ -107,9 +107,7 @@ enum AnyClient {
 
 impl AnyClient {
     async fn get(&self, uri: &str) -> Result<hyper::Response<hyper::body::Incoming>, String> {
-        let req = Request::get(uri)
-            .body(Empty::<Bytes>::new())
-            .map_err(|e| e.to_string())?;
+        let req = Request::get(uri).body(Empty::<Bytes>::new()).map_err(|e| e.to_string())?;
         match self {
             AnyClient::Http(c) => c.request(req).await.map_err(|e| e.to_string()),
             AnyClient::Https(c) => c.request(req).await.map_err(|e| e.to_string()),
@@ -215,14 +213,8 @@ async fn main() {
     let counters = Arc::new(Counters::new());
 
     if args.warmup > 0 {
-        let handles = run_workers(
-            args.clone(),
-            base.clone(),
-            https,
-            stop.clone(),
-            counters.clone(),
-        )
-        .await;
+        let handles =
+            run_workers(args.clone(), base.clone(), https, stop.clone(), counters.clone()).await;
         tokio::time::sleep(Duration::from_secs(args.warmup)).await;
         stop.store(true, Ordering::Relaxed);
         for h in handles {
@@ -363,10 +355,7 @@ mod tests {
         use axum::routing::get;
         // /tcb and /qe/identity 200; /pckcert 404 (errors are counted, not fatal).
         let app = axum::Router::new()
-            .route(
-                "/sgx/certification/v4/tcb",
-                get(|| async { axum::body::Body::from("{}") }),
-            )
+            .route("/sgx/certification/v4/tcb", get(|| async { axum::body::Body::from("{}") }))
             .route(
                 "/sgx/certification/v4/qe/identity",
                 get(|| async { axum::body::Body::from("{}") }),
@@ -377,21 +366,13 @@ mod tests {
             axum::serve(listener, app).await.ok();
         });
 
-        let args = Args {
-            url: format!("http://{addr}"),
-            concurrency: 2,
-            ..Args::parse_from(["loadgen"])
-        };
+        let args =
+            Args { url: format!("http://{addr}"), concurrency: 2, ..Args::parse_from(["loadgen"]) };
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(Counters::new());
-        let handles = run_workers(
-            args,
-            format!("http://{addr}"),
-            false,
-            stop.clone(),
-            counters.clone(),
-        )
-        .await;
+        let handles =
+            run_workers(args, format!("http://{addr}"), false, stop.clone(), counters.clone())
+                .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         stop.store(true, Ordering::Relaxed);
         for h in handles {
