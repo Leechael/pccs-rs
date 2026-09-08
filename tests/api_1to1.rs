@@ -1485,6 +1485,139 @@ async fn spawn_refresh_mock(
     (format!("http://{addr}/sgx/certification/v4/"), h)
 }
 
+/// Intel PCCS 2026-09-04 commit 4d077a7 security fix: Express allowed `//` in
+/// URLs which bypassed app-level middleware while still matching route handlers.
+/// 
+/// Axum behavior: duplicate slashes cause routes to NOT MATCH at all (404), which
+/// is inherently safe—no handler runs, so no auth bypass is possible. This test
+/// verifies that Axum's routing is NOT vulnerable to the class of bypass Intel fixed:
+/// 
+/// - Normal paths WITH auth work (200/OK or other success based on payload)
+/// - Normal paths WITHOUT auth fail with 401
+/// - Double-slash paths return 404 (route doesn't match), proving no handler bypass
+#[tokio::test]
+async fn auth_not_bypassed_by_duplicate_slashes() {
+    let router = app();
+    
+    // Protected admin routes: expected status when authed (may be 200, 400, etc.)
+    // The key test is: without auth = 401, with auth = not 401 or 404
+    let admin_test_cases = [
+        ("GET", "/sgx/certification/v4/platforms?source=reg"),
+        ("PUT", "/sgx/certification/v4/platformcollateral"),
+        ("GET", "/sgx/certification/v4/refresh"),
+        ("POST", "/sgx/certification/v4/refresh"),
+        ("PUT", "/sgx/certification/v4/appraisalpolicy"),
+    ];
+
+    for (method, path) in &admin_test_cases {
+        // Normal path WITHOUT auth: must be 401
+        let req = Request::builder()
+            .method(*method)
+            .uri(*path)
+            .header("content-type", "application/json")
+            .body(if *method == "GET" {
+                Body::empty()
+            } else {
+                Body::from("{}")
+            })
+            .unwrap();
+        let (status, _, body) = send(router.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} without token must be 401"
+        );
+        assert_eq!(body.as_ref(), b"Authentication failed.");
+
+        // Normal path WITH valid auth: must NOT be 401 or 404 (auth passed, handler ran)
+        let req = Request::builder()
+            .method(*method)
+            .uri(*path)
+            .header(headers::ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN)
+            .header("content-type", "application/json")
+            .body(if *method == "GET" {
+                Body::empty()
+            } else {
+                Body::from("{}")
+            })
+            .unwrap();
+        let (status, _, _) = send(router.clone(), req).await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED && status != StatusCode::NOT_FOUND,
+            "{method} {path} with valid token got {status}; must not be 401 (auth bypass) or 404 (route not found)"
+        );
+
+        // Double-slash variant: must be 404 (route doesn't match)
+        // This proves Axum is NOT vulnerable to the Express bypass class
+        let double_slash_path = path.replace("/v4/", "/v4//");
+        let req = Request::builder()
+            .method(*method)
+            .uri(&double_slash_path)
+            .header("content-type", "application/json")
+            .body(if *method == "GET" {
+                Body::empty()
+            } else {
+                Body::from("{}")
+            })
+            .unwrap();
+        let (status, _, _) = send(router.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {double_slash_path} must be 404 (route not matched); if 401 or 200, handler ran (bypass!)"
+        );
+
+        // Double-slash WITH auth: still 404 (route never matches, so auth never runs)
+        let req = Request::builder()
+            .method(*method)
+            .uri(&double_slash_path)
+            .header(headers::ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN)
+            .header("content-type", "application/json")
+            .body(if *method == "GET" {
+                Body::empty()
+            } else {
+                Body::from("{}")
+            })
+            .unwrap();
+        let (status, _, _) = send(router.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {double_slash_path} even with auth must be 404"
+        );
+    }
+
+    // Protected user route: POST /platforms
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sgx/certification/v4/platforms")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, _, _) = send(router.clone(), req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sgx/certification/v4/platforms")
+        .header(headers::USER_TOKEN, DEFAULT_USER_TOKEN)
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, _, _) = send(router.clone(), req).await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+
+    // Double-slash: 404
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sgx/certification/v4//platforms")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, _, _) = send(router.clone(), req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "double-slash POST must be 404");
+}
+
 /// Finding G: concurrent refreshes are serialised, and an upstream failure is
 /// reported instead of swallowed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
