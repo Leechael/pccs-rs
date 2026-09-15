@@ -29,9 +29,9 @@ RUN apt-get update \
     && mkdir -p /etc/pccs-rs
 COPY --from=builder /pccs-rs /usr/bin/pccs-rs
 COPY packaging/config.toml /etc/pccs-rs/config.toml
+# Bind-mounts of /var/lib/pccs-rs must be writable by uid 10001.
 USER 10001
 WORKDIR /var/lib/pccs-rs
-VOLUME ["/var/lib/pccs-rs"]
 EXPOSE 8081
 ENV PCCS_HOST=0.0.0.0 \
     PCCS_PORT=8081 \
