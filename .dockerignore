@@ -1,0 +1,11 @@
+.git
+.github
+target
+compare
+docs
+tests
+scripts
+fixtures
+*.md
+prek.toml
+rustfmt.toml
