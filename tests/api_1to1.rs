@@ -775,14 +775,40 @@ async fn nvidia_nras_proxies_json_and_is_not_cached() {
 
 #[tokio::test]
 async fn nvidia_nras_options_preflight_is_cors() {
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/nvidia/nras/attest/gpu")
+            .header(headers::REQUEST_ID, "client-supplied-id")
+            .body(Body::empty())
+            .unwrap();
+        let (status, h, _) = send(app(), req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_nras_cors(&h);
+        let id = h
+            .get(headers::REQUEST_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(id, "client-supplied-id");
+        assert!(!id.is_empty());
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1], "each preflight gets a fresh Request-ID");
+}
+
+#[tokio::test]
+async fn nvidia_nras_prefix_does_not_match_nras_extra() {
     let req = Request::builder()
         .method("OPTIONS")
-        .uri("/nvidia/nras/attest/gpu")
+        .uri("/nvidia/nras-extra")
         .body(Body::empty())
         .unwrap();
     let (status, headers, _) = send(app(), req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_nras_cors(&headers);
+    assert_ne!(status, StatusCode::NO_CONTENT);
+    assert!(headers.get("access-control-allow-origin").is_none());
 }
 
 #[tokio::test]
@@ -817,7 +843,7 @@ async fn nvidia_nras_forwards_retry_after() {
         uri: String::new(),
         nvidia_nras_uri: upstream,
         db_path: db_path.clone(),
-        upstream_max_attempts: 1,
+        upstream_max_attempts: 6,
         ..Config::test_default()
     };
     let app = create_app_from_config(cfg);
@@ -825,6 +851,33 @@ async fn nvidia_nras_forwards_retry_after() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(headers.get("retry-after").unwrap(), "11");
     assert_eq!(body, "{}");
+    assert_nras_cors(&headers);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "NRAS must not inherit Intel 429 retries"
+    );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_does_not_retry_upstream_503() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::SERVICE_UNAVAILABLE, Some("2")).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-503-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 6,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, _) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers.get("retry-after").unwrap(), "2");
     assert_nras_cors(&headers);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 
