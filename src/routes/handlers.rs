@@ -5,9 +5,10 @@ use crate::error::{self, PccsError, PccsJson};
 use crate::headers;
 use crate::store::RegisteredPlatform;
 use crate::validate::{self, PlatformsSource};
-use axum::extract::{FromRequestParts, OriginalUri, State};
+use axum::extract::{FromRequestParts, OriginalUri, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -111,49 +112,36 @@ pub async fn get_nvidia_rim(
 
 // --------------- NVIDIA NRAS (GPU attestation) ---------------
 
-pub async fn post_nvidia_nras_attest_gpu(
-    State(state): State<AppState>,
-    axum::Json(body): axum::Json<serde_json::Value>,
-) -> Result<Response, PccsError> {
-    let rec = state.cache.get_nvidia_nras(&body).await?;
-
-    let mut h = HeaderMap::new();
-    if let Some(ct) = rec.content_type.as_deref() {
-        if let Ok(v) = HeaderValue::from_str(ct) {
-            h.insert(header::CONTENT_TYPE, v);
-        }
-    }
-    // CORS for browser UI
-    if let Ok(v) = HeaderValue::from_str("*") {
-        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
-        h.insert(
-            header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("POST, OPTIONS"),
-        );
-        h.insert(
-            header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("Content-Type"),
-        );
-    }
-
-    let status = StatusCode::from_u16(rec.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    Ok((status, h, rec.body).into_response())
+fn insert_nras_cors(headers: &mut HeaderMap) {
+    insert(headers, "access-control-allow-origin", "*");
+    insert(headers, "access-control-allow-methods", "POST, OPTIONS");
+    insert(headers, "access-control-allow-headers", "Content-Type");
+    insert(headers, "access-control-expose-headers", "Retry-After");
+    insert(headers, "cache-control", "no-store");
 }
 
-pub async fn options_nvidia_nras() -> Response {
-    let mut h = HeaderMap::new();
-    if let Ok(v) = HeaderValue::from_str("*") {
-        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
-        h.insert(
-            header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("POST, OPTIONS"),
-        );
-        h.insert(
-            header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("Content-Type"),
-        );
+/// Path-scoped CORS for `/nvidia/nras`. Outermost so it covers PccsJson
+/// rejections and the global `DefaultBodyLimit` 413. OPTIONS is answered here
+/// so preflight does not depend on a matching POST route.
+pub async fn nras_cors(req: Request, next: Next) -> Response {
+    let nras = req.uri().path().starts_with("/nvidia/nras");
+    if nras && req.method() == Method::OPTIONS {
+        let mut headers = HeaderMap::new();
+        insert_nras_cors(&mut headers);
+        return (StatusCode::NO_CONTENT, headers).into_response();
     }
-    (StatusCode::NO_CONTENT, h).into_response()
+    let mut response = next.run(req).await;
+    if nras {
+        insert_nras_cors(response.headers_mut());
+    }
+    response
+}
+
+pub async fn post_nvidia_nras_attest_gpu(
+    State(state): State<AppState>,
+    PccsJson(body): PccsJson<Value>,
+) -> Result<Response, PccsError> {
+    Ok(amd_response(state.cache.get_nvidia_nras(&body).await?))
 }
 
 // --------------- pckcert ---------------

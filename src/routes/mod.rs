@@ -2,7 +2,7 @@ pub mod handlers;
 
 use crate::auth::{self, AppState};
 use axum::middleware;
-use axum::routing::{get, options, post, put};
+use axum::routing::{get, post, put};
 use axum::Router;
 
 pub fn sgx_router(state: AppState) -> Router<AppState> {
@@ -56,7 +56,5 @@ pub fn nvidia_rim_router() -> Router<AppState> {
 }
 
 pub fn nvidia_nras_router() -> Router<AppState> {
-    Router::new()
-        .route("/attest/gpu", post(handlers::post_nvidia_nras_attest_gpu))
-        .route("/attest/gpu", options(handlers::options_nvidia_nras))
+    Router::new().route("/attest/gpu", post(handlers::post_nvidia_nras_attest_gpu))
 }
