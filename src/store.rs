@@ -562,9 +562,6 @@ impl Store {
         self.put_json(&keys::nvidia_rim(&rec.url), rec)
     }
 
-    // NRAS responses are nonce-bound; we rely on single-flight in Cache
-    // rather than persistent storage for now.
-
     // ---------- registration queue ----------
 
     fn normalize_reg(p: &mut RegisteredPlatform) {
