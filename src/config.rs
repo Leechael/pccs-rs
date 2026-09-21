@@ -22,7 +22,6 @@ pub const DEFAULT_AMD_KDS_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_NVIDIA_RIM_URI: &str = "https://rim.attestation.nvidia.com";
 pub const DEFAULT_NVIDIA_RIM_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_NVIDIA_NRAS_URI: &str = "https://nras.attestation.nvidia.com";
-pub const DEFAULT_NVIDIA_NRAS_CACHE_TTL_SECS: u64 = 5 * 60; // 5 minutes (nonce-bound)
 pub const DEFAULT_REFRESH: &str = "0 0 1 * * *";
 
 /// Packaged default path. systemd always passes `--config` pointing here.
@@ -198,10 +197,6 @@ pub struct ServeArgs {
     #[arg(long, env = "PCCS_NVIDIA_NRAS_URI")]
     pub nvidia_nras_uri: Option<String>,
 
-    /// Freshness lifetime for cached NVIDIA NRAS responses (short because nonce-bound).
-    #[arg(long, env = "PCCS_NVIDIA_NRAS_CACHE_TTL_SECONDS")]
-    pub nvidia_nras_cache_ttl_seconds: Option<u64>,
-
     #[arg(long, env = "PCCS_PROXY")]
     pub proxy: Option<String>,
 
@@ -337,7 +332,6 @@ struct TomlConfig {
     nvidia_rim_uri: Option<String>,
     nvidia_rim_cache_ttl_seconds: Option<u64>,
     nvidia_nras_uri: Option<String>,
-    nvidia_nras_cache_ttl_seconds: Option<u64>,
     proxy: Option<String>,
     refresh_schedule: Option<String>,
     db_path: Option<PathBuf>,
@@ -373,7 +367,6 @@ pub struct Config {
     pub nvidia_rim_uri: String,
     pub nvidia_rim_cache_ttl_secs: u64,
     pub nvidia_nras_uri: String,
-    pub nvidia_nras_cache_ttl_secs: u64,
     pub proxy: String,
     pub refresh_schedule: String,
     pub db_path: PathBuf,
@@ -419,7 +412,6 @@ impl Default for Config {
             nvidia_rim_uri: DEFAULT_NVIDIA_RIM_URI.into(),
             nvidia_rim_cache_ttl_secs: DEFAULT_NVIDIA_RIM_CACHE_TTL_SECS,
             nvidia_nras_uri: DEFAULT_NVIDIA_NRAS_URI.into(),
-            nvidia_nras_cache_ttl_secs: DEFAULT_NVIDIA_NRAS_CACHE_TTL_SECS,
             proxy: String::new(),
             refresh_schedule: DEFAULT_REFRESH.into(),
             db_path: PathBuf::from("pccs-db"),
@@ -645,9 +637,6 @@ fn apply_toml(cfg: &mut Config, file: TomlConfig) {
     if let Some(u) = file.nvidia_nras_uri {
         cfg.nvidia_nras_uri = u;
     }
-    if let Some(n) = file.nvidia_nras_cache_ttl_seconds {
-        cfg.nvidia_nras_cache_ttl_secs = n;
-    }
     if let Some(p) = file.proxy {
         cfg.proxy = p;
     }
@@ -755,9 +744,6 @@ fn apply_cli(cfg: &mut Config, c: ServeArgs) {
     }
     if let Some(u) = c.nvidia_nras_uri {
         cfg.nvidia_nras_uri = u;
-    }
-    if let Some(n) = c.nvidia_nras_cache_ttl_seconds {
-        cfg.nvidia_nras_cache_ttl_secs = n;
     }
     if let Some(p) = c.proxy {
         cfg.proxy = p;
