@@ -61,7 +61,6 @@ pub struct Cache {
     nvidia_rim_uri: String,
     nvidia_rim_cache_ttl_secs: u64,
     nvidia_nras_uri: String,
-    nvidia_nras_cache_ttl_secs: u64,
     /// Per-key locks so N concurrent misses on the same key produce one
     /// upstream request; the losers re-read the store after acquiring.
     inflight: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -152,7 +151,6 @@ impl Cache {
             nvidia_rim_uri: normalize_nvidia_rim_host(&cfg.nvidia_rim_uri),
             nvidia_rim_cache_ttl_secs: cfg.nvidia_rim_cache_ttl_secs,
             nvidia_nras_uri: cfg.nvidia_nras_uri.trim_end_matches('/').to_string(),
-            nvidia_nras_cache_ttl_secs: cfg.nvidia_nras_cache_ttl_secs,
             store,
             pcs,
             pool_refetch_on_new_tcb: cfg.pool_refetch_on_new_tcb,
