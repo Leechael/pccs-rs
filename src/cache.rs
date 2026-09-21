@@ -226,44 +226,38 @@ impl Cache {
         .await
     }
 
-    /// NVIDIA NRAS GPU attestation.
-    /// Uses single-flight to avoid thundering herd on identical (body) requests.
-    /// Responses are not persisted to RocksDB because they are nonce-bound.
+    /// Stateless NVIDIA NRAS GPU attestation proxy. Not cached: the result is
+    /// nonce-bound. OFFLINE never calls upstream. LAZY and REQ both proxy.
     pub async fn get_nvidia_nras(
         &self,
         body: &serde_json::Value,
     ) -> Result<AmdKdsResponse, PccsError> {
+        if self.nvidia_nras_uri.is_empty() {
+            return Err(error::NVIDIA_NRAS_ACCESS_FAILURE);
+        }
+        if self.mode == CacheMode::Offline {
+            return Err(error::SERVICE_UNAVAILABLE);
+        }
         let url = format!("{}/v3/attest/gpu", self.nvidia_nras_uri);
-        let body_str = serde_json::to_string(body).unwrap_or_default();
-        let key = keys::nvidia_nras(&url, &body_str);
-
-        let _guard = self.key_lock(&key).await?;
-
-        // Perform the POST (single-flight protected)
-        let client = reqwest::Client::new();
-        let resp = client.post(&url).json(body).send().await.map_err(|e| {
-            tracing::warn!("nvidia nras upstream: {e}");
-            error::NVIDIA_NRAS_ACCESS_FAILURE
-        })?;
-
-        let status = resp.status();
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let body_bytes = resp.bytes().await.map_err(|e| {
-            tracing::warn!("nvidia nras body: {e}");
-            error::NVIDIA_NRAS_ACCESS_FAILURE
-        })?;
-
+        let payload = serde_json::to_vec(body).map_err(|_| error::INVALID_REQ)?;
+        self.store.record_upstream();
+        let (status, hdrs, body) = self
+            .pcs
+            .post_json_once(&url, &payload)
+            .await
+            .map_err(|_| error::NVIDIA_NRAS_ACCESS_FAILURE)?;
         Ok(AmdKdsResponse {
-            status: status.as_u16(),
-            body: body_bytes.to_vec(),
-            content_type,
+            status,
+            body,
+            content_type: hdrs
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string()),
             content_disposition: None,
-            retry_after: None,
+            retry_after: hdrs
+                .get(hyper::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string()),
         })
     }
 
