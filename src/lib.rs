@@ -60,11 +60,11 @@ pub fn create_app(state: AppState) -> Router {
     }
 
     app.fallback(routes::handlers::not_found)
-        .layer(middleware::from_fn(auth::add_request_id))
         .layer(DefaultBodyLimit::max(body_limit))
-        // Outermost so NRAS CORS covers extractor rejections *and* the global
-        // 413 from DefaultBodyLimit.
+        // CORS wraps the body-limit 413, but stays inside Request-ID so OPTIONS
+        // preflight (answered without calling next) still gets a fresh id.
         .layer(middleware::from_fn(routes::handlers::nras_cors))
+        .layer(middleware::from_fn(auth::add_request_id))
         .with_state(state)
 }
 

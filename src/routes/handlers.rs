@@ -120,11 +120,15 @@ fn insert_nras_cors(headers: &mut HeaderMap) {
     insert(headers, "cache-control", "no-store");
 }
 
-/// Path-scoped CORS for `/nvidia/nras`. Outermost so it covers PccsJson
-/// rejections and the global `DefaultBodyLimit` 413. OPTIONS is answered here
-/// so preflight does not depend on a matching POST route.
+fn is_nras_path(path: &str) -> bool {
+    path == "/nvidia/nras" || path.starts_with("/nvidia/nras/")
+}
+
+/// Path-scoped CORS for `/nvidia/nras`. Wraps `DefaultBodyLimit` so 413 still
+/// gets ACAO, but sits inside `add_request_id`. OPTIONS is answered here so
+/// preflight does not depend on a matching POST route.
 pub async fn nras_cors(req: Request, next: Next) -> Response {
-    let nras = req.uri().path().starts_with("/nvidia/nras");
+    let nras = is_nras_path(req.uri().path());
     if nras && req.method() == Method::OPTIONS {
         let mut headers = HeaderMap::new();
         insert_nras_cors(&mut headers);
