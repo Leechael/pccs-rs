@@ -50,3 +50,11 @@ pub fn amd_kds_router() -> Router<AppState> {
         .route("/vcek/{*rest}", get(handlers::get_amd_kds))
         .route("/vlek/{*rest}", get(handlers::get_amd_kds))
 }
+
+pub fn nvidia_rim_router() -> Router<AppState> {
+    Router::new().route("/v1/rim/{*rest}", get(handlers::get_nvidia_rim))
+}
+
+pub fn nvidia_nras_router() -> Router<AppState> {
+    Router::new().route("/attest/gpu", post(handlers::post_nvidia_nras_attest_gpu))
+}

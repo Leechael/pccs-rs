@@ -25,6 +25,9 @@ pub struct Cache {
     pub is_intel: bool,
     amd_kds_uri: String,
     amd_kds_cache_ttl_secs: u64,
+    nvidia_rim_uri: String,
+    nvidia_rim_cache_ttl_secs: u64,
+    nvidia_nras_uri: String,
     /// Per-key locks so N concurrent misses on the same key produce one
     /// upstream request; the losers re-read the store after acquiring.
     inflight: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -78,6 +81,24 @@ fn normalize_amd_kds_host(uri: &str) -> String {
     host
 }
 
+/// NVIDIA RIM host. A legacy `.../v1/rim` suffix is stripped so `/v1/rim/`
+/// request paths can be appended without doubling.
+fn normalize_nvidia_rim_host(uri: &str) -> String {
+    let host = uri.trim().trim_end_matches('/').to_string();
+    host.strip_suffix("/v1/rim")
+        .map(|stripped| stripped.trim_end_matches('/').to_string())
+        .unwrap_or(host)
+}
+
+fn join_host_path(host: &str, path_and_query: &str) -> String {
+    let path_and_query = if path_and_query.starts_with('/') {
+        path_and_query.to_string()
+    } else {
+        format!("/{path_and_query}")
+    };
+    format!("{host}{path_and_query}")
+}
+
 impl Cache {
     pub fn new(store: Store, pcs: PcsClient, cfg: &Config) -> Self {
         Self {
@@ -86,6 +107,9 @@ impl Cache {
             is_intel: cfg.is_intel_upstream(),
             amd_kds_uri: normalize_amd_kds_host(&cfg.amd_kds_uri),
             amd_kds_cache_ttl_secs: cfg.amd_kds_cache_ttl_secs,
+            nvidia_rim_uri: normalize_nvidia_rim_host(&cfg.nvidia_rim_uri),
+            nvidia_rim_cache_ttl_secs: cfg.nvidia_rim_cache_ttl_secs,
+            nvidia_nras_uri: cfg.nvidia_nras_uri.trim_end_matches('/').to_string(),
             store,
             pcs,
             inflight: Mutex::new(HashMap::new()),
@@ -175,41 +199,103 @@ impl Cache {
     }
 
     pub async fn get_amd_kds(&self, path_and_query: &str) -> Result<AmdKdsResponse, PccsError> {
-        let path_and_query = if path_and_query.starts_with('/') {
-            path_and_query.to_string()
-        } else {
-            format!("/{path_and_query}")
-        };
-        let url = format!("{}{path_and_query}", self.amd_kds_uri);
+        let url = join_host_path(&self.amd_kds_uri, path_and_query);
+        self.get_cached_url(
+            url,
+            self.amd_kds_cache_ttl_secs,
+            "amd kds",
+            keys::amd_kds,
+            error::AMD_KDS_ACCESS_FAILURE,
+            Store::get_amd_kds,
+            Store::put_amd_kds,
+        )
+        .await
+    }
+
+    pub async fn get_nvidia_rim(&self, path_and_query: &str) -> Result<AmdKdsResponse, PccsError> {
+        let url = join_host_path(&self.nvidia_rim_uri, path_and_query);
+        self.get_cached_url(
+            url,
+            self.nvidia_rim_cache_ttl_secs,
+            "nvidia rim",
+            keys::nvidia_rim,
+            error::NVIDIA_RIM_ACCESS_FAILURE,
+            Store::get_nvidia_rim,
+            Store::put_nvidia_rim,
+        )
+        .await
+    }
+
+    /// Stateless NVIDIA NRAS GPU attestation proxy. Not cached: the result is
+    /// nonce-bound. OFFLINE never calls upstream. LAZY and REQ both proxy.
+    pub async fn get_nvidia_nras(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<AmdKdsResponse, PccsError> {
+        if self.nvidia_nras_uri.is_empty() {
+            return Err(error::NVIDIA_NRAS_ACCESS_FAILURE);
+        }
+        if self.mode == CacheMode::Offline {
+            return Err(error::SERVICE_UNAVAILABLE);
+        }
+        let url = format!("{}/v3/attest/gpu", self.nvidia_nras_uri);
+        let payload = serde_json::to_vec(body).map_err(|_| error::INVALID_REQ)?;
+        self.store.record_upstream();
+        let (status, hdrs, body) = self
+            .pcs
+            .post_json_once(&url, &payload)
+            .await
+            .map_err(|_| error::NVIDIA_NRAS_ACCESS_FAILURE)?;
+        Ok(AmdKdsResponse {
+            status,
+            body,
+            content_type: hdrs
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string()),
+            content_disposition: None,
+            retry_after: hdrs
+                .get(hyper::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string()),
+        })
+    }
+
+    async fn get_cached_url(
+        &self,
+        url: String,
+        ttl: u64,
+        kind: &'static str,
+        key_for: fn(&str) -> String,
+        access_failure: PccsError,
+        load: fn(&Store, &str) -> Option<AmdKdsRecord>,
+        save: fn(&Store, &AmdKdsRecord) -> Result<(), PccsError>,
+    ) -> Result<AmdKdsResponse, PccsError> {
         let now = unix_time();
-        if let Some(rec) = self.store.get_amd_kds(&url) {
-            if now.saturating_sub(rec.fetched_at) < self.amd_kds_cache_ttl_secs {
+        if let Some(rec) = load(&self.store, &url) {
+            if now.saturating_sub(rec.fetched_at) < ttl {
                 self.store.record_hit();
-                tracing::debug!("cache hit amd kds");
+                tracing::debug!("cache hit {kind}");
                 return Ok(rec.into());
             }
         }
         self.store.record_miss();
-        tracing::info!("cache miss amd kds url={url}");
+        tracing::info!("cache miss {kind} url={url}");
         if self.mode != CacheMode::Lazy {
             return Err(error::NO_CACHE_DATA);
         }
 
-        let key = keys::amd_kds(&url);
+        let key = key_for(&url);
         let _guard = self.key_lock(&key).await?;
         let now = unix_time();
-        if let Some(rec) = self.store.get_amd_kds(&url) {
-            if now.saturating_sub(rec.fetched_at) < self.amd_kds_cache_ttl_secs {
+        if let Some(rec) = load(&self.store, &url) {
+            if now.saturating_sub(rec.fetched_at) < ttl {
                 return Ok(rec.into());
             }
         }
 
         self.store.record_upstream();
-        let fetched = self
-            .pcs
-            .get_url(&url)
-            .await
-            .map_err(|_| error::AMD_KDS_ACCESS_FAILURE);
+        let fetched = self.pcs.get_url(&url).await.map_err(|_| access_failure);
         let (status, headers, body) = self.note(&key, fetched).await?;
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
@@ -239,7 +325,7 @@ impl Cache {
             content_disposition,
             fetched_at: unix_time(),
         };
-        self.store.put_amd_kds(&rec)?;
+        save(&self.store, &rec)?;
         Ok(rec.into())
     }
 
@@ -1125,6 +1211,22 @@ mod tests {
         assert_eq!(
             normalize_amd_kds_host("https://mirror.example/amd-kds/vcek/v1"),
             "https://mirror.example/amd-kds"
+        );
+    }
+
+    #[test]
+    fn nvidia_rim_host_strips_legacy_v1_rim_suffix() {
+        assert_eq!(
+            normalize_nvidia_rim_host("https://rim.attestation.nvidia.com/v1/rim"),
+            "https://rim.attestation.nvidia.com"
+        );
+        assert_eq!(
+            normalize_nvidia_rim_host(" https://rim.attestation.nvidia.com/v1/rim/ "),
+            "https://rim.attestation.nvidia.com"
+        );
+        assert_eq!(
+            normalize_nvidia_rim_host("https://rim.attestation.nvidia.com"),
+            "https://rim.attestation.nvidia.com"
         );
     }
 

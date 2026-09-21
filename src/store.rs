@@ -549,6 +549,19 @@ impl Store {
         self.put_json(&keys::amd_kds(&rec.url), rec)
     }
 
+    pub fn get_nvidia_rim(&self, url: &str) -> Option<AmdKdsRecord> {
+        let rec: AmdKdsRecord = self.get_json(&keys::nvidia_rim(url))?;
+        if rec.url != url {
+            tracing::warn!("nvidia rim record does not match its key; treating as a miss");
+            return None;
+        }
+        Some(rec)
+    }
+
+    pub fn put_nvidia_rim(&self, rec: &AmdKdsRecord) -> Result<(), PccsError> {
+        self.put_json(&keys::nvidia_rim(&rec.url), rec)
+    }
+
     // ---------- registration queue ----------
 
     fn normalize_reg(p: &mut RegisteredPlatform) {

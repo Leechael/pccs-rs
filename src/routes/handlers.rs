@@ -5,9 +5,10 @@ use crate::error::{self, PccsError, PccsJson};
 use crate::headers;
 use crate::store::RegisteredPlatform;
 use crate::validate::{self, PlatformsSource};
-use axum::extract::{FromRequestParts, OriginalUri, State};
+use axum::extract::{FromRequestParts, OriginalUri, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -78,17 +79,73 @@ fn amd_response(rec: crate::cache::AmdKdsResponse) -> Response {
     bytes(status, headers, rec.body)
 }
 
+fn original_path_and_query(uri: &Uri) -> String {
+    match uri.query() {
+        Some(query) => format!("{}?{query}", uri.path()),
+        None => uri.path().to_string(),
+    }
+}
+
 pub async fn get_amd_kds(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
-    let path_and_query = match uri.query() {
-        Some(query) => format!("{}?{query}", uri.path()),
-        None => uri.path().to_string(),
-    };
     Ok(amd_response(
-        state.cache.get_amd_kds(&path_and_query).await?,
+        state
+            .cache
+            .get_amd_kds(&original_path_and_query(&uri))
+            .await?,
     ))
+}
+
+pub async fn get_nvidia_rim(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, PccsError> {
+    Ok(amd_response(
+        state
+            .cache
+            .get_nvidia_rim(&original_path_and_query(&uri))
+            .await?,
+    ))
+}
+
+// --------------- NVIDIA NRAS (GPU attestation) ---------------
+
+fn insert_nras_cors(headers: &mut HeaderMap) {
+    insert(headers, "access-control-allow-origin", "*");
+    insert(headers, "access-control-allow-methods", "POST, OPTIONS");
+    insert(headers, "access-control-allow-headers", "Content-Type");
+    insert(headers, "access-control-expose-headers", "Retry-After");
+    insert(headers, "cache-control", "no-store");
+}
+
+fn is_nras_path(path: &str) -> bool {
+    path == "/nvidia/nras" || path.starts_with("/nvidia/nras/")
+}
+
+/// Path-scoped CORS for `/nvidia/nras`. Wraps `DefaultBodyLimit` so 413 still
+/// gets ACAO, but sits inside `add_request_id`. OPTIONS is answered here so
+/// preflight does not depend on a matching POST route.
+pub async fn nras_cors(req: Request, next: Next) -> Response {
+    let nras = is_nras_path(req.uri().path());
+    if nras && req.method() == Method::OPTIONS {
+        let mut headers = HeaderMap::new();
+        insert_nras_cors(&mut headers);
+        return (StatusCode::NO_CONTENT, headers).into_response();
+    }
+    let mut response = next.run(req).await;
+    if nras {
+        insert_nras_cors(response.headers_mut());
+    }
+    response
+}
+
+pub async fn post_nvidia_nras_attest_gpu(
+    State(state): State<AppState>,
+    PccsJson(body): PccsJson<Value>,
+) -> Result<Response, PccsError> {
+    Ok(amd_response(state.cache.get_nvidia_nras(&body).await?))
 }
 
 // --------------- pckcert ---------------

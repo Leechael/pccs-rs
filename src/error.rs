@@ -127,6 +127,14 @@ pub const AMD_KDS_ACCESS_FAILURE: PccsError = PccsError::new(
     StatusCode::BAD_GATEWAY,
     "Unable to retrieve the collateral from the AMD KDS.",
 );
+pub const NVIDIA_RIM_ACCESS_FAILURE: PccsError = PccsError::new(
+    StatusCode::BAD_GATEWAY,
+    "Unable to retrieve the collateral from the NVIDIA RIM service.",
+);
+pub const NVIDIA_NRAS_ACCESS_FAILURE: PccsError = PccsError::new(
+    StatusCode::BAD_GATEWAY,
+    "Unable to retrieve the attestation result from the NVIDIA NRAS.",
+);
 
 /// Express `res.send(string)` sets `Content-Type: text/html; charset=utf-8`.
 /// Returning a bare `&str` from axum would say `text/plain`, so success bodies
@@ -162,6 +170,8 @@ mod tests {
         assert_eq!(SERVICE_UNAVAILABLE.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(PCS_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
         assert_eq!(AMD_KDS_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(NVIDIA_RIM_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(NVIDIA_NRAS_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
         assert_eq!(integrity_error().status.as_u16(), 460);
         assert_eq!(platform_unknown().status.as_u16(), 461);
         assert_eq!(certs_unavailable().status.as_u16(), 462);

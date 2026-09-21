@@ -522,6 +522,440 @@ async fn amd_vcek_cache_key_includes_the_complete_query() {
 }
 
 #[tokio::test]
+async fn nvidia_rim_is_cached_by_its_full_url() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/v1/rim/{id}",
+        axum::routing::get(move |uri: axum::http::Uri| {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                (
+                    [("content-type", "application/json")],
+                    format!("rim {}", uri.path()),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nvidia-rim-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: format!("http://{addr}/v1/rim"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for _ in 0..2 {
+        let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "rim /v1/rim/some-id");
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_rim_transport_failure_is_a_bad_gateway() {
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nvidia-transport-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: "http://127.0.0.1:9".into(),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    let (status, _, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        body,
+        "Unable to retrieve the collateral from the NVIDIA RIM service."
+    );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn non_lazy_nvidia_rim_miss_never_calls_upstream() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().fallback(move || {
+        let calls = mock_calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            "rim"
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    for mode in [CacheMode::Req, CacheMode::Offline] {
+        let db_path = std::env::temp_dir().join(format!(
+            "pccs-rs-nvidia-no-fill-{}-{}",
+            mode.as_str(),
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = Config {
+            uri: String::new(),
+            nvidia_rim_uri: format!("http://{addr}"),
+            cache_mode: mode,
+            db_path: db_path.clone(),
+            upstream_max_attempts: 1,
+            ..Config::test_default()
+        };
+        let app = create_app_from_config(cfg);
+        let (status, _, _) = send(app.clone(), get("/v1/rim/some-id")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{}", mode.as_str());
+        drop(app);
+        let _ = std::fs::remove_dir_all(db_path);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn nvidia_rim_error_response_is_relayed_and_not_cached() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/v1/rim/some-id",
+        axum::routing::get(move || {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "10")],
+                    "slow down",
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nvidia-error-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: format!("http://{addr}"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for _ in 0..2 {
+        let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers.get("retry-after").unwrap(), "10");
+        assert_eq!(body, "slow down");
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+fn nras_post(body: impl Into<Body>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "application/json")
+        .body(body.into())
+        .unwrap()
+}
+
+fn assert_nras_cors(headers: &axum::http::HeaderMap) {
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+    let methods = headers
+        .get("access-control-allow-methods")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(methods.contains("POST"), "{methods}");
+    assert!(methods.contains("OPTIONS"), "{methods}");
+    assert_eq!(
+        headers.get("access-control-allow-headers").unwrap(),
+        "Content-Type"
+    );
+    assert_eq!(
+        headers.get("access-control-expose-headers").unwrap(),
+        "Retry-After"
+    );
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+}
+
+async fn spawn_nras(
+    calls: Arc<AtomicU64>,
+    status: StatusCode,
+    retry_after: Option<&'static str>,
+) -> String {
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/v3/attest/gpu",
+        axum::routing::post(move |body: bytes::Bytes| {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                if let Some(retry) = retry_after {
+                    headers.insert(
+                        axum::http::header::RETRY_AFTER,
+                        axum::http::HeaderValue::from_static(retry),
+                    );
+                }
+                (status, headers, body)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn nvidia_nras_proxies_json_and_is_not_cached() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-proxy-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let payload = json!({"nonce":"aa","evidence_list":[]});
+
+    for _ in 0..2 {
+        let (status, headers, body) = send(app.clone(), nras_post(payload.to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, payload.to_string().as_bytes());
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_nras_cors(&headers);
+    }
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "must not persist NRAS results"
+    );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_options_preflight_is_cors() {
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/nvidia/nras/attest/gpu")
+            .header(headers::REQUEST_ID, "client-supplied-id")
+            .body(Body::empty())
+            .unwrap();
+        let (status, h, _) = send(app(), req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_nras_cors(&h);
+        let id = h
+            .get(headers::REQUEST_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(id, "client-supplied-id");
+        assert!(!id.is_empty());
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1], "each preflight gets a fresh Request-ID");
+}
+
+#[tokio::test]
+async fn nvidia_nras_prefix_does_not_match_nras_extra() {
+    let req = Request::builder()
+        .method("OPTIONS")
+        .uri("/nvidia/nras-extra")
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, _) = send(app(), req).await;
+    assert_ne!(status, StatusCode::NO_CONTENT);
+    assert!(headers.get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
+async fn nvidia_nras_extractor_errors_have_cors() {
+    let malformed = Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "application/json")
+        .body(Body::from("{not json"))
+        .unwrap();
+    let (status, headers, _) = send(app(), malformed).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_nras_cors(&headers);
+
+    let wrong_type = Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "text/plain")
+        .body(Body::from("x"))
+        .unwrap();
+    let (status, headers, _) = send(app(), wrong_type).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_nras_cors(&headers);
+}
+
+#[tokio::test]
+async fn nvidia_nras_forwards_retry_after() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::TOO_MANY_REQUESTS, Some("11")).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-429-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 6,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, body) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "11");
+    assert_eq!(body, "{}");
+    assert_nras_cors(&headers);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "NRAS must not inherit Intel 429 retries"
+    );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_does_not_retry_upstream_503() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::SERVICE_UNAVAILABLE, Some("2")).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-503-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 6,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, _) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers.get("retry-after").unwrap(), "2");
+    assert_nras_cors(&headers);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_transport_failure_is_a_bad_gateway_with_cors() {
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nras-transport-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: "http://127.0.0.1:9".into(),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, body) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        body,
+        "Unable to retrieve the attestation result from the NVIDIA NRAS."
+    );
+    assert_nras_cors(&headers);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_offline_never_calls_upstream() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nras-offline-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        cache_mode: CacheMode::Offline,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, _) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_nras_cors(&headers);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_req_mode_still_proxies() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-req-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        cache_mode: CacheMode::Req,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, _, _) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
 async fn every_documented_route_is_registered() {
     let routes: &[(&str, &str)] = &[
         ("POST", "/sgx/certification/v3/platforms"),
@@ -557,6 +991,8 @@ async fn every_documented_route_is_registered() {
         ("GET", "/vcek/v1/Genoa/cert_chain"),
         ("GET", "/vcek/v1/Genoa/crl"),
         ("GET", "/vlek/v1/Genoa/cert_chain"),
+        ("GET", "/v1/rim/some-id"),
+        ("POST", "/nvidia/nras/attest/gpu"),
     ];
 
     for (method, path) in routes {
@@ -2134,4 +2570,39 @@ async fn stalled_request_body_is_408_with_request_id() {
         started.elapsed() < std::time::Duration::from_secs(10),
         "must time out at RequestTimeoutSeconds, not hang"
     );
+}
+
+#[tokio::test]
+async fn nvidia_nras_stalled_body_is_408_with_cors() {
+    let mut cfg = Config::test_default();
+    cfg.request_timeout_secs = 1;
+    let router = app_cfg(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "application/json")
+        .body(Body::new(StalledBody(Some(bytes::Bytes::from_static(
+            b"{",
+        )))))
+        .unwrap();
+    let (status, headers, _) = send(router, req).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert_nras_cors(&headers);
+}
+
+#[tokio::test]
+async fn nvidia_nras_oversize_body_is_413_with_cors() {
+    let mut cfg = Config::test_default();
+    cfg.max_body_size = 64;
+    let router = app_cfg(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "application/json")
+        .body(Body::from(format!("{{\"x\":\"{}\"}}", "a".repeat(256))))
+        .unwrap();
+    let (status, headers, body) = send(router, req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body.as_ref(), b"Content too large.");
+    assert_nras_cors(&headers);
 }
