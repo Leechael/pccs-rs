@@ -193,7 +193,7 @@ pub struct ServeArgs {
     #[arg(long, env = "PCCS_NVIDIA_RIM_CACHE_TTL_SECONDS")]
     pub nvidia_rim_cache_ttl_seconds: Option<u64>,
 
-    /// NVIDIA NRAS host for GPU attestation.
+    /// NVIDIA NRAS host. `POST /nvidia/nras/attest/gpu` is forwarded to `{host}/v3/attest/gpu`.
     #[arg(long, env = "PCCS_NVIDIA_NRAS_URI")]
     pub nvidia_nras_uri: Option<String>,
 
@@ -1008,12 +1008,14 @@ mod tests {
         assert_eq!(cfg.uri, DEFAULT_URI);
         assert_eq!(cfg.amd_kds_uri, DEFAULT_AMD_KDS_URI);
         assert_eq!(cfg.nvidia_rim_uri, DEFAULT_NVIDIA_RIM_URI);
+        assert_eq!(cfg.nvidia_nras_uri, DEFAULT_NVIDIA_NRAS_URI);
         assert!(is_sha512_hex(DEFAULT_USER_TOKEN_HASH));
         let test = Config::test_default();
         assert!(is_sha512_hex(test.admin_token_hash.as_str()));
         assert!(test.uri.is_empty());
         assert!(test.amd_kds_uri.is_empty());
         assert!(test.nvidia_rim_uri.is_empty());
+        assert!(test.nvidia_nras_uri.is_empty());
     }
 
     #[test]
@@ -1101,6 +1103,7 @@ mod tests {
                 amd_kds_cache_ttl_seconds = 123
                 nvidia_rim_uri = "https://nvidia-file.example/v1/rim"
                 nvidia_rim_cache_ttl_seconds = 321
+                nvidia_nras_uri = "https://nvidia-file.example/nras"
                 proxy = "http://proxy.example:8080"
                 refresh_schedule = "0 0 2 * * *"
                 user_token_hash = "file-user-hash"
@@ -1129,6 +1132,7 @@ mod tests {
         assert_eq!(cfg.amd_kds_cache_ttl_secs, 123);
         assert_eq!(cfg.nvidia_rim_uri, "https://nvidia-file.example/v1/rim");
         assert_eq!(cfg.nvidia_rim_cache_ttl_secs, 321);
+        assert_eq!(cfg.nvidia_nras_uri, "https://nvidia-file.example/nras");
         assert_eq!(cfg.proxy, "http://proxy.example:8080");
         assert_eq!(cfg.refresh_schedule, "0 0 2 * * *");
         assert_eq!(cfg.user_token_hash, "file-user-hash");
@@ -1171,6 +1175,8 @@ mod tests {
             "https://nvidia-cli.example/v1/rim",
             "--nvidia-rim-cache-ttl-seconds",
             "654",
+            "--nvidia-nras-uri",
+            "https://nvidia-cli.example/nras",
             "--proxy",
             "http://cli-proxy:1",
             "--refresh-schedule",
@@ -1213,6 +1219,7 @@ mod tests {
         assert_eq!(cfg.amd_kds_cache_ttl_secs, 456);
         assert_eq!(cfg.nvidia_rim_uri, "https://nvidia-cli.example/v1/rim");
         assert_eq!(cfg.nvidia_rim_cache_ttl_secs, 654);
+        assert_eq!(cfg.nvidia_nras_uri, "https://nvidia-cli.example/nras");
         assert_eq!(cfg.proxy, "http://cli-proxy:1");
         assert_eq!(cfg.refresh_schedule, "0 0 3 * * *");
         assert_eq!(cfg.db_path, PathBuf::from("/tmp/cli-db"));
