@@ -115,28 +115,11 @@ pub async fn post_nvidia_nras_attest_gpu(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, PccsError> {
-    let url = format!(
-        "{}/v3/attest/gpu",
-        state.config.nvidia_nras_uri.trim_end_matches('/')
-    );
-
-    let client = reqwest::Client::new();
-    let resp = client.post(&url).json(&body).send().await.map_err(|e| {
-        tracing::warn!("nvidia nras: {e}");
-        error::NVIDIA_RIM_ACCESS_FAILURE
-    })?;
-
-    let status = resp.status();
-    let headers = resp.headers().clone();
-    let bytes = resp.bytes().await.map_err(|e| {
-        tracing::warn!("nvidia nras body: {e}");
-        error::NVIDIA_RIM_ACCESS_FAILURE
-    })?;
+    let rec = state.cache.get_nvidia_nras(&body).await?;
 
     let mut h = HeaderMap::new();
-    // Forward content-type if present
-    if let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE) {
-        if let Ok(v) = HeaderValue::from_str(ct.to_str().unwrap_or("application/json")) {
+    if let Some(ct) = rec.content_type.as_deref() {
+        if let Ok(v) = HeaderValue::from_str(ct) {
             h.insert(header::CONTENT_TYPE, v);
         }
     }
@@ -153,12 +136,8 @@ pub async fn post_nvidia_nras_attest_gpu(
         );
     }
 
-    Ok((
-        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-        h,
-        bytes,
-    )
-        .into_response())
+    let status = StatusCode::from_u16(rec.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    Ok((status, h, rec.body).into_response())
 }
 
 pub async fn options_nvidia_nras() -> Response {
