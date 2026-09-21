@@ -51,7 +51,8 @@ pub fn create_app(state: AppState) -> Router {
     let mut app = Router::new()
         .nest("/sgx/certification/v3", sgx_v3)
         .merge(routes::amd_kds_router())
-        .merge(routes::nvidia_rim_router());
+        .merge(routes::nvidia_rim_router())
+        .nest("/nvidia/nras", routes::nvidia_nras_router());
     if pcs_ver == 4 {
         app = app
             .nest("/sgx/certification/v4", routes::sgx_router(state.clone()))
