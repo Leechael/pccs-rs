@@ -63,6 +63,9 @@ pub fn create_app(state: AppState) -> Router {
         .fallback(routes::handlers::not_found)
         .layer(middleware::from_fn(auth::add_request_id))
         .layer(DefaultBodyLimit::max(body_limit))
+        // Outermost so NRAS CORS covers extractor rejections *and* the global
+        // 413 from DefaultBodyLimit.
+        .layer(middleware::from_fn(routes::handlers::nras_cors))
         .with_state(state)
 }
 
