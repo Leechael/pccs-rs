@@ -8,7 +8,6 @@ use hyper_util::service::TowerToHyperService;
 use pccs_rs::config::{
     Cli, Command, Config, ConfigCommand, DEFAULT_ADMIN_TOKEN_HASH, DEFAULT_USER_TOKEN_HASH,
 };
-use pccs_rs::health::StartupState;
 use pccs_rs::{app_state, create_app};
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
@@ -87,7 +86,6 @@ async fn run(cfg: Config) {
     warn_on_self_upstream(&cfg, addr);
 
     let state = app_state(cfg.clone());
-    let startup = StartupState::new();
     let scheduler = spawn_refresh_scheduler(state.cache.clone(), cfg.refresh_schedule.clone());
     // No handler-cancelling timeout layer here. Node's `server.requestTimeout`
     // bounds only *receiving* the request, never producing the response; a
@@ -96,7 +94,7 @@ async fn run(cfg: Config) {
     // `/refresh` into a 408 and, worse, cancelling it between two writes.
     // Request-receive is bounded by hyper's `header_read_timeout` (headers)
     // plus the body-read timeout in `error::PccsJson` (body).
-    let app = create_app(state.clone(), startup.clone());
+    let app = create_app(state.clone());
 
     if cfg.https {
         rustls::crypto::ring::default_provider().install_default().ok();
@@ -128,7 +126,7 @@ async fn run(cfg: Config) {
             .acceptor(TunedAcceptor);
         let mut server = axum_server::bind(addr).acceptor(acceptor).handle(handle);
         configure_http(server.http_builder(), &cfg);
-        startup.mark_started();
+        state.startup.mark_started();
         if let Err(e) = server.serve(app.into_make_service()).await {
             tracing::error!("https server: {e}");
         }
@@ -138,7 +136,7 @@ async fn run(cfg: Config) {
             eprintln!("bind {addr}: {e}");
             std::process::exit(1);
         });
-        startup.mark_started();
+        state.startup.mark_started();
         serve_http(listener, app, &cfg).await;
     }
 

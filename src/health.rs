@@ -96,9 +96,9 @@ pub async fn readiness(State(state): State<AppState>) -> Response {
 /// `GET /healthz/startup` — startup probe. Returns 200 once the HTTP server is
 /// accepting connections (after `mark_started()` is called), or 503 while
 /// still starting.
-pub async fn startup(State(startup): State<StartupState>) -> Response {
+pub async fn startup(State(state): State<AppState>) -> Response {
     let timestamp = now_iso8601();
-    if startup.is_started() {
+    if state.startup.is_started() {
         json_response(StatusCode::OK, json!({ "status": "STARTED", "timestamp": timestamp }))
     } else {
         json_response(
@@ -147,19 +147,23 @@ mod tests {
 
     #[tokio::test]
     async fn startup_returns_503_before_started_and_200_after() {
-        let startup = StartupState::new();
-        assert!(!startup.is_started());
+        let cfg = Config::test_default();
+        let cache = build_cache(&cfg).unwrap();
+        let startup_state = StartupState::new();
+        let state = AppState { cache, config: Arc::new(cfg), startup: startup_state.clone() };
 
-        let resp = startup(State(startup.clone())).await;
+        assert!(!startup_state.is_started());
+
+        let resp = super::startup(State(state.clone())).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["status"], "STARTING");
 
-        startup.mark_started();
-        assert!(startup.is_started());
+        startup_state.mark_started();
+        assert!(startup_state.is_started());
 
-        let resp = startup(State(startup)).await;
+        let resp = super::startup(State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
@@ -168,16 +172,14 @@ mod tests {
 
     #[tokio::test]
     async fn health_probes_route_integration() {
-        use crate::{app_state, create_app};
         use axum::Router;
 
         let cfg = Config::test_default();
-        let state = app_state(cfg);
-        let startup = StartupState::new();
+        let cache = build_cache(&cfg).unwrap();
+        let startup_state = StartupState::new();
+        let state = AppState { cache, config: Arc::new(cfg), startup: startup_state.clone() };
 
-        let app = Router::new()
-            .nest("/healthz", crate::routes::healthz_router())
-            .with_state((state, startup.clone()));
+        let app = Router::new().nest("/healthz", crate::routes::healthz_router()).with_state(state);
 
         let resp = app
             .clone()
@@ -200,7 +202,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        startup.mark_started();
+        startup_state.mark_started();
 
         let resp = app
             .oneshot(Request::builder().uri("/healthz/startup").body(Body::empty()).unwrap())

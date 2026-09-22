@@ -33,10 +33,10 @@ pub fn app_state(cfg: Config) -> AppState {
     let cache = build_cache(&cfg).unwrap_or_else(|e| {
         panic!("failed to initialise cache: {e}");
     });
-    AppState { cache, config: Arc::new(cfg) }
+    AppState { cache, config: Arc::new(cfg), startup: StartupState::new() }
 }
 
-pub fn create_app(state: AppState, startup: StartupState) -> Router {
+pub fn create_app(state: AppState) -> Router {
     let body_limit = state.config.max_body_size;
     let pcs_ver = state.config.pcs_version();
 
@@ -58,9 +58,9 @@ pub fn create_app(state: AppState, startup: StartupState) -> Router {
         .fallback(routes::handlers::not_found)
         .layer(middleware::from_fn(auth::add_request_id))
         .layer(DefaultBodyLimit::max(body_limit))
-        .with_state((state, startup))
+        .with_state(state)
 }
 
 pub fn create_app_from_config(cfg: Config) -> Router {
-    create_app(app_state(cfg), StartupState::new())
+    create_app(app_state(cfg))
 }
