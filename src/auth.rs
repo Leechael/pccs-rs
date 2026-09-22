@@ -40,6 +40,7 @@ pub fn header_token<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Optio
 pub struct AppState {
     pub config: std::sync::Arc<Config>,
     pub cache: std::sync::Arc<crate::cache::Cache>,
+    pub startup: crate::health::StartupState,
 }
 
 pub async fn require_user(
