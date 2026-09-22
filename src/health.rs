@@ -132,11 +132,7 @@ mod tests {
     async fn readiness_returns_200_when_db_is_healthy() {
         let cfg = Config::test_default();
         let cache = build_cache(&cfg).unwrap();
-        let state = AppState {
-            cache,
-            config: Arc::new(cfg),
-            startup: StartupState::new(),
-        };
+        let state = AppState { cache, config: Arc::new(cfg), startup: StartupState::new() };
 
         let resp = readiness(State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
