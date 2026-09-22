@@ -1,6 +1,7 @@
 pub mod handlers;
 
 use crate::auth::{self, AppState};
+use crate::health::{self, StartupState};
 use axum::middleware;
 use axum::routing::{get, post, put};
 use axum::Router;
@@ -34,4 +35,13 @@ pub fn tdx_router() -> Router<AppState> {
     Router::new()
         .route("/tcb", get(handlers::get_tdx_tcb))
         .route("/qe/identity", get(handlers::get_tdqe_identity))
+}
+
+/// Health probe routes, mounted at `/healthz`. Unauthenticated. Liveness and
+/// startup check process state only; readiness performs a lightweight DB check.
+pub fn healthz_router() -> Router<(AppState, StartupState)> {
+    Router::new()
+        .route("/live", get(health::liveness))
+        .route("/ready", get(health::readiness))
+        .route("/startup", get(health::startup))
 }
