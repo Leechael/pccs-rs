@@ -126,6 +126,7 @@ async fn run(cfg: Config) {
             .acceptor(TunedAcceptor);
         let mut server = axum_server::bind(addr).acceptor(acceptor).handle(handle);
         configure_http(server.http_builder(), &cfg);
+        state.startup.mark_started();
         if let Err(e) = server.serve(app.into_make_service()).await {
             tracing::error!("https server: {e}");
         }
@@ -135,6 +136,7 @@ async fn run(cfg: Config) {
             eprintln!("bind {addr}: {e}");
             std::process::exit(1);
         });
+        state.startup.mark_started();
         serve_http(listener, app, &cfg).await;
     }
 

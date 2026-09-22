@@ -200,6 +200,13 @@ impl Store {
         self.upstream_fetches.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Lightweight health check: returns `true` if the DB is usable, `false`
+    /// otherwise. Used by the `/healthz/ready` probe. Cheap enough to run on
+    /// every readiness check (sub-millisecond on a healthy DB).
+    pub fn is_healthy(&self) -> bool {
+        self.db.property_value("rocksdb.estimate-num-keys").is_ok()
+    }
+
     fn get_json<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Option<T> {
         // `get_pinned` reads straight out of the block cache instead of
         // allocating a `Vec<u8>` copy per lookup.
