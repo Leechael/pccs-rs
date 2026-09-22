@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod hash;
 pub mod headers;
+pub mod health;
 pub mod keys;
 pub mod pcs;
 pub mod routes;
@@ -20,6 +21,7 @@ pub mod validate;
 use crate::auth::AppState;
 use crate::cache::build_cache;
 use crate::config::Config;
+use crate::health::StartupState;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::Router;
@@ -34,7 +36,7 @@ pub fn app_state(cfg: Config) -> AppState {
     AppState { cache, config: Arc::new(cfg) }
 }
 
-pub fn create_app(state: AppState) -> Router {
+pub fn create_app(state: AppState, startup: StartupState) -> Router {
     let body_limit = state.config.max_body_size;
     let pcs_ver = state.config.pcs_version();
 
@@ -52,12 +54,13 @@ pub fn create_app(state: AppState) -> Router {
             .nest("/tdx/certification/v4", routes::tdx_router());
     }
 
-    app.fallback(routes::handlers::not_found)
+    app.nest("/healthz", routes::healthz_router())
+        .fallback(routes::handlers::not_found)
         .layer(middleware::from_fn(auth::add_request_id))
         .layer(DefaultBodyLimit::max(body_limit))
-        .with_state(state)
+        .with_state((state, startup))
 }
 
 pub fn create_app_from_config(cfg: Config) -> Router {
-    create_app(app_state(cfg))
+    create_app(app_state(cfg), StartupState::new())
 }
