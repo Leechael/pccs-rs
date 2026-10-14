@@ -327,6 +327,16 @@ fn validate_input(pce_id: &str, certs: &[ParsedCert], tcb_info: &Value) -> Resul
     if tcb_type != Some(0) {
         return Err(format!("TCB_TYPE in TCB Info ({tcb_type:?}) is different than 0"));
     }
+    validate_platform_metadata(pce_id, certs, tcb_info)
+}
+
+/// Shared SGX/TDX platform identity and component shape. Algorithm selection's
+/// SGX type0 restriction is deliberately not a collateral forwarding rule.
+fn validate_platform_metadata(
+    pce_id: &str,
+    certs: &[ParsedCert],
+    tcb_info: &Value,
+) -> Result<(), String> {
     let info_pceid =
         tcb_info.get("pceId").and_then(|v| v.as_str()).ok_or("PCEID missing in TCB Info")?;
     if !info_pceid.eq_ignore_ascii_case(pce_id) {
@@ -517,6 +527,44 @@ fn find_insert_index(bucket_certs: &[usize], parsed: &[ParsedCert], cert: &Parse
         index += 1;
     }
     -1
+}
+
+/// Validate a complete PCK pool against shared platform TCB metadata without
+/// selecting a raw CPU/PCE SVN or creating a raw mapping. Manifest-only fills
+/// need the same certificate/type/identity/component checks as selection.
+/// This is SGX type0 structural validation, not signature or issuer-chain
+/// verification. TDX forwarding uses the separate shared-metadata gate below.
+pub fn validate_pck_cert_pool(
+    pce_id: &str,
+    certs: &[(String, String)],
+    tcb_info: &Value,
+) -> Result<(), String> {
+    if certs.is_empty() {
+        return Err("No certificate found for given platform".into());
+    }
+    let parsed = parse_pck_certs(certs)?;
+    validate_input(pce_id, &parsed, tcb_info)
+}
+
+/// Validate forwarded TDX collateral against its PCK platform, without using
+/// it for PCK selection or requiring SGX's algorithm type0. Intel's TDX schema
+/// allows integer tcbType values; when supplied it must remain an integer.
+/// No signature/crypto verification or TDX selection is performed here.
+pub fn validate_tdx_pck_cert_pool(
+    pce_id: &str,
+    certs: &[(String, String)],
+    tcb_info: &Value,
+) -> Result<(), String> {
+    if certs.is_empty() {
+        return Err("No certificate found for given platform".into());
+    }
+    if let Some(typ) = tcb_info.get("tcbType") {
+        if typ.as_i64().is_none() && typ.as_u64().is_none() {
+            return Err("TCB_TYPE in TDX collateral must be an integer".into());
+        }
+    }
+    let parsed = parse_pck_certs(certs)?;
+    validate_platform_metadata(pce_id, &parsed, tcb_info)
 }
 
 /// Node `selectBestPckCert`. Returns `(tcbm, pem)` of the chosen certificate.

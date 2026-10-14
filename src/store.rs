@@ -115,7 +115,22 @@ pub struct PlatformPool {
     pub raw_tcbs: Vec<RawTcb>,
 }
 
+/// Opaque snapshot of only the fetch credentials. Deliberately no Debug or
+/// serialization implementation: credentials must not leak through diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlatformCredentials {
+    enc_ppid: String,
+    platform_manifest: String,
+}
+
 impl PlatformPool {
+    pub fn credentials(&self) -> PlatformCredentials {
+        PlatformCredentials {
+            enc_ppid: self.enc_ppid.clone(),
+            platform_manifest: self.platform_manifest.clone(),
+        }
+    }
+
     pub fn cert_pairs(&self) -> Vec<(String, String)> {
         self.certs.iter().map(|c| (c.tcbm.clone(), c.cert.clone())).collect()
     }
@@ -293,6 +308,232 @@ impl Store {
         merged.raw_tcbs = previous.clone();
         self.put_platform_pool(&merged)?;
         Ok(previous)
+    }
+
+    /// Re-read the current pool under `platform_lock`, compute a selection,
+    /// and optionally publish its GET key and raw mapping in one atomic batch.
+    /// The closure is computation only: it must not mutate the store or re-enter
+    /// platform methods. `persist = false` returns an untracked response only.
+    pub fn select_platform_cert<F>(
+        &self,
+        qeid: &str,
+        pceid: &str,
+        persist: bool,
+        select: F,
+    ) -> Result<PckCertRecord, PccsError>
+    where
+        F: FnOnce(&PlatformPool) -> Result<PckCertRecord, PccsError>,
+    {
+        let _guard = self.platform_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = self.get_platform_pool(qeid, pceid).ok_or(error::NO_CACHE_DATA)?;
+        let rec = select(&pool)?;
+        if persist {
+            let raw = RawTcb {
+                cpu_svn: rec.cpusvn.to_ascii_uppercase(),
+                pce_svn: rec.pcesvn.to_ascii_uppercase(),
+                tcbm: rec.tcbm.to_ascii_uppercase(),
+            };
+            match pool.raw_tcbs.iter_mut().find(|r| {
+                r.cpu_svn.eq_ignore_ascii_case(&raw.cpu_svn)
+                    && r.pce_svn.eq_ignore_ascii_case(&raw.pce_svn)
+            }) {
+                Some(existing) => *existing = raw,
+                None => pool.raw_tcbs.push(raw),
+            }
+            let mut batch = WriteBatch::default();
+            Self::batch_pckcert(&mut batch, &rec)?;
+            batch.put(
+                keys::platform(qeid, pceid).as_bytes(),
+                serde_json::to_vec(&pool).map_err(|_| error::INTERNAL_ERROR)?,
+            );
+            self.write_batch(batch)?;
+        }
+        Ok(rec)
+    }
+
+    /// Replace the pool, staged TCB collateral and tracked GET selections as
+    /// one atomic batch, optionally adding a newly selected raw GET mapping.
+    /// Read raw mappings only after locking; a concurrent local selection must
+    /// either precede this replacement or select from the newly committed pool.
+    /// All selection and serialization can fail before the batch is committed,
+    /// leaving the old pool and success keys coherent. The closure must only
+    /// compute a selection, never mutate/re-enter platform methods.
+    pub fn replace_platform_certs_with_selection<F>(
+        &self,
+        fresh: &PlatformPool,
+        expected: Option<&PlatformCredentials>,
+        tcbs: &[TcbRecord],
+        selected: Option<&PckCertRecord>,
+        mut select: F,
+    ) -> Result<(), PccsError>
+    where
+        F: FnMut(&PlatformPool, &RawTcb) -> Result<PckCertRecord, PccsError>,
+    {
+        let _guard = self.platform_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let current = self.get_platform_pool(&fresh.qe_id, &fresh.pce_id);
+        Self::check_platform_context(current.as_ref(), expected)?;
+        let mut merged = fresh.clone();
+        merged.raw_tcbs = current.map(|p| p.raw_tcbs).unwrap_or_default();
+        let mut batch = WriteBatch::default();
+        for raw in &mut merged.raw_tcbs {
+            let rec = select(fresh, raw)?;
+            raw.tcbm = rec.tcbm.to_ascii_uppercase();
+            Self::batch_pckcert(&mut batch, &rec)?;
+        }
+        if let Some(rec) = selected {
+            let raw = RawTcb {
+                cpu_svn: rec.cpusvn.to_ascii_uppercase(),
+                pce_svn: rec.pcesvn.to_ascii_uppercase(),
+                tcbm: rec.tcbm.to_ascii_uppercase(),
+            };
+            match merged.raw_tcbs.iter_mut().find(|r| {
+                r.cpu_svn.eq_ignore_ascii_case(&raw.cpu_svn)
+                    && r.pce_svn.eq_ignore_ascii_case(&raw.pce_svn)
+            }) {
+                Some(existing) => *existing = raw,
+                None => merged.raw_tcbs.push(raw),
+            }
+            Self::batch_pckcert(&mut batch, rec)?;
+        }
+        for rec in tcbs {
+            batch.put(
+                keys::tcb(
+                    keys::prod_name(rec.prod_type),
+                    rec.version,
+                    &rec.fmspc,
+                    &rec.update_type,
+                )
+                .as_bytes(),
+                serde_json::to_vec(rec).map_err(|_| error::INTERNAL_ERROR)?,
+            );
+        }
+        batch.put(
+            keys::platform(&merged.qe_id, &merged.pce_id).as_bytes(),
+            serde_json::to_vec(&merged).map_err(|_| error::INTERNAL_ERROR)?,
+        );
+        self.write_batch(batch)
+    }
+
+    /// A PCCS single-cert response augments a pool; it never replaces the full
+    /// inventory. Publish its cert, raw mapping and all affected GET records in
+    /// one batch under the same lock as local selection and full replacement.
+    pub fn merge_pckcert(
+        &self,
+        rec: &PckCertRecord,
+        expected: Option<&PlatformCredentials>,
+    ) -> Result<(), PccsError> {
+        let _guard = self.platform_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let current = self.get_platform_pool(&rec.qeid, &rec.pceid);
+        Self::check_platform_context(current.as_ref(), expected)?;
+        let mut pool = current.unwrap_or_else(|| PlatformPool {
+            qe_id: rec.qeid.clone(),
+            pce_id: rec.pceid.clone(),
+            ..Default::default()
+        });
+        if (!pool.fmspc.is_empty() && !pool.fmspc.eq_ignore_ascii_case(&rec.fmspc))
+            || (!pool.ca.is_empty() && !pool.ca.eq_ignore_ascii_case(&rec.ca))
+        {
+            tracing::warn!("PCCS single certificate conflicts with cached platform metadata");
+            return Err(error::NO_CACHE_DATA);
+        }
+        let known_ppids: Vec<_> = pool
+            .certs
+            .iter()
+            .filter_map(|c| crate::selection::parse_pck_cert(&c.cert).ok())
+            .map(|c| c.ppid)
+            .collect();
+        match crate::selection::parse_pck_cert(&rec.cert) {
+            Ok(cert) => {
+                if known_ppids.iter().any(|ppid| !ppid.eq_ignore_ascii_case(&cert.ppid))
+                    || !cert.pce_id.eq_ignore_ascii_case(&rec.pceid)
+                    || !cert.fmspc.eq_ignore_ascii_case(&rec.fmspc)
+                    || !cert.ca.eq_ignore_ascii_case(&rec.ca)
+                {
+                    tracing::warn!(
+                        "PCCS single certificate conflicts with cached platform identity"
+                    );
+                    return Err(error::NO_CACHE_DATA);
+                }
+            }
+            Err(_) if !known_ppids.is_empty() => {
+                tracing::warn!("Unparseable PCCS certificate cannot augment a validated pool");
+                return Err(error::NO_CACHE_DATA);
+            }
+            // Legacy opaque development seeds / unknown single-cert mirrors
+            // retain their baseline transport behavior, not a trust guarantee.
+            Err(_) => {}
+        }
+        pool.fmspc = rec.fmspc.clone();
+        pool.ca = rec.ca.to_ascii_uppercase();
+        pool.issuer_chain = rec.issuer_chain.clone();
+        if let Some(ppid) = &rec.encrypted_ppid {
+            pool.enc_ppid = ppid.clone();
+        }
+        if !rec.platform_manifest.is_empty() {
+            pool.platform_manifest = rec.platform_manifest.clone();
+        }
+        let cert = PlatformCert { tcbm: rec.tcbm.clone(), cert: rec.cert.clone() };
+        match pool.certs.iter_mut().find(|c| c.tcbm.eq_ignore_ascii_case(&rec.tcbm)) {
+            Some(existing) => *existing = cert,
+            None => pool.certs.push(cert),
+        }
+        let mut batch = WriteBatch::default();
+        for raw in &pool.raw_tcbs {
+            if let Some(mut cached) =
+                self.get_pckcert(&pool.qe_id, &raw.cpu_svn, &raw.pce_svn, &pool.pce_id)
+            {
+                cached.fmspc = pool.fmspc.clone();
+                cached.ca = pool.ca.clone();
+                cached.issuer_chain = pool.issuer_chain.clone();
+                cached.encrypted_ppid =
+                    if pool.enc_ppid.is_empty() { None } else { Some(pool.enc_ppid.clone()) };
+                cached.platform_manifest = pool.platform_manifest.clone();
+                if cached.tcbm.eq_ignore_ascii_case(&rec.tcbm) {
+                    cached.cert = rec.cert.clone();
+                }
+                Self::batch_pckcert(&mut batch, &cached)?;
+            }
+        }
+        let raw = RawTcb {
+            cpu_svn: rec.cpusvn.to_ascii_uppercase(),
+            pce_svn: rec.pcesvn.to_ascii_uppercase(),
+            tcbm: rec.tcbm.to_ascii_uppercase(),
+        };
+        match pool.raw_tcbs.iter_mut().find(|r| {
+            r.cpu_svn.eq_ignore_ascii_case(&raw.cpu_svn)
+                && r.pce_svn.eq_ignore_ascii_case(&raw.pce_svn)
+        }) {
+            Some(existing) => *existing = raw,
+            None => pool.raw_tcbs.push(raw),
+        }
+        Self::batch_pckcert(&mut batch, rec)?;
+        batch.put(
+            keys::platform(&pool.qe_id, &pool.pce_id).as_bytes(),
+            serde_json::to_vec(&pool).map_err(|_| error::INTERNAL_ERROR)?,
+        );
+        self.write_batch(batch)
+    }
+
+    /// Called only under platform_lock, before publication. Raw additions are
+    /// deliberately not part of this comparison; None is an absent platform,
+    /// not an existing platform whose two credential strings happen to be empty.
+    fn check_platform_context(
+        current: Option<&PlatformPool>,
+        expected: Option<&PlatformCredentials>,
+    ) -> Result<(), PccsError> {
+        if current.map(PlatformPool::credentials).as_ref() != expected {
+            tracing::warn!("Rejecting PCK response fetched under stale platform credentials");
+            return Err(error::NO_CACHE_DATA);
+        }
+        Ok(())
+    }
+
+    fn batch_pckcert(batch: &mut WriteBatch, rec: &PckCertRecord) -> Result<(), PccsError> {
+        batch.put(
+            keys::pckcert(&rec.qeid, &rec.pceid, &rec.cpusvn, &rec.pcesvn).as_bytes(),
+            serde_json::to_vec(rec).map_err(|_| error::INTERNAL_ERROR)?,
+        );
+        Ok(())
     }
 
     /// Hot path: existence only. Deserialising the whole pool (every cert of
@@ -1205,18 +1446,10 @@ pub fn sha384_hex(s: &str) -> String {
     hex::encode(Sha384::digest(s.as_bytes()))
 }
 
+/// Startup seeds are explicit only. Preserve a missing explicit path so the
+/// caller reports its load failure rather than discovering another seed.
 pub fn find_seed_path(explicit: Option<&Path>) -> Option<std::path::PathBuf> {
-    if let Some(p) = explicit {
-        if p.exists() {
-            return Some(p.to_path_buf());
-        }
-    }
-    let candidates = [
-        std::path::PathBuf::from("fixtures/seed.json"),
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/seed.json"),
-        std::path::PathBuf::from("/workspace/pccs-rs/fixtures/seed.json"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
+    explicit.map(Path::to_path_buf)
 }
 
 /// Apply runtime RocksDB memory knobs. Keeps zstd block compression.
@@ -1778,14 +2011,9 @@ mod tests {
     }
 
     #[test]
-    fn find_seed_path_prefers_explicit_and_falls_back() {
-        let explicit = std::env::temp_dir().join(format!("pccs-rs-seed-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&explicit, "{}").unwrap();
-        assert_eq!(find_seed_path(Some(&explicit)), Some(explicit.clone()));
-        // A missing explicit path falls through to the built-in candidates;
-        // the repo ships fixtures/seed.json, so this is always Some here.
+    fn find_seed_path_never_discovers_a_fallback() {
+        assert_eq!(find_seed_path(None), None);
         let missing = std::path::Path::new("/definitely/not/here.json");
-        assert!(find_seed_path(Some(missing)).unwrap().ends_with("seed.json"));
-        let _ = std::fs::remove_file(&explicit);
+        assert_eq!(find_seed_path(Some(missing)), Some(missing.to_path_buf()));
     }
 }
