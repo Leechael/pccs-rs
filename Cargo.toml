@@ -37,6 +37,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 socket2 = "0.6"
 toml = "0.8"
 toml_edit = "0.22"
+# Offline Intel PCCS snapshot import; bundled SQLite keeps release binaries self-contained.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "pccs-rs"
