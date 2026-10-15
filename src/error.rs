@@ -117,10 +117,8 @@ pub const PCS_ACCESS_FAILURE: PccsError = PccsError::new(
     StatusCode::BAD_GATEWAY,
     "Unable to retrieve the collateral from the Intel SGX PCS.",
 );
-pub const AMD_KDS_ACCESS_FAILURE: PccsError = PccsError::new(
-    StatusCode::BAD_GATEWAY,
-    "Unable to retrieve the collateral from the AMD KDS.",
-);
+pub const AMD_KDS_ACCESS_FAILURE: PccsError =
+    PccsError::new(StatusCode::BAD_GATEWAY, "Unable to retrieve the collateral from the AMD KDS.");
 
 /// Express `res.send(string)` sets `Content-Type: text/html; charset=utf-8`.
 /// Returning a bare `&str` from axum would say `text/plain`, so success bodies

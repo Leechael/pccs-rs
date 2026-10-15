@@ -83,9 +83,7 @@ pub async fn get_amd_kds(
         Some(query) => format!("{}?{query}", uri.path()),
         None => uri.path().to_string(),
     };
-    Ok(amd_response(
-        state.cache.get_amd_kds(&path_and_query).await?,
-    ))
+    Ok(amd_response(state.cache.get_amd_kds(&path_and_query).await?))
 }
 
 // --------------- pckcert ---------------

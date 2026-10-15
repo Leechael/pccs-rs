@@ -1973,10 +1973,7 @@ async fn amd_kds_cert_chain_is_cached_by_its_full_url() {
         let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "amd-chain");
-        assert_eq!(
-            headers.get("content-type").unwrap(),
-            "application/octet-stream"
-        );
+        assert_eq!(headers.get("content-type").unwrap(), "application/octet-stream");
     }
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 
@@ -2061,10 +2058,8 @@ async fn concurrent_amd_kds_transport_failures_issue_one_upstream_fetch() {
         }
     });
 
-    let db_path = std::env::temp_dir().join(format!(
-        "pccs-rs-amd-failed-concurrent-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = std::env::temp_dir()
+        .join(format!("pccs-rs-amd-failed-concurrent-{}", uuid::Uuid::new_v4()));
     let cfg = Config {
         uri: String::new(),
         amd_kds_uri: format!("http://{addr}"),
@@ -2194,11 +2189,7 @@ async fn amd_kds_error_response_is_relayed_and_not_cached() {
             let calls = mock_calls.clone();
             async move {
                 calls.fetch_add(1, Ordering::Relaxed);
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [("retry-after", "10")],
-                    "slow down",
-                )
+                (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "10")], "slow down")
             }
         }),
     );

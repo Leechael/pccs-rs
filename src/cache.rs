@@ -81,10 +81,7 @@ impl From<AmdKdsRecord> for AmdKdsResponse {
 }
 
 fn unix_time() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 /// AMD KDS host. A legacy `.../vcek/v1` or `.../vlek/v1` suffix is stripped so
@@ -227,11 +224,7 @@ impl Cache {
         }
 
         self.store.record_upstream();
-        let fetched = self
-            .pcs
-            .get_url(&url)
-            .await
-            .map_err(|_| error::AMD_KDS_ACCESS_FAILURE);
+        let fetched = self.pcs.get_url(&url).await.map_err(|_| error::AMD_KDS_ACCESS_FAILURE);
         let (status, headers, body) = self.note(&key, fetched).await?;
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
@@ -254,13 +247,8 @@ impl Cache {
                 retry_after,
             });
         }
-        let rec = AmdKdsRecord {
-            url,
-            body,
-            content_type,
-            content_disposition,
-            fetched_at: unix_time(),
-        };
+        let rec =
+            AmdKdsRecord { url, body, content_type, content_disposition, fetched_at: unix_time() };
         self.store.put_amd_kds(&rec)?;
         Ok(rec.into())
     }
@@ -1150,10 +1138,7 @@ mod tests {
             normalize_amd_kds_host("https://kdsintf.amd.com/vlek/v1/"),
             "https://kdsintf.amd.com"
         );
-        assert_eq!(
-            normalize_amd_kds_host(" https://kdsintf.amd.com "),
-            "https://kdsintf.amd.com"
-        );
+        assert_eq!(normalize_amd_kds_host(" https://kdsintf.amd.com "), "https://kdsintf.amd.com");
         assert_eq!(
             normalize_amd_kds_host("https://mirror.example/amd-kds/vcek/v1"),
             "https://mirror.example/amd-kds"
