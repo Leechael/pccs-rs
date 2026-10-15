@@ -108,6 +108,26 @@ pub enum Command {
     Serve(ServeArgs),
     /// Convert or update configuration files
     Config(ConfigCmd),
+    /// Offline database operations (never starts the server)
+    Db(DbCmd),
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct DbCmd {
+    #[command(subcommand)]
+    pub command: DbCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DbCommand {
+    /// Import an Intel PCCS db_version=5 standalone SQLite snapshot into a fresh RocksDB
+    ImportIntel {
+        /// A consistent VACUUM INTO snapshot, not the live database
+        snapshot: PathBuf,
+        /// New destination directory; an existing path is always rejected
+        #[arg(long)]
+        db_path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -396,6 +416,7 @@ impl Config {
         Self {
             uri: String::new(),
             db_path: dir,
+            seed: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/seed.json")),
             no_seed: false,
             cache_mode: CacheMode::Lazy,
             user_token_hash: DEFAULT_USER_TOKEN_HASH.into(),

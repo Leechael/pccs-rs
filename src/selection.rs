@@ -327,6 +327,16 @@ fn validate_input(pce_id: &str, certs: &[ParsedCert], tcb_info: &Value) -> Resul
     if tcb_type != Some(0) {
         return Err(format!("TCB_TYPE in TCB Info ({tcb_type:?}) is different than 0"));
     }
+    validate_platform_metadata(pce_id, certs, tcb_info)
+}
+
+/// Shared SGX/TDX platform identity and component shape. Algorithm selection's
+/// SGX type0 restriction is deliberately not a collateral forwarding rule.
+fn validate_platform_metadata(
+    pce_id: &str,
+    certs: &[ParsedCert],
+    tcb_info: &Value,
+) -> Result<(), String> {
     let info_pceid =
         tcb_info.get("pceId").and_then(|v| v.as_str()).ok_or("PCEID missing in TCB Info")?;
     if !info_pceid.eq_ignore_ascii_case(pce_id) {
@@ -517,6 +527,46 @@ fn find_insert_index(bucket_certs: &[usize], parsed: &[ParsedCert], cert: &Parse
         index += 1;
     }
     -1
+}
+
+/// Validate a complete PCK pool against shared platform TCB metadata without
+/// selecting a raw CPU/PCE SVN or creating a raw mapping. Manifest-only fills
+/// need the same certificate/type/identity/component checks as selection.
+/// This is SGX type0 structural validation, not signature or issuer-chain
+/// verification. TDX forwarding uses the separate shared-metadata gate below.
+pub fn validate_pck_cert_pool(
+    pce_id: &str,
+    certs: &[(String, String)],
+    tcb_info: &Value,
+) -> Result<(), String> {
+    if certs.is_empty() {
+        return Err("No certificate found for given platform".into());
+    }
+    let parsed = parse_pck_certs(certs)?;
+    validate_input(pce_id, &parsed, tcb_info)?;
+    create_buckets(tcb_info)?;
+    Ok(())
+}
+
+/// Validate forwarded TDX collateral against its PCK platform, without using
+/// it for PCK selection or requiring SGX's algorithm type0. Intel's TDX schema
+/// allows integer tcbType values; when supplied it must remain an integer.
+/// No signature/crypto verification or TDX selection is performed here.
+pub fn validate_tdx_pck_cert_pool(
+    pce_id: &str,
+    certs: &[(String, String)],
+    tcb_info: &Value,
+) -> Result<(), String> {
+    if certs.is_empty() {
+        return Err("No certificate found for given platform".into());
+    }
+    if let Some(typ) = tcb_info.get("tcbType") {
+        if typ.as_i64().is_none() && typ.as_u64().is_none() {
+            return Err("TCB_TYPE in TDX collateral must be an integer".into());
+        }
+    }
+    let parsed = parse_pck_certs(certs)?;
+    validate_platform_metadata(pce_id, &parsed, tcb_info)
 }
 
 /// Node `selectBestPckCert`. Returns `(tcbm, pem)` of the chosen certificate.
@@ -770,6 +820,107 @@ mod tests {
             "tcbType": 0,
             "tcbLevels": tcb_levels,
         })
+    }
+
+    // Synthetic PCK: PPID 0x11*16, PCEID 4444, FMSPC 1234567890AB,
+    // CPUSVN 0x22*16, PCESVN 0x3333. No signature verification is implied.
+    const POOL_PCK_PEM: &str = include_str!("../tests/fixtures/pck-synthetic.pem");
+
+    fn pool_tcb_info(pcesvn: u64) -> Value {
+        serde_json::json!({
+            "id": "SGX",
+            "version": 3,
+            "issueDate": "2025-01-01T00:00:00Z",
+            "nextUpdate": "2025-02-01T00:00:00Z",
+            "fmspc": "1234567890AB",
+            "pceId": "4444",
+            "tcbType": 0,
+            "tcbEvaluationDataNumber": 1,
+            "tcbLevels": [{
+                "tcb": {
+                    "sgxtcbcomponents": vec![serde_json::json!({ "svn": 0x22 }); 16],
+                    "pcesvn": pcesvn
+                },
+                "tcbDate": "2025-01-01T00:00:00Z",
+                "tcbStatus": "UpToDate"
+            }]
+        })
+    }
+
+    #[test]
+    fn validate_pck_cert_pool_rejects_level_pcesvn_above_u32() {
+        let cert = parse_pck_cert(POOL_PCK_PEM).expect("synthetic PCK must be parseable");
+        assert_eq!(cert.pce_id, "4444");
+        assert_eq!(cert.fmspc, "1234567890AB");
+        assert_eq!(cert.pcesvn, 0x3333);
+        let certs = vec![("POOL".into(), POOL_PCK_PEM.into())];
+        let info = pool_tcb_info(4_294_967_296);
+
+        assert_eq!(validate_pck_cert_pool("4444", &certs, &info), Err("Invalid TCB levels".into()));
+    }
+
+    #[test]
+    fn validate_pck_cert_pool_accepts_level_pcesvn_boundaries() {
+        let certs = vec![("POOL".into(), POOL_PCK_PEM.into())];
+        // Preserve the selection algorithm's u32 range, not a byte/u16 limit.
+        for pcesvn in [0, 255, 256, 65_535, 65_536, 4_294_967_295] {
+            assert_eq!(
+                validate_pck_cert_pool("4444", &certs, &pool_tcb_info(pcesvn)),
+                Ok(()),
+                "level pcesvn={pcesvn}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_pck_cert_pool_accepts_a_selectable_pool() {
+        let certs = vec![("POOL".into(), POOL_PCK_PEM.into())];
+        let info = pool_tcb_info(0x3333);
+        assert_eq!(validate_pck_cert_pool("4444", &certs, &info), Ok(()));
+        assert_eq!(
+            select_best_pck_cert("22222222222222222222222222222222", "3333", "4444", &certs, &info,),
+            Ok(("POOL".into(), POOL_PCK_PEM.into()))
+        );
+    }
+
+    #[test]
+    fn validate_tdx_pck_cert_pool_forwards_integer_types_without_sgx_selection() {
+        let certs = vec![("POOL".into(), POOL_PCK_PEM.into())];
+        // Forwarding does not construct SGX selection buckets or constrain
+        // tcbType to SGX's algorithm type0.
+        let mut info = pool_tcb_info(4_294_967_296);
+        info["id"] = serde_json::json!("TDX");
+        info["tcbLevels"][0]["tcb"]["tdxtcbcomponents"] =
+            serde_json::json!(vec![serde_json::json!({ "svn": 1 }); 16]);
+        for typ in [
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!(u64::MAX),
+        ] {
+            info["tcbType"] = typ;
+            assert_eq!(validate_tdx_pck_cert_pool("4444", &certs, &info), Ok(()));
+        }
+        info["tcbType"] = serde_json::json!(1);
+        assert!(validate_pck_cert_pool("4444", &certs, &info).unwrap_err().contains("TCB_TYPE"));
+        info.as_object_mut().unwrap().remove("tcbType");
+        assert_eq!(validate_tdx_pck_cert_pool("4444", &certs, &info), Ok(()));
+    }
+
+    #[test]
+    fn validate_tdx_pck_cert_pool_rejects_non_integer_types() {
+        let certs = vec![("POOL".into(), POOL_PCK_PEM.into())];
+        let mut info = pool_tcb_info(0x3333);
+        info["id"] = serde_json::json!("TDX");
+        for typ in
+            [Value::Null, serde_json::json!(true), serde_json::json!("1"), serde_json::json!(1.5)]
+        {
+            info["tcbType"] = typ;
+            assert_eq!(
+                validate_tdx_pck_cert_pool("4444", &certs, &info),
+                Err("TCB_TYPE in TDX collateral must be an integer".into())
+            );
+        }
     }
 
     /// An unparsable certificate is an error, never a silent fallback to tcbm.

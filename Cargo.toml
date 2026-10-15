@@ -37,6 +37,15 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 socket2 = "0.6"
 toml = "0.8"
 toml_edit = "0.22"
+# Offline Intel PCCS snapshot import; bundled SQLite keeps release binaries self-contained.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# Atomic directory publication without replacing competing paths.
+rustix = { version = "1.1", features = ["fs"] }
+# Parse full CRL ASN.1 without signature verification or byte reserialization.
+x509-cert = { version = "0.2.5", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "pccs-rs"

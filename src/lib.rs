@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod hash;
 pub mod headers;
+pub mod intel_import;
 pub mod keys;
 pub mod pcs;
 pub mod routes;

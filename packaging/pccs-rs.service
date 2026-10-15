@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/pccs-rs serve --config /etc/pccs-rs/config.toml
+ExecStart=/usr/bin/pccs-rs serve --config /etc/pccs-rs/config.toml --no-seed
 Restart=on-failure
 RestartSec=2
 DynamicUser=yes
