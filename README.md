@@ -22,7 +22,8 @@ sudo $EDITOR /etc/pccs-rs/config.toml   # set api_key = "..."
 sudo systemctl enable --now pccs-rs
 ```
 
-Coming from Node PCCS? Import instead of editing by hand:
+Coming from Node PCCS? Import its **configuration** instead of editing by hand
+(this does not import its SQLite data):
 
 ```bash
 sudo pccs-rs config import /opt/intel/sgx-dcap-pccs/config/default.json
@@ -51,8 +52,9 @@ default).
 ## Usage
 
 ```text
-pccs-rs serve [OPTIONS]          start the HTTP server
-pccs-rs config import <FILE>     convert a Node pccs.json into TOML
+pccs-rs serve [OPTIONS]                           start the HTTP server
+pccs-rs config import <FILE>                      convert a Node pccs.json into TOML
+pccs-rs db import-intel <SNAPSHOT> --db-path <DIR>  restore Intel SQLite into a fresh RocksDB
 ```
 
 `serve` loads `--config` / `PCCS_CONFIG` if set, otherwise
@@ -83,6 +85,23 @@ Prefer terminating TLS on Caddy or nginx.
 `config import` writes `/etc/pccs-rs/config.toml` by default (`--to` to
 override). An existing destination is updated in place: keys present in the
 JSON are overwritten, other keys and comments are kept.
+
+### Restore Intel PCCS data
+
+```bash
+pccs-rs db import-intel /protected/pccs-snapshot.db --db-path /persistent/pccs-rs/cache
+```
+
+Use a standalone `VACUUM INTO` snapshot, not the live SQLite file. The importer
+supports Intel `db_version=5` / `api_version=4`, opens the source read-only,
+retains complete certificate pools, raw-TCB mappings and original signed bodies,
+and publishes only a verified fresh store. Existing destinations are rejected.
+Run it as the database's runtime owner; the parent must exist and the destination
+must not. Snapshots/Manifests are registration credentials: keep them private.
+
+Normal startup never discovers fixture files. Development fixtures require an
+explicit `--seed <FILE>`; a missing file is fatal. `--no-seed` disables even an
+explicit seed and is set by the packaged systemd/Docker commands.
 
 ## Configuration
 

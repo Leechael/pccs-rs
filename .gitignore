@@ -3,6 +3,8 @@ target/
 # secrets / local runtime
 certs/
 *.pem
+# Public synthetic test certificate only; production certificates/keys stay ignored.
+!tests/fixtures/pck-synthetic.pem
 *.pid
 *.log
 compare/node-run/

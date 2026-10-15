@@ -6,7 +6,8 @@ use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use pccs_rs::config::{
-    Cli, Command, Config, ConfigCommand, DEFAULT_ADMIN_TOKEN_HASH, DEFAULT_USER_TOKEN_HASH,
+    Cli, Command, Config, ConfigCommand, DbCommand, DEFAULT_ADMIN_TOKEN_HASH,
+    DEFAULT_USER_TOKEN_HASH,
 };
 use pccs_rs::{app_state, create_app};
 use std::net::SocketAddr;
@@ -33,6 +34,20 @@ fn main() {
             if let Err(e) = run_config(cmd) {
                 eprintln!("{e}");
                 std::process::exit(1);
+            }
+        }
+        Command::Db(cmd) => {
+            let result = match cmd.command {
+                DbCommand::ImportIntel { snapshot, db_path } => {
+                    pccs_rs::intel_import::import_intel(&snapshot, &db_path)
+                }
+            };
+            match result {
+                Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
+                Err(e) => {
+                    eprintln!("Intel import failed: {e}");
+                    std::process::exit(1);
+                }
             }
         }
     }

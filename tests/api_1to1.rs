@@ -76,6 +76,1833 @@ fn pck_tcb_info() -> serde_json::Value {
     })
 }
 
+/// Synthetic Intel boundary for migration lifecycle regressions. The real
+/// HTTP handlers, selection and RocksDB store remain in the test path.
+#[derive(Clone)]
+struct MigrationPool {
+    cert: String,
+    tcbm: String,
+    chain: String,
+    not_available: bool,
+    fail: bool,
+    tcb_pceid: String,
+    standard_available: bool,
+    tcb_signature: String,
+    standard_pceid: Option<String>,
+    tdx_pceid: Option<String>,
+    tdx_type: i64,
+    requests: Arc<AtomicU64>,
+}
+
+impl Default for MigrationPool {
+    fn default() -> Self {
+        Self {
+            cert: PCK_PEM.into(),
+            tcbm: format!("{PCK_CPUSVN}{PCK_PCESVN}"),
+            chain: "migration-pck-chain".into(),
+            not_available: false,
+            fail: false,
+            tcb_pceid: PCK_PCEID.into(),
+            standard_available: true,
+            tcb_signature: "synthetic".into(),
+            standard_pceid: None,
+            tdx_pceid: None,
+            tdx_type: 0,
+            requests: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+fn migration_tcb_response(p: &MigrationPool, update: &str, prod: u8) -> axum::response::Response {
+    p.requests.fetch_add(1, Ordering::Relaxed);
+    if update == "standard" && !p.standard_available {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut info = pck_tcb_info();
+    let pceid = if prod == 1 {
+        info["id"] = json!("TDX");
+        info["tcbType"] = json!(p.tdx_type);
+        info["tcbLevels"][0]["tcb"]["tdxtcbcomponents"] =
+            json!((0..16).map(|_| json!({"svn": 0})).collect::<Vec<_>>());
+        p.tdx_pceid.as_deref().unwrap_or(&p.tcb_pceid)
+    } else if update == "standard" {
+        p.standard_pceid.as_deref().unwrap_or(&p.tcb_pceid)
+    } else {
+        &p.tcb_pceid
+    };
+    info["pceId"] = json!(pceid);
+    let mut resp =
+        axum::Json(json!({"tcbInfo": info, "signature": p.tcb_signature})).into_response();
+    resp.headers_mut()
+        .insert(headers::TCB_INFO_ISSUER_CHAIN, "migration-tcb-chain".parse().unwrap());
+    resp
+}
+
+async fn spawn_migration_intel(
+    pool: Arc<RwLock<MigrationPool>>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let tcb_pool = pool.clone();
+    let tdx_pool = pool.clone();
+    let app = axum::Router::new()
+        .route(
+            "/sgx/certification/v4/pckcerts",
+            axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let pool = pool.clone();
+                async move {
+                    if payload["pceid"] != PCK_PCEID
+                        || !["ABCD", "BCDE"]
+                            .contains(&payload["platformManifest"].as_str().unwrap_or(""))
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    let p = pool.read().await.clone();
+                    p.requests.fetch_add(1, Ordering::Relaxed);
+                    if p.fail {
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                    let mut entries = vec![json!({"tcbm": p.tcbm, "cert": p.cert})];
+                    if p.not_available {
+                        entries.push(json!({"tcbm": "00", "cert": "Not%20available"}));
+                    }
+                    let mut resp = axum::Json(entries).into_response();
+                    resp.headers_mut().insert(headers::SGX_FMSPC, PCK_FMSPC.parse().unwrap());
+                    resp.headers_mut()
+                        .insert(headers::SGX_PCK_CERTIFICATE_CA_TYPE, "platform".parse().unwrap());
+                    resp.headers_mut().insert(
+                        headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                        p.chain.parse().unwrap(),
+                    );
+                    resp
+                }
+            }),
+        )
+        .route(
+            "/sgx/certification/v4/tcb",
+            axum::routing::get(
+                move |axum::extract::Query(q): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let pool = tcb_pool.clone();
+                    async move {
+                        let p = pool.read().await;
+                        migration_tcb_response(
+                            &p,
+                            q.get("update").map(String::as_str).unwrap_or("standard"),
+                            0,
+                        )
+                    }
+                },
+            ),
+        );
+    let app = app.route(
+        "/tdx/certification/v4/tcb",
+        axum::routing::get(
+            move |axum::extract::Query(q): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| {
+                let pool = tdx_pool.clone();
+                async move {
+                    let p = pool.read().await;
+                    migration_tcb_response(
+                        &p,
+                        q.get("update").map(String::as_str).unwrap_or("standard"),
+                        1,
+                    )
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/sgx/certification/v4/"), handle)
+}
+
+fn migration_pck_path(cpu: &str) -> String {
+    format!(
+        "/sgx/certification/v4/pckcert?qeid=AA&cpusvn={cpu}&pcesvn={PCK_PCESVN}&pceid={PCK_PCEID}"
+    )
+}
+
+async fn migration_platform_rows(router: &axum::Router) -> serde_json::Value {
+    let (status, _, body) = send(
+        router.clone(),
+        get_admin(&format!("/sgx/certification/v4/platforms?source=%5B{PCK_FMSPC}%5D")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    serde_json::from_slice(&body).unwrap()
+}
+
+// Intent: regression / migration safety, plan invariant 6. Manifest-only fill
+// succeeds without inventing raw CPU/PCE SVN mappings; REQ clears its NEW row.
+#[tokio::test]
+async fn migration_manifest_registration_then_ppidless_get() {
+    for mode in [CacheMode::Lazy, CacheMode::Req] {
+        let pool = Arc::new(RwLock::new(MigrationPool::default()));
+        let (uri, server) = spawn_migration_intel(pool.clone()).await;
+        let mut cfg = cfg_empty();
+        cfg.uri = uri;
+        cfg.cache_mode = mode;
+        let router = app_cfg(cfg);
+        let (status, _, body) = send(
+            router.clone(),
+            post_user(
+                "/sgx/certification/v4/platforms",
+                json!({
+                    "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "mode {mode:?}: {}", String::from_utf8_lossy(&body));
+        assert_eq!(body.as_ref(), b"Operation successful.");
+        assert_eq!(migration_platform_rows(&router).await, json!([]), "no invented raw mapping");
+        let (status, _, body) =
+            send(router.clone(), get_admin("/sgx/certification/v4/platforms?source=reg")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), json!([]));
+        // Subsequent retrieval must use the stored pool, not depend on Intel.
+        pool.write().await.fail = true;
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(PCK_CPUSVN))).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+        assert_eq!(h.get(headers::SGX_TCBM).unwrap(), format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str());
+        assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), PCK_FMSPC);
+        assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(), "PLATFORM");
+        assert_eq!(
+            h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
+            "migration-pck-chain"
+        );
+        let rows = migration_platform_rows(&router).await;
+        assert_eq!(rows[0]["cpu_svn"], PCK_CPUSVN);
+        assert_eq!(rows[0]["pce_svn"], PCK_PCESVN);
+        assert_eq!(rows[0]["platform_manifest"], "ABCD");
+        assert_eq!(rows[0]["enc_ppid"], "");
+        server.abort();
+    }
+}
+
+// Intent: regression / Intel 1.24 parity. A known platform ALWAYS selects
+// locally, or returns404; it never refetches with stored/client credentials.
+// Omitted/full-zero/nonzero PPID is ignored for known platforms; an explicitly
+// empty query value still fails controller validation. Unknown uses the client
+// credential only. Assert HTTP outcomes/cache state AND no boundary requests.
+#[tokio::test]
+async fn migration_pck_get_matches_intel_known_platform_boundary() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream_calls = calls.clone();
+    let expected_ppid = Arc::new(RwLock::new("E".repeat(768)));
+    let expected_upstream = expected_ppid.clone();
+    let ppid_app = axum::Router::new().route(
+        "/sgx/certification/v4/pckcert",
+        axum::routing::get(
+            move |axum::extract::Query(q): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| {
+                let expected_upstream = expected_upstream.clone();
+                let calls = upstream_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    if q.get("encrypted_ppid") != Some(&*expected_upstream.read().await) {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    let mut resp = PCK_PEM.into_response();
+                    resp.headers_mut().insert(
+                        headers::SGX_TCBM,
+                        format!("{PCK_CPUSVN}{PCK_PCESVN}").parse().unwrap(),
+                    );
+                    resp.headers_mut().insert(headers::SGX_FMSPC, PCK_FMSPC.parse().unwrap());
+                    resp.headers_mut()
+                        .insert(headers::SGX_PCK_CERTIFICATE_CA_TYPE, "platform".parse().unwrap());
+                    resp.headers_mut().insert(
+                        headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                        "migration-pck-chain".parse().unwrap(),
+                    );
+                    resp
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let ppid_server = tokio::spawn(async move { axum::serve(listener, ppid_app).await.unwrap() });
+    let manifest = Arc::new(RwLock::new(MigrationPool::default()));
+    let (manifest_uri, manifest_server) = spawn_migration_intel(manifest.clone()).await;
+    for request_ppid in [None, Some("0".repeat(768)), Some("F".repeat(768)), Some(String::new())] {
+        let effective_ppid = if request_ppid.as_deref() == Some(&"F".repeat(768)) {
+            "F".repeat(768)
+        } else {
+            "E".repeat(768)
+        };
+        *expected_ppid.write().await = effective_ppid.clone();
+        for (manifest, uri, complete) in [
+            ("", format!("http://{addr}/sgx/certification/v4/"), false),
+            ("ABCD", manifest_uri.clone(), false),
+            ("ABCD", manifest_uri.clone(), true),
+        ] {
+            let mut cfg = cfg_empty();
+            cfg.uri = uri;
+            cfg.cache_mode = CacheMode::Lazy;
+            let mut state = pccs_rs::app_state(cfg);
+            // Exercise Intel policy with a loopback HTTP boundary, not the
+            // separately supported PCCS mirror policy inferred from this host.
+            Arc::get_mut(&mut state.cache).unwrap().is_intel = true;
+            // A real persisted incomplete platform, as encountered after migration.
+            state
+                .cache
+                .store
+                .put_platform_pool(&pccs_rs::store::PlatformPool {
+                    qe_id: "AA".into(),
+                    pce_id: PCK_PCEID.into(),
+                    enc_ppid: "E".repeat(768),
+                    platform_manifest: manifest.into(),
+                    fmspc: PCK_FMSPC.into(),
+                    ca: "PLATFORM".into(),
+                    issuer_chain: "migration-pck-chain".into(),
+                    certs: if complete {
+                        vec![pccs_rs::store::PlatformCert {
+                            tcbm: format!("{PCK_CPUSVN}{PCK_PCESVN}"),
+                            cert: PCK_PEM.into(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            if complete {
+                let doc = json!({"tcbInfo": pck_tcb_info(), "signature": "synthetic"});
+                state
+                    .cache
+                    .store
+                    .put_tcb(&pccs_rs::store::TcbRecord {
+                        prod_type: 0,
+                        fmspc: PCK_FMSPC.into(),
+                        version: 4,
+                        update_type: "STANDARD".into(),
+                        raw_body: doc.to_string(),
+                        tcbinfo: doc,
+                        issuer_chain: "migration-tcb-chain".into(),
+                    })
+                    .unwrap();
+            }
+            let router = pccs_rs::create_app(state);
+            let mut path = migration_pck_path(PCK_CPUSVN);
+            if let Some(ppid) = &request_ppid {
+                path.push_str(&format!("&encrypted_ppid={ppid}"));
+            }
+            let (status, h, body) = send(router.clone(), get(&path)).await;
+            let expected_status = if request_ppid.as_deref() == Some("") {
+                StatusCode::BAD_REQUEST
+            } else if complete {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(
+                status,
+                expected_status,
+                "known complete={complete}, manifest {manifest:?}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            if status != StatusCode::OK {
+                assert_eq!(
+                    body.as_ref(),
+                    if status == StatusCode::BAD_REQUEST {
+                        b"Invalid request parameters.".as_slice()
+                    } else {
+                        b"No cache data for this platform.".as_slice()
+                    }
+                );
+                assert_eq!(migration_platform_rows(&router).await, json!([]));
+                continue;
+            }
+            assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+            assert_eq!(
+                h.get(headers::SGX_TCBM).unwrap(),
+                format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str()
+            );
+            assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), PCK_FMSPC);
+            assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(), "PLATFORM");
+            assert_eq!(
+                h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
+                "migration-pck-chain"
+            );
+            let rows = migration_platform_rows(&router).await;
+            assert_eq!(
+                rows[0]["enc_ppid"],
+                "E".repeat(768),
+                "known PPID query does not replace stored credentials"
+            );
+            assert_eq!(rows[0]["platform_manifest"], manifest);
+            assert_eq!(rows[0]["cpu_svn"], PCK_CPUSVN);
+            let (status, _, cached) = send(router, get(&path)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(cached, body);
+        }
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "known Intel platform never calls boundary");
+    assert_eq!(
+        manifest.read().await.requests.load(Ordering::Relaxed),
+        0,
+        "known Manifest pool never calls Intel boundary"
+    );
+    *expected_ppid.write().await = "E".repeat(768);
+    let mut cfg = cfg_empty();
+    cfg.uri = format!("http://{addr}/sgx/certification/v4/");
+    cfg.cache_mode = CacheMode::Lazy;
+    let router = app_cfg(cfg);
+    for (qeid, credential, expected) in [
+        ("BB", None, StatusCode::NOT_FOUND),
+        ("CC", Some("0".repeat(768)), StatusCode::NOT_FOUND),
+        ("DD", Some(String::new()), StatusCode::BAD_REQUEST),
+        ("EE", Some("E".repeat(768)), StatusCode::OK),
+    ] {
+        let mut path = migration_pck_path(PCK_CPUSVN).replace("qeid=AA", &format!("qeid={qeid}"));
+        if let Some(ppid) = credential {
+            path.push_str(&format!("&encrypted_ppid={ppid}"));
+        }
+        let (status, _, body) = send(router.clone(), get(&path)).await;
+        assert_eq!(status, expected, "unknown platform {qeid}: {}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            body.as_ref(),
+            match expected {
+                StatusCode::OK => PCK_PEM.as_bytes(),
+                StatusCode::BAD_REQUEST => b"Invalid request parameters.",
+                _ => b"No cache data for this platform.",
+            }
+        );
+    }
+    let fetched = calls.load(Ordering::Relaxed);
+    let (status, _, body) =
+        send(router.clone(), get(&migration_pck_path(PCK_CPUSVN).replace("qeid=AA", "qeid=EE")))
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+    let (status, _, _) =
+        send(router, get(&migration_pck_path(&"33".repeat(16)).replace("qeid=AA", "qeid=EE")))
+            .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "mirror forwards PPID-less raw miss; this mock requires caller PPID"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), fetched + 1);
+    ppid_server.abort();
+    manifest_server.abort();
+}
+
+// Intent: regression / invariant. PCCS mirrors forward missing raw keys when
+// local selection is unavailable, even without enrollment credentials. A known
+// upstream ignores caller PPID, so that value cannot replace retained metadata.
+#[tokio::test]
+async fn migration_mirror_missing_raw_preserves_inventory_and_credentials() {
+    for initial_ppid in [Some("E".repeat(768)), None] {
+        let calls = Arc::new(AtomicU64::new(0));
+        let upstream_calls = calls.clone();
+        let expected_initial = initial_ppid.clone();
+        let upstream = axum::Router::new().route(
+            "/sgx/certification/v4/pckcert",
+            axum::routing::get(
+                move |axum::extract::Query(q): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let calls = upstream_calls.clone();
+                    let initial = expected_initial.clone();
+                    async move {
+                        let call = calls.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(q["qeid"], "AA");
+                        assert_eq!(q["pceid"], PCK_PCEID);
+                        assert_eq!(q["pcesvn"], PCK_PCESVN);
+                        let (cert, tcbm) = if call == 0 {
+                            assert_eq!(q.get("encrypted_ppid"), initial.as_ref());
+                            (PCK_PEM.to_string(), format!("{PCK_CPUSVN}{PCK_PCESVN}"))
+                        } else if call == 1 {
+                            assert_eq!(q.get("encrypted_ppid"), Some(&"F".repeat(768)));
+                            (migration_pck_with_cpu(0x11), format!("{}3333", "11".repeat(16)))
+                        } else if call == 2 {
+                            assert!(!q.contains_key("encrypted_ppid"), "do not send saved PPID");
+                            (PCK_PEM.to_string(), format!("{PCK_CPUSVN}{PCK_PCESVN}"))
+                        } else {
+                            return StatusCode::BAD_GATEWAY.into_response();
+                        };
+                        let mut resp = cert.into_response();
+                        for (name, value) in [
+                            (headers::SGX_TCBM, tcbm.as_str()),
+                            (headers::SGX_FMSPC, PCK_FMSPC),
+                            (headers::SGX_PCK_CERTIFICATE_CA_TYPE, "platform"),
+                            (headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN, "mirror-chain"),
+                        ] {
+                            resp.headers_mut().insert(name, value.parse().unwrap());
+                        }
+                        resp
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut cfg = cfg_empty();
+        cfg.uri = format!("http://{addr}/sgx/certification/v4/");
+        cfg.cache_mode = CacheMode::Lazy;
+        let state = pccs_rs::app_state(cfg);
+        let cache = state.cache.clone();
+        let router = pccs_rs::create_app(state);
+        let first_path = initial_ppid
+            .as_ref()
+            .map(|ppid| format!("{}&encrypted_ppid={ppid}", migration_pck_path(PCK_CPUSVN)))
+            .unwrap_or_else(|| migration_pck_path(PCK_CPUSVN));
+        let lower = "11".repeat(16);
+        let higher = "33".repeat(16);
+        for (path, expected_cert, expected_tcbm) in [
+            (first_path, PCK_PEM.to_string(), format!("{PCK_CPUSVN}{PCK_PCESVN}")),
+            (
+                format!("{}&encrypted_ppid={}", migration_pck_path(&lower), "F".repeat(768)),
+                migration_pck_with_cpu(0x11),
+                format!("{lower}{PCK_PCESVN}"),
+            ),
+            (migration_pck_path(&higher), PCK_PEM.to_string(), format!("{PCK_CPUSVN}{PCK_PCESVN}")),
+        ] {
+            let (status, h, body) = send(router.clone(), get(&path)).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(body.as_ref(), expected_cert.as_bytes());
+            assert_eq!(h.get(headers::SGX_TCBM).unwrap(), expected_tcbm.as_str());
+            assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), PCK_FMSPC);
+            assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(), "PLATFORM");
+            assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(), "mirror-chain");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert!(cache
+            .store
+            .get_tcb(0, PCK_FMSPC, 4, pccs_rs::validate::UpdateType::Standard)
+            .is_none());
+        let pool = cache.store.get_platform_pool("AA", PCK_PCEID).unwrap();
+        assert_eq!(pool.certs.len(), 2, "single-cert fetch must retain full inventory");
+        assert_eq!(pool.raw_tcbs.len(), 3);
+        assert_eq!(pool.enc_ppid, initial_ppid.clone().unwrap_or_default());
+        assert!(pool.platform_manifest.is_empty());
+        let rows = migration_platform_rows(&router).await;
+        assert_eq!(rows.as_array().unwrap().len(), 3);
+        for cpu in [PCK_CPUSVN, &lower, &higher] {
+            let rec = cache.store.get_pckcert("AA", cpu, PCK_PCESVN, PCK_PCEID).unwrap();
+            assert_eq!(rec.encrypted_ppid, initial_ppid);
+            assert!(rec.platform_manifest.is_empty());
+            assert!(rows.as_array().unwrap().iter().any(|row| {
+                row["cpu_svn"] == cpu
+                    && row["enc_ppid"] == initial_ppid.clone().unwrap_or_default()
+                    && row["platform_manifest"] == ""
+            }));
+            let (status, _, _) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3, "all raw GETs are tracked cache hits");
+        server.abort();
+    }
+}
+
+// Intent: regression / Intel parity. A previous unknown GET failure is an
+// upstream negative-cache entry, not a ban on local selection after a valid
+// Manifest POST. Use the SAME raw key immediately, with no TTL sleeps.
+#[tokio::test]
+async fn migration_manifest_post_bypasses_prior_unknown_get_failure() {
+    for credential in [None, Some("0".repeat(768))] {
+        let pool = Arc::new(RwLock::new(MigrationPool::default()));
+        let (uri, server) = spawn_migration_intel(pool.clone()).await;
+        let mut cfg = cfg_empty();
+        cfg.uri = uri;
+        cfg.cache_mode = CacheMode::Lazy;
+        let mut state = pccs_rs::app_state(cfg);
+        Arc::get_mut(&mut state.cache).unwrap().is_intel = true;
+        let router = pccs_rs::create_app(state);
+        let path = migration_pck_path(PCK_CPUSVN);
+        let first = credential
+            .as_ref()
+            .map(|ppid| format!("{path}&encrypted_ppid={ppid}"))
+            .unwrap_or_else(|| path.clone());
+        let (status, _, _) = send(router.clone(), get(&first)).await;
+        assert_eq!(
+            status,
+            if credential.is_none() { StatusCode::BAD_REQUEST } else { StatusCode::NOT_FOUND }
+        );
+        let (status, _, body) = send(
+            router.clone(),
+            post_user(
+                "/sgx/certification/v4/platforms",
+                json!({
+                    "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(migration_platform_rows(&router).await, json!([]));
+        let calls = pool.read().await.requests.load(Ordering::Relaxed);
+        let (status, h, body) = send(router.clone(), get(&path)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "known local selection must bypass old upstream error: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+        assert_eq!(h.get(headers::SGX_TCBM).unwrap(), format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str());
+        assert_eq!(
+            h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
+            "migration-pck-chain"
+        );
+        assert_eq!(pool.read().await.requests.load(Ordering::Relaxed), calls);
+        let rows = migration_platform_rows(&router).await;
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["cpu_svn"], PCK_CPUSVN);
+        assert_eq!(rows[0]["platform_manifest"], "ABCD");
+        server.abort();
+    }
+}
+
+// Intent: regression / invariant, plan invariant 7. Refresh replaces all
+// tracked selections, or fails without publishing an incompatible pool.
+#[tokio::test]
+async fn migration_refresh_reselects_or_retains_coherent_old_pool() {
+    let pool = Arc::new(RwLock::new(MigrationPool::default()));
+    let (uri, server) = spawn_migration_intel(pool.clone()).await;
+    let mut cfg = cfg_empty();
+    cfg.uri = uri;
+    cfg.cache_mode = CacheMode::Lazy;
+    let router = app_cfg(cfg.clone());
+    let (status, _, _) = send(
+        router.clone(),
+        post_user(
+            "/sgx/certification/v4/platforms",
+            json!({
+                "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let higher = "33".repeat(16);
+    for cpu in [PCK_CPUSVN, &higher] {
+        let (status, _, body) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+    }
+    assert_eq!(migration_platform_rows(&router).await.as_array().unwrap().len(), 2);
+    // The new pool has distinct response bytes, mapping and issuer chain.
+    let fresh_cert = format!("{PCK_PEM}\n");
+    let fresh_tcbm = format!("{}3333", "11".repeat(16));
+    {
+        let mut p = pool.write().await;
+        p.cert = fresh_cert.clone();
+        p.tcbm = fresh_tcbm.clone();
+        p.chain = "fresh-pck-chain".into();
+    }
+    let refresh = format!("/sgx/certification/v4/refresh?type=certs&fmspc={PCK_FMSPC}");
+    let (status, _, body) = send(router.clone(), get_admin(&refresh)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    for cpu in [PCK_CPUSVN, &higher] {
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), fresh_cert.as_bytes());
+        assert_eq!(h.get(headers::SGX_TCBM).unwrap(), fresh_tcbm.as_str());
+        assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(), "fresh-pck-chain");
+    }
+    let before = migration_platform_rows(&router).await;
+    {
+        let mut p = pool.write().await;
+        // Valid transport shape, but a cert selection cannot parse.
+        p.cert = "not an X.509 certificate".into();
+        p.tcbm = format!("{}3333", "44".repeat(16));
+        p.chain = "rejected-pck-chain".into();
+    }
+    let (status, _, body) = send(router.clone(), get_admin(&refresh)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "failed re-selection must fail refresh");
+    assert_eq!(body.as_ref(), b"No cache data for this platform.");
+    assert_eq!(
+        migration_platform_rows(&router).await,
+        before,
+        "failed refresh preserves tracked raw levels"
+    );
+    // Cached responses AND selection for a previously unseen raw TCB must use
+    // the retained pool. Merely retaining old success keys is insufficient.
+    pool.write().await.fail = true;
+    let unseen = "44".repeat(16);
+    for cpu in [PCK_CPUSVN, &higher, &unseen] {
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body.as_ref(), fresh_cert.as_bytes());
+        assert_eq!(h.get(headers::SGX_TCBM).unwrap(), fresh_tcbm.as_str());
+        assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(), "fresh-pck-chain");
+        assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), PCK_FMSPC);
+    }
+    drop(router);
+    let reopened = app_cfg(cfg);
+    let (status, h, body) = send(reopened, get(&migration_pck_path(PCK_CPUSVN))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), fresh_cert.as_bytes());
+    assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(), "fresh-pck-chain");
+    server.abort();
+}
+
+/// Synthetic SGX cert with distinct component/octets CPUSVN. The existing
+/// fixture is intentionally not cryptographically trusted; selection parses
+/// these executable extension values, not the pool's tcbm label.
+fn migration_pck_with_cpu(svn: u8) -> String {
+    use base64::Engine;
+    let body: String = PCK_PEM.lines().filter(|line| !line.starts_with("-----")).collect();
+    let mut der = base64::engine::general_purpose::STANDARD.decode(body).unwrap();
+    for component in 1..=16 {
+        let needle = [
+            0x06, 0x0B, 0x2A, 0x86, 0x48, 0x86, 0xF8, 0x4D, 0x01, 0x0D, 0x01, 0x02, component,
+            0x02, 0x01, 0x22,
+        ];
+        let offset = der.windows(needle.len()).position(|w| w == needle).unwrap();
+        der[offset + needle.len() - 1] = svn;
+    }
+    let mut octets = vec![0x04, 0x10];
+    octets.extend([0x22; 16]);
+    let offset = der.windows(octets.len()).position(|w| w == octets).unwrap();
+    der[offset + 2..offset + 18].fill(svn);
+    format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        base64::engine::general_purpose::STANDARD.encode(der)
+    )
+}
+
+fn migration_pck_with_ppid(cert: &str, ppid_byte: u8) -> String {
+    use base64::Engine;
+    let body: String = cert.lines().filter(|line| !line.starts_with("-----")).collect();
+    let mut der = base64::engine::general_purpose::STANDARD.decode(body).unwrap();
+    let mut needle = vec![0x04, 0x10];
+    needle.extend([0x11; 16]);
+    let offset = der.windows(needle.len()).position(|w| w == needle).unwrap();
+    der[offset + 2..offset + 18].fill(ppid_byte);
+    format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        base64::engine::general_purpose::STANDARD.encode(der)
+    )
+}
+
+// Intent: regression / migration safety. A PCCS single-cert refresh response is not
+// a complete pool response: retain all existing certs/raw mappings while
+// atomically merging selected refresh results and retaining all raw mappings.
+#[tokio::test]
+async fn migration_pccs_single_cert_refresh_preserves_pool_inventory() {
+    let lower_cert = migration_pck_with_cpu(0x11);
+    let fetched_cert = migration_pck_with_cpu(0x0E);
+    let original_response = json!({ "cert": fetched_cert,
+        "chain": "merged-pck-chain", "fmspc": PCK_FMSPC, "ca": "platform" });
+    let response = Arc::new(RwLock::new(original_response.clone()));
+    let reply = response.clone();
+    let fail = Arc::new(AtomicBool::new(false));
+    let failing = fail.clone();
+    let block_second = Arc::new(AtomicBool::new(false));
+    let blocking = block_second.clone();
+    let blocked = Arc::new(tokio::sync::Notify::new());
+    let blocked_mock = blocked.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_mock = release.clone();
+    let upstream = axum::Router::new().route(
+        "/sgx/certification/v4/pckcert",
+        axum::routing::get(
+            move |axum::extract::Query(q): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| {
+                let reply = reply.clone();
+                let fail = failing.clone();
+                let blocking = blocking.clone();
+                let blocked = blocked_mock.clone();
+                let release = release_mock.clone();
+                async move {
+                    if fail.load(Ordering::Relaxed)
+                        || q.get("encrypted_ppid") != Some(&"E".repeat(768))
+                    {
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                    let cpu = u8::from_str_radix(&q["cpusvn"][..2], 16).unwrap();
+                    if cpu == 0x33 && blocking.swap(false, Ordering::Relaxed) {
+                        blocked.notify_one();
+                        release.notified().await;
+                    }
+                    let p = reply.read().await;
+                    // The mirror's current selected cert is a new lower level;
+                    // a single selected response is not a full-pool deletion.
+                    let (cert, tcbm) =
+                        (p["cert"].as_str().unwrap(), format!("{}3333", "0E".repeat(16)));
+                    let mut resp = cert.to_string().into_response();
+                    resp.headers_mut().insert(headers::SGX_TCBM, tcbm.parse().unwrap());
+                    resp.headers_mut()
+                        .insert(headers::SGX_FMSPC, p["fmspc"].as_str().unwrap().parse().unwrap());
+                    resp.headers_mut().insert(
+                        headers::SGX_PCK_CERTIFICATE_CA_TYPE,
+                        p["ca"].as_str().unwrap().parse().unwrap(),
+                    );
+                    resp.headers_mut().insert(
+                        headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                        p["chain"].as_str().unwrap().parse().unwrap(),
+                    );
+                    resp
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let mut cfg = cfg_empty();
+    cfg.uri = format!("http://{addr}/sgx/certification/v4/");
+    cfg.cache_mode = CacheMode::Lazy;
+    let state = pccs_rs::app_state(cfg);
+    state
+        .cache
+        .store
+        .put_platform_pool(&pccs_rs::store::PlatformPool {
+            qe_id: "AA".into(),
+            pce_id: PCK_PCEID.into(),
+            enc_ppid: "E".repeat(768),
+            fmspc: PCK_FMSPC.into(),
+            ca: "PLATFORM".into(),
+            issuer_chain: "migration-pck-chain".into(),
+            certs: vec![
+                pccs_rs::store::PlatformCert {
+                    tcbm: format!("{PCK_CPUSVN}{PCK_PCESVN}"),
+                    cert: PCK_PEM.into(),
+                },
+                pccs_rs::store::PlatformCert {
+                    tcbm: format!("{}3333", "11".repeat(16)),
+                    cert: lower_cert.clone(),
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+    let tcb = json!({"tcbInfo": pck_tcb_info(), "signature": "synthetic"});
+    state
+        .cache
+        .store
+        .put_tcb(&pccs_rs::store::TcbRecord {
+            prod_type: 0,
+            fmspc: PCK_FMSPC.into(),
+            version: 4,
+            update_type: "STANDARD".into(),
+            raw_body: tcb.to_string(),
+            tcbinfo: tcb,
+            issuer_chain: "migration-tcb-chain".into(),
+        })
+        .unwrap();
+    let router = pccs_rs::create_app(state);
+    let higher = "33".repeat(16);
+    for cpu in [PCK_CPUSVN, &higher] {
+        let (status, _, body) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+    }
+    let before = migration_platform_rows(&router).await;
+    assert_eq!(before.as_array().unwrap().len(), 2);
+    let refresh_path = format!("/sgx/certification/v4/refresh?type=certs&fmspc={PCK_FMSPC}");
+    // Local selection handles these GETs; explicit refresh tests invalid
+    // responses retain the full pool, raw inventory and selected GET metadata.
+    for (field, bad) in [
+        ("fmspc", "FFFFFFFFFFFF".to_string()),
+        ("ca", "processor".to_string()),
+        ("cert", migration_pck_with_ppid(&fetched_cert, 0x77)),
+        ("cert", "opaque malformed cert".to_string()),
+    ] {
+        let mut candidate = original_response.clone();
+        candidate[field] = json!(bad);
+        *response.write().await = candidate;
+        let (status, _, body) = send(router.clone(), get_admin(&refresh_path)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "reject incompatible {field}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), b"No cache data for this platform.");
+        assert_eq!(migration_platform_rows(&router).await, before);
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(PCK_CPUSVN))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+        assert_eq!(
+            h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
+            "migration-pck-chain"
+        );
+    }
+    *response.write().await = original_response;
+    let (status, _, body) = send(router.clone(), get_admin(&refresh_path)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    for cpu in [PCK_CPUSVN, &higher] {
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), fetched_cert.as_bytes());
+        assert_eq!(h.get(headers::SGX_TCBM).unwrap(), format!("{}3333", "0E".repeat(16)).as_str());
+    }
+    let after = migration_platform_rows(&router).await;
+    assert_eq!(
+        after.as_array().unwrap().len(),
+        2,
+        "single-cert refresh retains both old raw mappings"
+    );
+    for row in before.as_array().unwrap() {
+        assert!(after.as_array().unwrap().contains(row));
+    }
+    fail.store(true, Ordering::Relaxed);
+    // Previously unselected certificates remain available for new raw TCBS,
+    // proving full pool inventory, not merely old GET keys, was retained.
+    for (cpu, expected) in [("11".repeat(16), lower_cert), ("23".repeat(16), PCK_PEM.into())] {
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(&cpu))).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body.as_ref(), expected.as_bytes());
+        assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), PCK_FMSPC);
+        assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(), "merged-pck-chain");
+    }
+    for cpu in [PCK_CPUSVN, &higher] {
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), fetched_cert.as_bytes());
+        assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(), "merged-pck-chain");
+    }
+    // Deterministic external-boundary gate: after refreshing raw 22, pause
+    // raw 33 upstream. Both select the SAME tcbm, so raw 33 must already have
+    // the renewed body/header atomically, not wait for its own network fetch.
+    let renewed = format!("{fetched_cert}\n");
+    {
+        let mut p = response.write().await;
+        p["cert"] = json!(renewed);
+        p["chain"] = json!("renewed-pck-chain");
+    }
+    fail.store(false, Ordering::Relaxed);
+    block_second.store(true, Ordering::Relaxed);
+    let r = router.clone();
+    let refresh = tokio::spawn(async move {
+        send(r, get_admin(&format!("/sgx/certification/v4/refresh?type=certs&fmspc={PCK_FMSPC}")))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), blocked.notified()).await.unwrap();
+    let (status, h, body) = send(router.clone(), get(&migration_pck_path(&higher))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), renewed.as_bytes());
+    assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(), "renewed-pck-chain");
+    release.notify_one();
+    let (status, _, body) = refresh.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    server.abort();
+}
+
+// Intent: regression / invariant. A failed certificate refresh must retain
+// shared TCB collateral as well as the old pool/GET keys, so an unseen raw TCB
+// can still select locally. Explicit cert refresh uses EARLY ephemerally and
+// must not require the unrelated STANDARD endpoint to be available.
+#[tokio::test]
+async fn migration_cert_refresh_preserves_shared_tcb_on_selection_failure() {
+    let pool = Arc::new(RwLock::new(MigrationPool::default()));
+    let (uri, server) = spawn_migration_intel(pool.clone()).await;
+    let mut cfg = cfg_empty();
+    cfg.uri = uri;
+    cfg.cache_mode = CacheMode::Lazy;
+    let router = app_cfg(cfg);
+    let (status, _, _) = send(
+        router.clone(),
+        post_user(
+            "/sgx/certification/v4/platforms",
+            json!({
+                "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, old_cert) = send(router.clone(), get(&migration_pck_path(PCK_CPUSVN))).await;
+    assert_eq!(status, StatusCode::OK);
+    let tcb_path = format!("/sgx/certification/v4/tcb?fmspc={PCK_FMSPC}");
+    let (status, _, old_standard) = send(router.clone(), get(&tcb_path)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, old_early) =
+        send(router.clone(), get(&format!("{tcb_path}&update=early"))).await;
+    assert_eq!(status, StatusCode::OK);
+    pool.write().await.tcb_pceid = "5555".into();
+    let refresh = format!("/sgx/certification/v4/refresh?type=certs&fmspc={PCK_FMSPC}");
+    let (status, _, body) = send(router.clone(), get_admin(&refresh)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body.as_ref(), b"No cache data for this platform.");
+    for (path, expected) in
+        [(tcb_path.clone(), old_standard), (format!("{tcb_path}&update=early"), old_early)]
+    {
+        let (status, _, body) = send(router.clone(), get(&path)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, expected, "failed cert refresh must not poison shared TCB collateral");
+    }
+    pool.write().await.fail = true;
+    let unseen = "33".repeat(16);
+    let (status, h, body) = send(router.clone(), get(&migration_pck_path(&unseen))).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body, old_cert);
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str());
+    {
+        let mut p = pool.write().await;
+        p.fail = false;
+        p.tcb_pceid = PCK_PCEID.into();
+        p.standard_available = false;
+        p.cert = format!("{PCK_PEM}\n");
+        p.chain = "early-only-refresh-chain".into();
+    }
+    let (status, _, body) = send(router.clone(), get_admin(&refresh)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "cert refresh must not depend on STANDARD: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, h, body) = send(router, get(&migration_pck_path(&unseen))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), format!("{PCK_PEM}\n").as_bytes());
+    assert_eq!(
+        h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
+        "early-only-refresh-chain"
+    );
+    server.abort();
+}
+
+// Intent: regression / Intel parity. TDX is collateral forwarding, not the
+// SGX PCK selection algorithm: an integer type1 must retain its original body
+// while actual PCK selection continues to use the separate SGX type0 document.
+#[tokio::test]
+async fn migration_tdx_nonzero_type_is_forwarded_without_sgx_selection() {
+    let pool = Arc::new(RwLock::new(MigrationPool { tdx_type: 1, ..Default::default() }));
+    let (uri, server) = spawn_migration_intel(pool.clone()).await;
+    let mut cfg = cfg_empty();
+    cfg.uri = uri;
+    cfg.cache_mode = CacheMode::Lazy;
+    let router = app_cfg(cfg);
+    let (status, _, body) = send(
+        router.clone(),
+        post_user(
+            "/sgx/certification/v4/platforms",
+            json!({
+                "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "TDX integer type1 is not SGX selection: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(migration_platform_rows(&router).await, json!([]));
+    let calls = pool.read().await.requests.load(Ordering::Relaxed);
+    let mut info = pck_tcb_info();
+    info["id"] = json!("TDX");
+    info["tcbType"] = json!(1);
+    info["tcbLevels"][0]["tcb"]["tdxtcbcomponents"] =
+        json!((0..16).map(|_| json!({"svn": 0})).collect::<Vec<_>>());
+    let expected = json!({"tcbInfo": info, "signature": "synthetic"}).to_string();
+    for update in ["early", "standard"] {
+        let (status, h, body) = send(
+            router.clone(),
+            get(&format!("/tdx/certification/v4/tcb?fmspc={PCK_FMSPC}&update={update}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), expected.as_bytes(), "TDX raw bytes retain nonzero type");
+        assert_eq!(h.get(headers::TCB_INFO_ISSUER_CHAIN).unwrap(), "migration-tcb-chain");
+    }
+    let (status, h, body) = send(router, get(&migration_pck_path(PCK_CPUSVN))).await;
+    assert_eq!(status, StatusCode::OK, "actual PCK selection still uses SGX type0");
+    assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str());
+    assert_eq!(pool.read().await.requests.load(Ordering::Relaxed), calls);
+    server.abort();
+}
+
+// Intent: regression / invariant. Manifest-only registration has no requested
+// or tracked raw TCB. Validate every staged document anyway: a bad STANDARD
+// must not hide behind valid EARLY, nor may bad TDX shared metadata poison a
+// same-FMSPC platform's served collateral or later local selection.
+#[tokio::test]
+async fn migration_manifest_registration_validates_all_staged_tcb_documents() {
+    for bad_source in ["sgx_early", "sgx_standard", "tdx"] {
+        let pool = Arc::new(RwLock::new(MigrationPool::default()));
+        let (uri, server) = spawn_migration_intel(pool.clone()).await;
+        let mut cfg = cfg_empty();
+        cfg.uri = uri;
+        cfg.cache_mode = CacheMode::Lazy;
+        let mut state = pccs_rs::app_state(cfg);
+        Arc::get_mut(&mut state.cache).unwrap().is_intel = true;
+        let router = pccs_rs::create_app(state);
+        let (status, _, _) = send(
+            router.clone(),
+            post_user(
+                "/sgx/certification/v4/platforms",
+                json!({
+                    "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "valid SGX and TDX type-0 documents accepted");
+        assert_eq!(migration_platform_rows(&router).await, json!([]), "no invented raw TCB");
+        let (status, _, old_cert) =
+            send(router.clone(), get(&migration_pck_path(PCK_CPUSVN))).await;
+        assert_eq!(status, StatusCode::OK);
+        let old_rows = migration_platform_rows(&router).await;
+        let mut saved = Vec::new();
+        for prod in ["sgx", "tdx"] {
+            for update in ["early", "standard"] {
+                let path =
+                    format!("/{prod}/certification/v4/tcb?fmspc={PCK_FMSPC}&update={update}");
+                let (status, _, body) = send(router.clone(), get(&path)).await;
+                assert_eq!(status, StatusCode::OK);
+                let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(doc["tcbInfo"]["id"], if prod == "sgx" { "SGX" } else { "TDX" });
+                saved.push((path, body));
+            }
+        }
+        {
+            let mut p = pool.write().await;
+            match bad_source {
+                "sgx_early" => {
+                    p.tcb_pceid = "5555".into();
+                    p.standard_pceid = Some(PCK_PCEID.into());
+                    p.tdx_pceid = Some(PCK_PCEID.into());
+                }
+                "sgx_standard" => p.standard_pceid = Some("5555".into()),
+                "tdx" => p.tdx_pceid = Some("5555".into()),
+                _ => unreachable!(),
+            }
+            p.tcb_signature = "must-not-publish".into();
+        }
+        let (status, _, body) = send(
+            router.clone(),
+            post_user(
+                "/sgx/certification/v4/platforms",
+                json!({
+                    "qe_id": "BB", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "new no-raw platform must reject {bad_source}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), b"No cache data for this platform.");
+        assert_eq!(migration_platform_rows(&router).await, old_rows);
+        for (path, expected) in saved {
+            let (status, _, body) = send(router.clone(), get(&path)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, expected, "rejected registration must preserve {path}");
+        }
+        pool.write().await.fail = true;
+        let unseen = "33".repeat(16);
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(&unseen))).await;
+        assert_eq!(status, StatusCode::OK, "same-FMSPC platform remains locally selectable");
+        assert_eq!(body, old_cert);
+        assert_eq!(h.get(headers::SGX_TCBM).unwrap(), format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str());
+        let unknown = migration_pck_path(PCK_CPUSVN).replace("qeid=AA", "qeid=BB");
+        let (status, _, body) = send(router, get(&unknown)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "rejected registration must not leave a platform pool"
+        );
+        assert_eq!(body.as_ref(), b"Invalid request parameters.");
+        server.abort();
+    }
+}
+
+// Intent: regression / invariant. Two unknown GETs for different raw keys may
+// publish in either order when the actual fetch credentials agree. Different
+// credentials still make the late response stale. Gate only external HTTP.
+#[tokio::test]
+async fn migration_parallel_unknown_gets_check_actual_fetch_credentials() {
+    for intel in [false, true] {
+        for same_credentials in [true, false] {
+            let blocked = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let calls = Arc::new(AtomicU64::new(0));
+            let response = {
+                let blocked = blocked.clone();
+                let release = release.clone();
+                let calls = calls.clone();
+                move |q: std::collections::HashMap<String, String>| {
+                    let blocked = blocked.clone();
+                    let release = release.clone();
+                    let calls = calls.clone();
+                    async move {
+                        assert_eq!(q["pceid"], PCK_PCEID);
+                        let late = calls.fetch_add(1, Ordering::Relaxed) == 0;
+                        assert_eq!(
+                            q["encrypted_ppid"],
+                            if late || same_credentials {
+                                "E".repeat(768)
+                            } else {
+                                "F".repeat(768)
+                            }
+                        );
+                        if late {
+                            blocked.notify_one();
+                            release.notified().await;
+                        }
+                        let tcbm = format!("{PCK_CPUSVN}{PCK_PCESVN}");
+                        let mut resp = if intel {
+                            axum::Json(json!([{"tcbm": tcbm, "cert": PCK_PEM}])).into_response()
+                        } else {
+                            PCK_PEM.into_response()
+                        };
+                        for (name, value) in [
+                            (headers::SGX_TCBM, tcbm.as_str()),
+                            (headers::SGX_FMSPC, PCK_FMSPC),
+                            (headers::SGX_PCK_CERTIFICATE_CA_TYPE, "platform"),
+                            (
+                                headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                                if late { "late-chain" } else { "published-chain" },
+                            ),
+                        ] {
+                            resp.headers_mut().insert(name, value.parse().unwrap());
+                        }
+                        resp
+                    }
+                }
+            };
+            let upstream = axum::Router::new()
+                .route(
+                    if intel {
+                        "/sgx/certification/v4/pckcerts"
+                    } else {
+                        "/sgx/certification/v4/pckcert"
+                    },
+                    axum::routing::get(move |axum::extract::Query(q)| response(q)),
+                )
+                .route(
+                    "/sgx/certification/v4/tcb",
+                    axum::routing::get(
+                        |axum::extract::Query(q): axum::extract::Query<
+                            std::collections::HashMap<String, String>,
+                        >| async move {
+                            migration_tcb_response(&MigrationPool::default(), &q["update"], 0)
+                        },
+                    ),
+                )
+                .route(
+                    "/tdx/certification/v4/tcb",
+                    axum::routing::get(
+                        |axum::extract::Query(q): axum::extract::Query<
+                            std::collections::HashMap<String, String>,
+                        >| async move {
+                            migration_tcb_response(&MigrationPool::default(), &q["update"], 1)
+                        },
+                    ),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server =
+                tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+            let mut cfg = cfg_empty();
+            cfg.uri = format!("http://{addr}/sgx/certification/v4/");
+            cfg.cache_mode = CacheMode::Lazy;
+            let mut state = pccs_rs::app_state(cfg);
+            Arc::get_mut(&mut state.cache).unwrap().is_intel = intel;
+            let cache = state.cache.clone();
+            let router = pccs_rs::create_app(state);
+            let late_cpu = "33".repeat(16);
+            let r = router.clone();
+            let late_path =
+                format!("{}&encrypted_ppid={}", migration_pck_path(&late_cpu), "E".repeat(768));
+            let pending = tokio::spawn(async move { send(r, get(&late_path)).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), blocked.notified())
+                .await
+                .unwrap();
+            let published_ppid = if same_credentials { "E".repeat(768) } else { "F".repeat(768) };
+            let (status, _, body) = send(
+                router.clone(),
+                get(&format!("{}&encrypted_ppid={published_ppid}", migration_pck_path(PCK_CPUSVN))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+            let published_rows = migration_platform_rows(&router).await;
+            assert_eq!(published_rows.as_array().unwrap().len(), 1);
+            release.notify_one();
+            let (status, _, body) = pending.await.unwrap();
+            assert_eq!(
+                status,
+                if same_credentials { StatusCode::OK } else { StatusCode::NOT_FOUND },
+                "intel={intel}, same_credentials={same_credentials}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                body.as_ref(),
+                if same_credentials {
+                    PCK_PEM.as_bytes()
+                } else {
+                    b"No cache data for this platform."
+                }
+            );
+            let rows = migration_platform_rows(&router).await;
+            if !same_credentials {
+                assert_eq!(rows, published_rows, "late result must not mutate published platform");
+                assert!(cache.store.get_pckcert("AA", &late_cpu, PCK_PCESVN, PCK_PCEID).is_none());
+            }
+            assert_eq!(rows.as_array().unwrap().len(), if same_credentials { 2 } else { 1 });
+            for cpu in if same_credentials { vec![PCK_CPUSVN, &late_cpu] } else { vec![PCK_CPUSVN] }
+            {
+                let (status, h, body) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+                assert_eq!(
+                    h.get(headers::SGX_TCBM).unwrap(),
+                    format!("{PCK_CPUSVN}{PCK_PCESVN}").as_str()
+                );
+                assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), PCK_FMSPC);
+                assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_CA_TYPE).unwrap(), "PLATFORM");
+                assert_eq!(
+                    h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
+                    if same_credentials { "late-chain" } else { "published-chain" }
+                );
+                let rec = cache.store.get_pckcert("AA", cpu, PCK_PCESVN, PCK_PCEID).unwrap();
+                assert_eq!(rec.encrypted_ppid.as_deref(), Some(published_ppid.as_str()));
+                assert!(rec.platform_manifest.is_empty());
+            }
+            assert_eq!(calls.load(Ordering::Relaxed), 2, "both successful raw keys remain tracked");
+            server.abort();
+        }
+    }
+}
+
+// Intent: regression / migration safety. A pool response fetched under M0
+// must not overwrite a concurrent successful registration's M1 credentials.
+// Exercise explicit Manifest/PPID refresh, an UNKNOWN client-credential GET,
+// and a POST racing an identical-Manifest POST (which keeps the strict guard).
+// Block only external requests, with no known-platform GET refills.
+#[tokio::test]
+async fn migration_stale_manifest_fetch_cannot_overwrite_new_registration() {
+    for (mode, trigger) in [
+        (CacheMode::Req, "refresh"),
+        (CacheMode::Lazy, "unknown"),
+        (CacheMode::Req, "mirror_refresh"),
+        (CacheMode::Req, "raw_addition"),
+        (CacheMode::Lazy, "same_manifest_post"),
+    ] {
+        let arm = Arc::new(AtomicBool::new(false));
+        let armed = arm.clone();
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let blocked_mock = blocked.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_mock = release.clone();
+        let mirror_arm = arm.clone();
+        let mirror_blocked = blocked.clone();
+        let mirror_release = release.clone();
+        let upstream = axum::Router::new()
+            .route(
+                "/sgx/certification/v4/pckcerts",
+                axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                    let arm = armed.clone();
+                    let blocked = blocked_mock.clone();
+                    let release = release_mock.clone();
+                    async move {
+                        let manifest = payload["platformManifest"].as_str().unwrap();
+                        assert_eq!(payload["pceid"], PCK_PCEID);
+                        assert!(["ABCD", "BCDE"].contains(&manifest));
+                        let old_pending = manifest == "ABCD" && arm.swap(false, Ordering::Relaxed);
+                        if old_pending {
+                            blocked.notify_one();
+                            release.notified().await;
+                        }
+                        let (cert, tcbm, chain) = if old_pending {
+                            (
+                                migration_pck_with_cpu(0x11),
+                                format!("{}3333", "11".repeat(16)),
+                                "old-M0-chain",
+                            )
+                        } else if manifest == "BCDE" {
+                            (
+                                format!("{PCK_PEM}\n"),
+                                format!("{PCK_CPUSVN}{PCK_PCESVN}"),
+                                "new-M1-chain",
+                            )
+                        } else {
+                            (
+                                PCK_PEM.into(),
+                                format!("{PCK_CPUSVN}{PCK_PCESVN}"),
+                                "initial-M0-chain",
+                            )
+                        };
+                        let mut resp =
+                            axum::Json(json!([{"tcbm": tcbm, "cert": cert}])).into_response();
+                        resp.headers_mut().insert(headers::SGX_FMSPC, PCK_FMSPC.parse().unwrap());
+                        resp.headers_mut().insert(
+                            headers::SGX_PCK_CERTIFICATE_CA_TYPE,
+                            "platform".parse().unwrap(),
+                        );
+                        resp.headers_mut().insert(
+                            headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                            chain.parse().unwrap(),
+                        );
+                        resp
+                    }
+                }),
+            )
+            .route(
+                "/sgx/certification/v4/pckcert",
+                axum::routing::get(
+                    move |axum::extract::Query(q): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| {
+                        let arm = mirror_arm.clone();
+                        let blocked = mirror_blocked.clone();
+                        let release = mirror_release.clone();
+                        async move {
+                            assert_eq!(q["encrypted_ppid"], "E".repeat(768));
+                            let pending = arm.swap(false, Ordering::Relaxed);
+                            if pending {
+                                blocked.notify_one();
+                                release.notified().await;
+                            }
+                            let (cert, tcbm, chain) = if pending {
+                                (
+                                    migration_pck_with_cpu(0x11),
+                                    format!("{}3333", "11".repeat(16)),
+                                    "old-mirror-chain",
+                                )
+                            } else {
+                                (
+                                    PCK_PEM.into(),
+                                    format!("{PCK_CPUSVN}{PCK_PCESVN}"),
+                                    "initial-M0-chain",
+                                )
+                            };
+                            let mut resp = cert.into_response();
+                            resp.headers_mut().insert(headers::SGX_TCBM, tcbm.parse().unwrap());
+                            resp.headers_mut()
+                                .insert(headers::SGX_FMSPC, PCK_FMSPC.parse().unwrap());
+                            resp.headers_mut().insert(
+                                headers::SGX_PCK_CERTIFICATE_CA_TYPE,
+                                "platform".parse().unwrap(),
+                            );
+                            resp.headers_mut().insert(
+                                headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                                chain.parse().unwrap(),
+                            );
+                            resp
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/sgx/certification/v4/tcb",
+                axum::routing::get(
+                    |axum::extract::Query(q): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        migration_tcb_response(&MigrationPool::default(), &q["update"], 0)
+                    },
+                ),
+            )
+            .route(
+                "/tdx/certification/v4/tcb",
+                axum::routing::get(
+                    |axum::extract::Query(q): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        migration_tcb_response(&MigrationPool::default(), &q["update"], 1)
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut cfg = cfg_empty();
+        cfg.uri = format!("http://{addr}/sgx/certification/v4/");
+        cfg.cache_mode = mode;
+        let router = app_cfg(cfg);
+        let registration = |manifest| {
+            post_user(
+                "/sgx/certification/v4/platforms",
+                json!({
+                    "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": manifest
+                }),
+            )
+        };
+        let initial = if trigger == "mirror_refresh" {
+            post_user(
+                "/sgx/certification/v4/platforms",
+                json!({"qe_id": "AA", "pce_id": PCK_PCEID,
+                "cpu_svn": PCK_CPUSVN, "pce_svn": PCK_PCESVN, "enc_ppid": "E".repeat(768)}),
+            )
+        } else {
+            registration("ABCD")
+        };
+        if !["unknown", "same_manifest_post"].contains(&trigger) {
+            let (status, _, _) = send(router.clone(), initial).await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _, body) =
+                send(router.clone(), get(&migration_pck_path(PCK_CPUSVN))).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+        }
+        arm.store(true, Ordering::Relaxed);
+        let r = router.clone();
+        let pending = tokio::spawn(async move {
+            let req = if trigger == "unknown" {
+                get(&format!(
+                    "{}&encrypted_ppid={}",
+                    migration_pck_path(&"11".repeat(16)),
+                    "E".repeat(768)
+                ))
+            } else if trigger == "same_manifest_post" {
+                post_user(
+                    "/sgx/certification/v4/platforms",
+                    json!({"qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"}),
+                )
+            } else {
+                get_admin(&format!("/sgx/certification/v4/refresh?type=certs&fmspc={PCK_FMSPC}"))
+            };
+            send(r, req).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), blocked.notified()).await.unwrap();
+        if trigger == "raw_addition" {
+            // A pool/raw change with identical credentials is NOT a stale
+            // fetch. Include the new level by re-reading raws under the lock.
+            let added = "33".repeat(16);
+            let (status, _, _) = send(router.clone(), get(&migration_pck_path(&added))).await;
+            assert_eq!(status, StatusCode::OK);
+            release.notify_one();
+            let (status, _, body) = pending.await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "raw additions must not reject refresh: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let rows = migration_platform_rows(&router).await;
+            assert_eq!(rows.as_array().unwrap().len(), 2);
+            for cpu in [PCK_CPUSVN, &added] {
+                let (status, h, body) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body.as_ref(), migration_pck_with_cpu(0x11).as_bytes());
+                assert_eq!(
+                    h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
+                    "old-M0-chain"
+                );
+            }
+            server.abort();
+            continue;
+        }
+        let next_manifest = if trigger == "same_manifest_post" { "ABCD" } else { "BCDE" };
+        let (status, _, body) = send(router.clone(), registration(next_manifest)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "concurrent M1 registration must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let rows_m1 = migration_platform_rows(&router).await;
+        if ["unknown", "same_manifest_post"].contains(&trigger) {
+            assert_eq!(rows_m1, json!([]), "new Manifest registration invents no raw mapping");
+        } else {
+            assert_eq!(rows_m1.as_array().unwrap().len(), 1);
+            assert_eq!(rows_m1[0]["platform_manifest"], "BCDE");
+        }
+        let (status, _, body) =
+            send(router.clone(), get_admin("/sgx/certification/v4/platforms?source=reg")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!([]),
+            "successful REQ registration drains NEW"
+        );
+        release.notify_one();
+        let (status, _, body) = pending.await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "stale {trigger} result must be rejected, not publish M0: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body.as_ref(), b"No cache data for this platform.");
+        assert_eq!(
+            migration_platform_rows(&router).await,
+            rows_m1,
+            "M1 credentials and tracked mappings survive stale response"
+        );
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(PCK_CPUSVN))).await;
+        assert_eq!(status, StatusCode::OK);
+        let expected_cert = if trigger == "same_manifest_post" {
+            PCK_PEM.to_string()
+        } else {
+            format!("{PCK_PEM}\n")
+        };
+        assert_eq!(body.as_ref(), expected_cert.as_bytes());
+        assert_eq!(
+            h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
+            if trigger == "same_manifest_post" { "initial-M0-chain" } else { "new-M1-chain" }
+        );
+        let (status, _, body) =
+            send(router, get_admin("/sgx/certification/v4/platforms?source=reg")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), json!([]));
+        server.abort();
+    }
+}
+
+// Intent: regression / invariant. Authenticated Manifest updates stage fetched
+// TCB records; document validation or tracked selection failure leaves shared
+// TCB bytes, old selections and the old pool unchanged. No GET refill.
+#[tokio::test]
+async fn migration_failed_registration_does_not_publish_fetched_tcb() {
+    let pool = Arc::new(RwLock::new(MigrationPool::default()));
+    let (uri, server) = spawn_migration_intel(pool.clone()).await;
+    let mut cfg = cfg_empty();
+    cfg.uri = uri;
+    cfg.cache_mode = CacheMode::Lazy;
+    let router = app_cfg(cfg);
+    let (status, _, _) = send(
+        router.clone(),
+        post_user(
+            "/sgx/certification/v4/platforms",
+            json!({
+                "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, old_cert) = send(router.clone(), get(&migration_pck_path(PCK_CPUSVN))).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = migration_platform_rows(&router).await;
+    let tcb_path = format!("/sgx/certification/v4/tcb?fmspc={PCK_FMSPC}");
+    let (status, _, old_tcb) = send(router.clone(), get(&tcb_path)).await;
+    assert_eq!(status, StatusCode::OK);
+    // Request a new Manifest. A bad document fails validation; a valid doc
+    // with a cert above the tracked raw TCB fails re-selection before commit.
+    for pceid in ["5555", PCK_PCEID] {
+        {
+            let mut p = pool.write().await;
+            p.tcb_pceid = pceid.into();
+            p.tcb_signature = "must-not-publish".into();
+            p.cert = if pceid == PCK_PCEID {
+                migration_pck_with_cpu(0x33)
+            } else {
+                format!("{PCK_PEM}\n")
+            };
+        }
+        let (status, _, body) = send(
+            router.clone(),
+            post_user(
+                "/sgx/certification/v4/platforms",
+                json!({
+                    "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "BCDE"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.as_ref(), b"No cache data for this platform.");
+        for update in ["standard", "early"] {
+            let (status, _, body) =
+                send(router.clone(), get(&format!("{tcb_path}&update={update}"))).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, old_tcb, "failed registration must not publish staged {update} TCB");
+        }
+        assert_eq!(migration_platform_rows(&router).await, rows);
+    }
+    pool.write().await.fail = true;
+    let unseen = "33".repeat(16);
+    for cpu in [PCK_CPUSVN, &unseen] {
+        let (status, h, body) = send(router.clone(), get(&migration_pck_path(cpu))).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body, old_cert);
+        assert_eq!(
+            h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(),
+            "migration-pck-chain"
+        );
+    }
+    server.abort();
+}
+
+// Intent: regression / invariant, plan invariant 7. Manifest registration with
+// unavailable levels invents no raw mapping. A later known-platform GET is
+// local selection and MUST track its GET, so cert refresh can update it.
+#[tokio::test]
+async fn migration_not_available_fill_cannot_leave_stale_untracked_get() {
+    let pool = Arc::new(RwLock::new(MigrationPool { not_available: true, ..Default::default() }));
+    let (uri, server) = spawn_migration_intel(pool.clone()).await;
+    let mut cfg = cfg_empty();
+    cfg.uri = uri;
+    cfg.cache_mode = CacheMode::Lazy;
+    let router = app_cfg(cfg);
+    let (status, _, body) = send(
+        router.clone(),
+        post_user(
+            "/sgx/certification/v4/platforms",
+            json!({
+                "qe_id": "AA", "pce_id": PCK_PCEID, "platform_manifest": "ABCD"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(migration_platform_rows(&router).await, json!([]));
+    let path = migration_pck_path(PCK_CPUSVN);
+    let (status, h, body) = send(router.clone(), get(&path)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), PCK_PEM.as_bytes());
+    assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(), "migration-pck-chain");
+    assert_eq!(
+        migration_platform_rows(&router).await.as_array().unwrap().len(),
+        1,
+        "local selection tracks the new raw key despite prior unavailable levels"
+    );
+    let fresh_cert = format!("{PCK_PEM}\n");
+    let fresh_tcbm = format!("{}3333", "55".repeat(16));
+    {
+        let mut p = pool.write().await;
+        p.not_available = false;
+        p.cert = fresh_cert.clone();
+        p.tcbm = fresh_tcbm.clone();
+        p.chain = "available-pck-chain".into();
+    }
+    let refresh = format!("/sgx/certification/v4/refresh?type=certs&fmspc={PCK_FMSPC}");
+    let (status, _, body) = send(router.clone(), get_admin(&refresh)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    pool.write().await.fail = true;
+    let (status, h, body) = send(router.clone(), get(&path)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.as_ref(),
+        fresh_cert.as_bytes(),
+        "tracked local GET must update with the refreshed pool"
+    );
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), fresh_tcbm.as_str());
+    assert_eq!(h.get(headers::SGX_FMSPC).unwrap(), PCK_FMSPC);
+    assert_eq!(h.get(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN).unwrap(), "available-pck-chain");
+    let rows = migration_platform_rows(&router).await;
+    assert_eq!(
+        rows.as_array().unwrap().len(),
+        1,
+        "local selection is tracked for subsequent refreshes"
+    );
+    assert_eq!(rows[0]["cpu_svn"], PCK_CPUSVN);
+    assert_eq!(rows[0]["pce_svn"], PCK_PCESVN);
+    server.abort();
+}
+
+// Intent: regression / target behavior. Intel refresh probes the v4 identity
+// set even when records were absent; a missing identity is tolerated, and v3
+// is never fetched. Exact bodies remain cached after the boundary stops serving.
+#[tokio::test]
+async fn migration_refresh_populates_missing_v4_identities() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let mut upstream = axum::Router::new();
+    for (path, id) in [
+        ("/sgx/certification/v4/qe/identity", "QE"),
+        ("/sgx/certification/v4/qve/identity", "QVE"),
+        ("/tdx/certification/v4/qe/identity", "TD_QE"),
+    ] {
+        let fail = fail.clone();
+        upstream = upstream.route(path, axum::routing::get(move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| {
+            let fail = fail.clone();
+            async move {
+                let update = q.get("update").unwrap();
+                if fail.load(Ordering::Relaxed) || (id == "QVE" && update == "early") {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                let body = format!("{{\n  \"signature\":\"{update}\",\n  \"enclaveIdentity\":{{\"id\":\"{id}\"}}\n}}\n");
+                let mut resp = body.into_response();
+                resp.headers_mut().insert(headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN, "refresh-identity-chain".parse().unwrap());
+                resp
+            }
+        }));
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let mut cfg = cfg_empty();
+    cfg.uri = format!("http://{addr}/sgx/certification/v4/");
+    cfg.cache_mode = CacheMode::Lazy;
+    let router = app_cfg(cfg);
+    let (status, _, body) = send(router.clone(), get_admin("/sgx/certification/v4/refresh")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "missing QVE EARLY must not abort refresh: {}",
+        String::from_utf8_lossy(&body)
+    );
+    fail.store(true, Ordering::Relaxed);
+    for (path, id) in [
+        ("/sgx/certification/v4/qe/identity", "QE"),
+        ("/sgx/certification/v4/qve/identity", "QVE"),
+        ("/tdx/certification/v4/qe/identity", "TD_QE"),
+    ] {
+        for update in ["standard", "early"] {
+            let (status, h, body) =
+                send(router.clone(), get(&format!("{path}?update={update}"))).await;
+            if id == "QVE" && update == "early" {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(body.as_ref(), b"No cache data for this platform.");
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{id}/{update}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                let expected = format!("{{\n  \"signature\":\"{update}\",\n  \"enclaveIdentity\":{{\"id\":\"{id}\"}}\n}}\n");
+                assert_eq!(body.as_ref(), expected.as_bytes());
+                assert_eq!(
+                    h.get(headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN).unwrap(),
+                    "refresh-identity-chain"
+                );
+            }
+        }
+    }
+    let (status, _, _) = send(router, get("/sgx/certification/v3/qe/identity")).await;
+    assert_eq!(status, StatusCode::GONE);
+    server.abort();
+}
+
+// Intent: regression / invariant, plan invariant 8. Production defaults must
+// not discover development fixtures; an explicit bad path fails closed, while
+// --no-seed overrides even an explicit path.
+#[tokio::test]
+async fn migration_startup_seeding_is_explicit_and_missing_seed_fails() {
+    assert!(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/seed.json").exists(),
+        "fixture discovery regression requires the real development fixture to exist"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let cfg =
+        Config { db_path: dir.path().join("default"), uri: String::new(), ..Config::default() };
+    assert!(cfg.seed.is_none());
+    assert!(!cfg.no_seed);
+    let router = app_cfg(cfg);
+    let (status, _, body) = send(router, get(TCB)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "normal startup must not implicitly seed fixtures");
+    assert_eq!(body.as_ref(), b"No cache data for this platform.");
+
+    let missing = dir.path().join("missing-seed.json");
+    let cfg = Config {
+        db_path: dir.path().join("missing"),
+        uri: String::new(),
+        seed: Some(missing.clone()),
+        ..Config::default()
+    };
+    let result = pccs_rs::cache::build_cache(&cfg);
+    assert!(result.is_err(), "explicit missing seed must fail, never fall back to fixtures");
+    assert!(result.err().unwrap().contains("missing-seed.json"));
+
+    let disabled = Config { db_path: dir.path().join("disabled"), no_seed: true, ..cfg };
+    let router = app_cfg(disabled);
+    let (status, _, body) = send(router, get(TCB)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body.as_ref(), b"No cache data for this platform.");
+}
+
 /// A structurally valid JWS-like appraisal policy (Node parses segment[1] as
 /// base64url JSON and reads `policy_payload.policy_array[].environment.class_id`).
 fn jws_policy(class_id: &str, marker: &str) -> String {

@@ -37,4 +37,4 @@ ENV PCCS_HOST=0.0.0.0 \
     PCCS_PORT=8081 \
     PCCS_DB_PATH=/var/lib/pccs-rs
 ENTRYPOINT ["/usr/bin/pccs-rs"]
-CMD ["serve"]
+CMD ["serve", "--no-seed"]
