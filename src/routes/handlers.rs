@@ -5,7 +5,8 @@ use crate::error::{self, PccsError, PccsJson};
 use crate::headers;
 use crate::store::RegisteredPlatform;
 use crate::validate::{self, PlatformsSource};
-use axum::extract::{FromRequestParts, OriginalUri, Request, State};
+use axum::body::Bytes;
+use axum::extract::{FromRequest, FromRequestParts, OriginalUri, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
@@ -95,6 +96,25 @@ pub async fn get_nvidia_rim(
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, PccsError> {
     Ok(amd_response(state.cache.get_nvidia_rim(&original_path_and_query(&uri)).await?))
+}
+
+// --------------- NVIDIA OCSP ---------------
+
+pub async fn post_nvidia_ocsp(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Response, PccsError> {
+    let content_type =
+        req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let media = content_type.split(';').next().unwrap_or("").trim();
+    if !media.eq_ignore_ascii_case("application/ocsp-request") {
+        return Err(error::INVALID_REQ);
+    }
+    let body = Bytes::from_request(req, &state).await.map_err(|_| error::INVALID_REQ)?;
+    if body.is_empty() {
+        return Err(error::INVALID_REQ);
+    }
+    Ok(amd_response(state.cache.get_nvidia_ocsp(&body).await?))
 }
 
 // --------------- NVIDIA NRAS (GPU attestation) ---------------

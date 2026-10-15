@@ -13,6 +13,7 @@ pub mod headers;
 pub mod health;
 pub mod intel_import;
 pub mod keys;
+pub mod ocsp;
 pub mod pcs;
 pub mod routes;
 pub mod selection;
@@ -52,6 +53,7 @@ pub fn create_app(state: AppState) -> Router {
         .nest("/sgx/certification/v3", sgx_v3)
         .merge(routes::amd_kds_router())
         .merge(routes::nvidia_rim_router())
+        .merge(routes::nvidia_ocsp_router())
         .nest("/nvidia/nras", routes::nvidia_nras_router());
     if pcs_ver == 4 {
         app = app

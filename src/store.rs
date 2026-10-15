@@ -74,6 +74,15 @@ pub struct AmdKdsRecord {
     pub fetched_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NvidiaOcspRecord {
+    pub cache_key: String,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub fetched_at: u64,
+    pub expires_at: u64,
+}
+
 /// `GET /platforms?source=[fmspc]` row. Node's SQL selects exactly these six
 /// columns — `fmspc` and `ca` are filter/join columns and are not returned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -827,6 +836,19 @@ impl Store {
 
     pub fn put_nvidia_rim(&self, rec: &AmdKdsRecord) -> Result<(), PccsError> {
         self.put_json(&keys::nvidia_rim(&rec.url), rec)
+    }
+
+    pub fn get_nvidia_ocsp(&self, cache_key: &str) -> Option<NvidiaOcspRecord> {
+        let rec: NvidiaOcspRecord = self.get_json(&keys::nvidia_ocsp(cache_key))?;
+        if rec.cache_key != cache_key {
+            tracing::warn!("nvidia ocsp record does not match its key; treating as a miss");
+            return None;
+        }
+        Some(rec)
+    }
+
+    pub fn put_nvidia_ocsp(&self, rec: &NvidiaOcspRecord) -> Result<(), PccsError> {
+        self.put_json(&keys::nvidia_ocsp(&rec.cache_key), rec)
     }
 
     // ---------- registration queue ----------
