@@ -942,10 +942,8 @@ mod tests {
     #[tokio::test]
     async fn post_json_once_does_not_apply_intel_v3_eol() {
         use axum::routing::post;
-        let app = axum::Router::new().route(
-            "/v3/attest/gpu",
-            post(|| async { (StatusCode::OK, "token") }),
-        );
+        let app = axum::Router::new()
+            .route("/v3/attest/gpu", post(|| async { (StatusCode::OK, "token") }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -953,10 +951,7 @@ mod tests {
         });
         let client = client_for(&format!("http://{addr}/"));
         let (status, _, body) = client
-            .post_json_once(
-                &format!("http://{addr}/v3/attest/gpu"),
-                br#"{"nonce":"aa"}"#,
-            )
+            .post_json_once(&format!("http://{addr}/v3/attest/gpu"), br#"{"nonce":"aa"}"#)
             .await
             .unwrap();
         assert_eq!(status, 200);
