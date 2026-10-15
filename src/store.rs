@@ -123,6 +123,14 @@ pub struct PlatformCredentials {
     platform_manifest: String,
 }
 
+/// Publication guard. Only an unknown GET may accept a platform created while
+/// it was fetching, and only when that platform has the actual request creds.
+/// Registration and refresh retain the strict observed-context comparison.
+pub(crate) enum PlatformPublication<'a> {
+    Observed(Option<&'a PlatformCredentials>),
+    AbsentGet { enc_ppid: &'a str, platform_manifest: &'a str },
+}
+
 impl PlatformPool {
     pub fn credentials(&self) -> PlatformCredentials {
         PlatformCredentials {
@@ -364,6 +372,26 @@ impl Store {
         expected: Option<&PlatformCredentials>,
         tcbs: &[TcbRecord],
         selected: Option<&PckCertRecord>,
+        select: F,
+    ) -> Result<(), PccsError>
+    where
+        F: FnMut(&PlatformPool, &RawTcb) -> Result<PckCertRecord, PccsError>,
+    {
+        self.replace_platform_certs_after_fetch(
+            fresh,
+            PlatformPublication::Observed(expected),
+            tcbs,
+            selected,
+            select,
+        )
+    }
+
+    pub(crate) fn replace_platform_certs_after_fetch<F>(
+        &self,
+        fresh: &PlatformPool,
+        publication: PlatformPublication<'_>,
+        tcbs: &[TcbRecord],
+        selected: Option<&PckCertRecord>,
         mut select: F,
     ) -> Result<(), PccsError>
     where
@@ -371,7 +399,7 @@ impl Store {
     {
         let _guard = self.platform_lock.lock().unwrap_or_else(|e| e.into_inner());
         let current = self.get_platform_pool(&fresh.qe_id, &fresh.pce_id);
-        Self::check_platform_context(current.as_ref(), expected)?;
+        Self::check_platform_publication(current.as_ref(), publication)?;
         let mut merged = fresh.clone();
         merged.raw_tcbs = current.map(|p| p.raw_tcbs).unwrap_or_default();
         let mut batch = WriteBatch::default();
@@ -422,9 +450,18 @@ impl Store {
         rec: &PckCertRecord,
         expected: Option<&PlatformCredentials>,
     ) -> Result<(), PccsError> {
+        self.merge_pckcert_after_fetch(rec, PlatformPublication::Observed(expected))
+    }
+
+    pub(crate) fn merge_pckcert_after_fetch(
+        &self,
+        rec: &PckCertRecord,
+        publication: PlatformPublication<'_>,
+    ) -> Result<(), PccsError> {
         let _guard = self.platform_lock.lock().unwrap_or_else(|e| e.into_inner());
         let current = self.get_platform_pool(&rec.qeid, &rec.pceid);
-        Self::check_platform_context(current.as_ref(), expected)?;
+        Self::check_platform_publication(current.as_ref(), publication)?;
+        let new_platform = current.is_none();
         let mut pool = current.unwrap_or_else(|| PlatformPool {
             qe_id: rec.qeid.clone(),
             pce_id: rec.pceid.clone(),
@@ -466,10 +503,10 @@ impl Store {
         pool.fmspc = rec.fmspc.clone();
         pool.ca = rec.ca.to_ascii_uppercase();
         pool.issuer_chain = rec.issuer_chain.clone();
-        if let Some(ppid) = &rec.encrypted_ppid {
-            pool.enc_ppid = ppid.clone();
-        }
-        if !rec.platform_manifest.is_empty() {
+        // A known PCCS upstream ignores the caller's PPID. Its response
+        // therefore cannot authenticate a replacement for retained credentials.
+        if new_platform {
+            pool.enc_ppid = rec.encrypted_ppid.clone().unwrap_or_default();
             pool.platform_manifest = rec.platform_manifest.clone();
         }
         let cert = PlatformCert { tcbm: rec.tcbm.clone(), cert: rec.cert.clone() };
@@ -506,7 +543,11 @@ impl Store {
             Some(existing) => *existing = raw,
             None => pool.raw_tcbs.push(raw),
         }
-        Self::batch_pckcert(&mut batch, rec)?;
+        let mut selected = rec.clone();
+        selected.encrypted_ppid =
+            if pool.enc_ppid.is_empty() { None } else { Some(pool.enc_ppid.clone()) };
+        selected.platform_manifest = pool.platform_manifest.clone();
+        Self::batch_pckcert(&mut batch, &selected)?;
         batch.put(
             keys::platform(&pool.qe_id, &pool.pce_id).as_bytes(),
             serde_json::to_vec(&pool).map_err(|_| error::INTERNAL_ERROR)?,
@@ -515,13 +556,24 @@ impl Store {
     }
 
     /// Called only under platform_lock, before publication. Raw additions are
-    /// deliberately not part of this comparison; None is an absent platform,
-    /// not an existing platform whose two credential strings happen to be empty.
-    fn check_platform_context(
+    /// not credential changes. Observed(None) remains strict for POST/refresh;
+    /// AbsentGet additionally accepts a same-credential concurrent GET fill.
+    fn check_platform_publication(
         current: Option<&PlatformPool>,
-        expected: Option<&PlatformCredentials>,
+        publication: PlatformPublication<'_>,
     ) -> Result<(), PccsError> {
-        if current.map(PlatformPool::credentials).as_ref() != expected {
+        let matches = match publication {
+            PlatformPublication::Observed(expected) => {
+                current.map(PlatformPool::credentials).as_ref() == expected
+            }
+            PlatformPublication::AbsentGet { enc_ppid, platform_manifest } => {
+                current.is_none_or(|pool| {
+                    pool.enc_ppid.eq_ignore_ascii_case(enc_ppid)
+                        && pool.platform_manifest == platform_manifest
+                })
+            }
+        };
+        if !matches {
             tracing::warn!("Rejecting PCK response fetched under stale platform credentials");
             return Err(error::NO_CACHE_DATA);
         }
