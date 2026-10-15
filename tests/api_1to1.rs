@@ -3556,6 +3556,194 @@ async fn nvidia_rim_accepts_dotted_driver_ids() {
     let _ = std::fs::remove_dir_all(db_path);
 }
 
+fn ocsp_der(tag: u8, value: &[u8]) -> Vec<u8> {
+    let mut result = vec![tag];
+    if value.len() < 128 {
+        result.push(value.len() as u8);
+    } else {
+        let bytes = value.len().to_be_bytes();
+        let first = bytes.iter().position(|byte| *byte != 0).unwrap();
+        result.push(0x80 | (bytes.len() - first) as u8);
+        result.extend_from_slice(&bytes[first..]);
+    }
+    result.extend_from_slice(value);
+    result
+}
+
+fn ocsp_sequence(parts: &[Vec<u8>]) -> Vec<u8> {
+    ocsp_der(0x30, &parts.concat())
+}
+
+fn sample_ocsp_request(nonce: u8) -> Vec<u8> {
+    let algorithm = ocsp_sequence(&[ocsp_der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a])]);
+    let cert_id = ocsp_sequence(&[
+        algorithm,
+        ocsp_der(0x04, &[1; 20]),
+        ocsp_der(0x04, &[2; 20]),
+        ocsp_der(0x02, &[3]),
+    ]);
+    let request = ocsp_sequence(&[cert_id]);
+    let list = ocsp_sequence(&[request]);
+    let extensions = ocsp_der(0xa2, &ocsp_sequence(&[ocsp_der(0x04, &[nonce; 16])]));
+    ocsp_sequence(&[ocsp_sequence(&[list, extensions])])
+}
+
+fn sample_ocsp_response(this_update: &str, next_update: Option<&str>) -> Vec<u8> {
+    let cert_id = ocsp_sequence(&[ocsp_der(0x02, &[1])]);
+    let mut single = vec![cert_id, ocsp_der(0x80, &[]), ocsp_der(0x18, this_update.as_bytes())];
+    if let Some(next_update) = next_update {
+        single.push(ocsp_der(0xa0, &ocsp_der(0x18, next_update.as_bytes())));
+    }
+    let responses = ocsp_sequence(&[ocsp_sequence(&single)]);
+    let response_data =
+        ocsp_sequence(&[ocsp_der(0x82, &[7; 20]), ocsp_der(0x18, b"20260716120000Z"), responses]);
+    let basic = ocsp_sequence(&[
+        response_data,
+        ocsp_sequence(&[ocsp_der(0x06, &[0x2a, 0x03])]),
+        ocsp_der(0x03, &[0]),
+    ]);
+    let response_bytes = ocsp_sequence(&[
+        ocsp_der(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01]),
+        ocsp_der(0x04, &basic),
+    ]);
+    ocsp_sequence(&[ocsp_der(0x0a, &[0]), ocsp_der(0xa0, &response_bytes)])
+}
+
+fn ocsp_post(body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/ocsp")
+        .header("content-type", "application/ocsp-request")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_is_cached_by_cert_id_ignoring_nonce() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    // Far-future nextUpdate so the cached entry stays fresh for the test.
+    let body = sample_ocsp_response("20200101120000Z", Some("20990102120000Z"));
+    let upstream_app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |req_body: bytes::Bytes| {
+            let calls = mock_calls.clone();
+            let body = body.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert!(!req_body.is_empty());
+                (StatusCode::OK, [("content-type", "application/ocsp-response")], body)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-ocsp-cache-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_ocsp_uri: format!("http://{addr}"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    let (status, headers, resp) = send(app.clone(), ocsp_post(sample_ocsp_request(1))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("content-type").unwrap(), "application/ocsp-response");
+    assert!(!resp.is_empty());
+
+    let (status, _, resp2) = send(app.clone(), ocsp_post(sample_ocsp_request(2))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp, resp2);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "nonce-only differences must share one cache entry"
+    );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_rejects_wrong_content_type() {
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_ocsp_uri: "http://127.0.0.1:9".into(),
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ocsp")
+        .header("content-type", "application/json")
+        .body(Body::from(sample_ocsp_request(1)))
+        .unwrap();
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_transport_failure_is_a_bad_gateway() {
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-ocsp-transport-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_ocsp_uri: "http://127.0.0.1:9".into(),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, _, body) = send(app.clone(), ocsp_post(sample_ocsp_request(1))).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "Unable to retrieve the OCSP response from the NVIDIA OCSP service.");
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_offline_never_calls_upstream() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |_: bytes::Bytes| {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-ocsp-offline-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_ocsp_uri: format!("http://{addr}"),
+        cache_mode: pccs_rs::config::CacheMode::Offline,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(1))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
 #[tokio::test]
 async fn every_documented_route_is_registered() {
     let routes: &[(&str, &str)] = &[
@@ -3593,6 +3781,7 @@ async fn every_documented_route_is_registered() {
         ("GET", "/vcek/v1/Genoa/crl"),
         ("GET", "/vlek/v1/Genoa/cert_chain"),
         ("GET", "/v1/rim/some-id"),
+        ("POST", "/ocsp"),
         ("POST", "/nvidia/nras/attest/gpu"),
     ];
 

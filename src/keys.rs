@@ -23,6 +23,7 @@ pub const ROOTCACRL: &str = "rootcacrl";
 pub const CRL: &str = "crl/";
 pub const AMD_KDS: &str = "amd-kds/";
 pub const NVIDIA_RIM: &str = "nvidia-rim/";
+pub const NVIDIA_OCSP: &str = "nvidia-ocsp/";
 pub const APPRAISAL: &str = "appraisal/";
 pub const PREG: &str = "preg/";
 /// Per-platform PCK cert pool + known raw TCBs (Intel `platforms` +
@@ -67,6 +68,10 @@ pub fn amd_kds(url: &str) -> String {
 
 pub fn nvidia_rim(url: &str) -> String {
     format!("{NVIDIA_RIM}{}", hash128_hex(url.as_bytes()))
+}
+
+pub fn nvidia_ocsp(cache_key: &str) -> String {
+    format!("{NVIDIA_OCSP}{cache_key}")
 }
 
 pub fn appraisal(fmspc: &str) -> String {

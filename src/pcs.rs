@@ -134,14 +134,17 @@ impl PcsClient {
         let amd_kds_uri = cfg.amd_kds_uri.trim();
         let nvidia_rim_uri = cfg.nvidia_rim_uri.trim();
         let nvidia_nras_uri = cfg.nvidia_nras_uri.trim();
+        let nvidia_ocsp_uri = cfg.nvidia_ocsp_uri.trim();
         let https = uri.starts_with("https://")
             || amd_kds_uri.starts_with("https://")
             || nvidia_rim_uri.starts_with("https://")
             || nvidia_nras_uri.starts_with("https://")
+            || nvidia_ocsp_uri.starts_with("https://")
             || (uri.is_empty()
                 && amd_kds_uri.is_empty()
                 && nvidia_rim_uri.is_empty()
-                && nvidia_nras_uri.is_empty());
+                && nvidia_nras_uri.is_empty()
+                && nvidia_ocsp_uri.is_empty());
         let client = if https {
             http_conn.enforce_http(false);
             let https_conn = hyper_rustls::HttpsConnectorBuilder::new()
@@ -218,6 +221,37 @@ impl PcsClient {
         let uri: Uri = url.parse().map_err(|_| error::INTERNAL_ERROR)?;
         let req = Request::post(uri)
             .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::copy_from_slice(body)))
+            .map_err(|_| error::INTERNAL_ERROR)?;
+        let _permit = match self.permits.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return Err(error::INTERNAL_ERROR),
+        };
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.attempt(req)).await {
+            Err(_) => {
+                tracing::warn!("upstream request {} timed out", redact_url(url));
+                Err(error::PCS_ACCESS_FAILURE)
+            }
+            Ok(Err(e)) => Err(e),
+            Ok(Ok(v)) => {
+                tracing::info!("upstream request {} -> {}", redact_url(url), v.0);
+                Ok(v)
+            }
+        }
+    }
+
+    /// One binary POST through the pooled client. Used by NVIDIA OCSP: no Intel
+    /// `/v3/` gate, no API key, no 429/503 retry.
+    pub async fn post_bytes_once(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let uri: Uri = url.parse().map_err(|_| error::INTERNAL_ERROR)?;
+        let req = Request::post(uri)
+            .header(hyper::header::CONTENT_TYPE, content_type)
             .body(Full::new(Bytes::copy_from_slice(body)))
             .map_err(|_| error::INTERNAL_ERROR)?;
         let _permit = match self.permits.clone().acquire_owned().await {
@@ -940,6 +974,20 @@ mod tests {
             amd_kds_uri: String::new(),
             nvidia_rim_uri: String::new(),
             nvidia_nras_uri: "  https://nras.example  ".into(),
+            ..Config::default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        assert!(matches!(client.client, AnyClient::Https(_)));
+    }
+
+    #[test]
+    fn nvidia_ocsp_scheme_ignores_surrounding_whitespace() {
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: String::new(),
+            nvidia_rim_uri: String::new(),
+            nvidia_nras_uri: String::new(),
+            nvidia_ocsp_uri: "  https://ocsp.example  ".into(),
             ..Config::default()
         };
         let client = PcsClient::new(&cfg).unwrap();

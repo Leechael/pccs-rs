@@ -380,6 +380,13 @@ fn warn_on_self_upstream(cfg: &Config, addr: SocketAddr) {
         "nvidia_rim_uri host",
         "Set nvidia_rim_uri to the NVIDIA RIM service.",
     );
+    warn_if_uri_is_self(
+        cfg,
+        addr,
+        &cfg.nvidia_ocsp_uri,
+        "nvidia_ocsp_uri host",
+        "Set nvidia_ocsp_uri to the NVIDIA OCSP responder.",
+    );
 }
 
 fn warn_if_uri_is_self(cfg: &Config, addr: SocketAddr, uri: &str, label: &str, advice: &str) {
@@ -526,6 +533,10 @@ mod tests {
         cfg.nvidia_rim_uri = "http://127.0.0.1:8081/v1/rim".into();
         warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
         assert_eq!(log_count(&logs, self_upstream), before + 3);
+        cfg.nvidia_rim_uri = String::new();
+        cfg.nvidia_ocsp_uri = "http://127.0.0.1:8081/ocsp".into();
+        warn_on_self_upstream(&cfg, "127.0.0.1:8081".parse().unwrap());
+        assert_eq!(log_count(&logs, self_upstream), before + 4);
     }
 
     #[tokio::test]

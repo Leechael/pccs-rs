@@ -24,6 +24,9 @@ db_path = "/var/lib/pccs-rs"
 # nvidia_rim_uri = "https://rim.attestation.nvidia.com"
 # nvidia_rim_cache_ttl_seconds = 2592000 # 30 days
 # nvidia_nras_uri = "https://nras.attestation.nvidia.com"
+# nvidia_ocsp_uri = "https://ocsp.ndis.nvidia.com"
+# nvidia_ocsp_max_ttl_seconds = 86400 # 24 hours
+# nvidia_ocsp_default_ttl_seconds = 3600 # 1 hour
 # proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
 # user_token_hash = ""
