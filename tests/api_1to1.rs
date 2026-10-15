@@ -2345,10 +2345,7 @@ async fn nvidia_rim_is_cached_by_its_full_url() {
             let calls = mock_calls.clone();
             async move {
                 calls.fetch_add(1, Ordering::Relaxed);
-                (
-                    [("content-type", "application/json")],
-                    format!("rim {}", uri.path()),
-                )
+                ([("content-type", "application/json")], format!("rim {}", uri.path()))
             }
         }),
     );
@@ -2395,10 +2392,7 @@ async fn nvidia_rim_transport_failure_is_a_bad_gateway() {
 
     let (status, _, body) = send(app.clone(), get("/v1/rim/some-id")).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(
-        body,
-        "Unable to retrieve the collateral from the NVIDIA RIM service."
-    );
+    assert_eq!(body, "Unable to retrieve the collateral from the NVIDIA RIM service.");
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);
@@ -2454,11 +2448,7 @@ async fn nvidia_rim_error_response_is_relayed_and_not_cached() {
             let calls = mock_calls.clone();
             async move {
                 calls.fetch_add(1, Ordering::Relaxed);
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [("retry-after", "10")],
-                    "slow down",
-                )
+                (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "10")], "slow down")
             }
         }),
     );
@@ -2502,21 +2492,11 @@ fn nras_post(body: impl Into<Body>) -> Request<Body> {
 
 fn assert_nras_cors(headers: &axum::http::HeaderMap) {
     assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
-    let methods = headers
-        .get("access-control-allow-methods")
-        .unwrap()
-        .to_str()
-        .unwrap();
+    let methods = headers.get("access-control-allow-methods").unwrap().to_str().unwrap();
     assert!(methods.contains("POST"), "{methods}");
     assert!(methods.contains("OPTIONS"), "{methods}");
-    assert_eq!(
-        headers.get("access-control-allow-headers").unwrap(),
-        "Content-Type"
-    );
-    assert_eq!(
-        headers.get("access-control-expose-headers").unwrap(),
-        "Retry-After"
-    );
+    assert_eq!(headers.get("access-control-allow-headers").unwrap(), "Content-Type");
+    assert_eq!(headers.get("access-control-expose-headers").unwrap(), "Retry-After");
     assert_eq!(headers.get("cache-control").unwrap(), "no-store");
 }
 
@@ -2577,11 +2557,7 @@ async fn nvidia_nras_proxies_json_and_is_not_cached() {
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
         assert_nras_cors(&headers);
     }
-    assert_eq!(
-        calls.load(Ordering::Relaxed),
-        2,
-        "must not persist NRAS results"
-    );
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "must not persist NRAS results");
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);
@@ -2600,12 +2576,7 @@ async fn nvidia_nras_options_preflight_is_cors() {
         let (status, h, _) = send(app(), req).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_nras_cors(&h);
-        let id = h
-            .get(headers::REQUEST_ID)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
+        let id = h.get(headers::REQUEST_ID).unwrap().to_str().unwrap().to_string();
         assert_ne!(id, "client-supplied-id");
         assert!(!id.is_empty());
         ids.push(id);
@@ -2615,11 +2586,8 @@ async fn nvidia_nras_options_preflight_is_cors() {
 
 #[tokio::test]
 async fn nvidia_nras_prefix_does_not_match_nras_extra() {
-    let req = Request::builder()
-        .method("OPTIONS")
-        .uri("/nvidia/nras-extra")
-        .body(Body::empty())
-        .unwrap();
+    let req =
+        Request::builder().method("OPTIONS").uri("/nvidia/nras-extra").body(Body::empty()).unwrap();
     let (status, headers, _) = send(app(), req).await;
     assert_ne!(status, StatusCode::NO_CONTENT);
     assert!(headers.get("access-control-allow-origin").is_none());
@@ -2666,11 +2634,7 @@ async fn nvidia_nras_forwards_retry_after() {
     assert_eq!(headers.get("retry-after").unwrap(), "11");
     assert_eq!(body, "{}");
     assert_nras_cors(&headers);
-    assert_eq!(
-        calls.load(Ordering::Relaxed),
-        1,
-        "NRAS must not inherit Intel 429 retries"
-    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "NRAS must not inherit Intel 429 retries");
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);
@@ -2713,10 +2677,7 @@ async fn nvidia_nras_transport_failure_is_a_bad_gateway_with_cors() {
     let app = create_app_from_config(cfg);
     let (status, headers, body) = send(app.clone(), nras_post(json!({}).to_string())).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(
-        body,
-        "Unable to retrieve the attestation result from the NVIDIA NRAS."
-    );
+    assert_eq!(body, "Unable to retrieve the attestation result from the NVIDIA NRAS.");
     assert_nras_cors(&headers);
 
     drop(app);
@@ -4294,9 +4255,7 @@ async fn nvidia_nras_stalled_body_is_408_with_cors() {
         .method("POST")
         .uri("/nvidia/nras/attest/gpu")
         .header("content-type", "application/json")
-        .body(Body::new(StalledBody(Some(bytes::Bytes::from_static(
-            b"{",
-        )))))
+        .body(Body::new(StalledBody(Some(bytes::Bytes::from_static(b"{")))))
         .unwrap();
     let (status, headers, _) = send(router, req).await;
     assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
