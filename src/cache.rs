@@ -172,11 +172,7 @@ fn canonicalize_query(query: Option<&str>, allowed: &[&str]) -> Result<String, P
         return Ok(String::new());
     }
     seen.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let encoded = seen
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
+    let encoded = seen.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
     Ok(format!("?{encoded}"))
 }
 
@@ -207,8 +203,7 @@ fn is_rim_id(s: &str) -> bool {
     if s.is_empty() || s == "." || s == ".." {
         return false;
     }
-    s.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
 fn canonicalize_nvidia_rim(path_and_query: &str) -> Result<String, PccsError> {
@@ -442,11 +437,7 @@ impl Cache {
         }
 
         self.store.record_upstream();
-        let fetched = self
-            .pcs
-            .get_url(&url)
-            .await
-            .map_err(|_| access_failure.clone());
+        let fetched = self.pcs.get_url(&url).await.map_err(|_| access_failure.clone());
         let (status, headers, body) = self.note(&key, fetched).await?;
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
@@ -464,15 +455,9 @@ impl Cache {
             return self.note(&key, Err(access_failure)).await;
         }
         if status != 200 {
-            let rec = AmdKdsResponse {
-                status,
-                body,
-                content_type,
-                content_disposition,
-                retry_after,
-            };
-            self.remember(&key, RecentOutcome::Response(rec.clone()))
-                .await;
+            let rec =
+                AmdKdsResponse { status, body, content_type, content_disposition, retry_after };
+            self.remember(&key, RecentOutcome::Response(rec.clone())).await;
             return Ok(rec);
         }
         let rec =
@@ -1403,10 +1388,7 @@ mod tests {
             &canonicalize_amd_kds("/vcek/v1/Genoa/cert_chain?junk=1").unwrap_err(),
             &error::INVALID_REQ,
         );
-        assert_err(
-            &canonicalize_amd_kds("/vcek/v1/../../x").unwrap_err(),
-            &error::INVALID_REQ,
-        );
+        assert_err(&canonicalize_amd_kds("/vcek/v1/../../x").unwrap_err(), &error::INVALID_REQ);
         assert_err(
             &canonicalize_amd_kds("/vcek/v3/Genoa/cert_chain").unwrap_err(),
             &error::INVALID_REQ,
@@ -1431,26 +1413,17 @@ mod tests {
 
     #[test]
     fn nvidia_rim_path_is_whitelisted() {
-        assert_eq!(
-            canonicalize_nvidia_rim("/v1/rim/some-id").unwrap(),
-            "/v1/rim/some-id"
-        );
+        assert_eq!(canonicalize_nvidia_rim("/v1/rim/some-id").unwrap(), "/v1/rim/some-id");
         assert_eq!(
             canonicalize_nvidia_rim("/v1/rim/NV_GPU_DRIVER_GH100_535.129.03").unwrap(),
             "/v1/rim/NV_GPU_DRIVER_GH100_535.129.03"
         );
-        assert_eq!(
-            canonicalize_nvidia_rim("/v1/rim/ids").unwrap(),
-            "/v1/rim/ids"
-        );
+        assert_eq!(canonicalize_nvidia_rim("/v1/rim/ids").unwrap(), "/v1/rim/ids");
         assert_err(
             &canonicalize_nvidia_rim("/v1/rim/some-id?junk=1").unwrap_err(),
             &error::INVALID_REQ,
         );
-        assert_err(
-            &canonicalize_nvidia_rim("/v1/rim/../x").unwrap_err(),
-            &error::INVALID_REQ,
-        );
+        assert_err(&canonicalize_nvidia_rim("/v1/rim/../x").unwrap_err(), &error::INVALID_REQ);
     }
 
     #[test]

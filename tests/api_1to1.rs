@@ -2487,7 +2487,6 @@ async fn nvidia_rim_error_response_is_relayed_and_not_cached() {
     let _ = std::fs::remove_dir_all(db_path);
 }
 
-
 struct UpstreamHit {
     path: String,
     api_key: String,
@@ -2510,12 +2509,7 @@ async fn spawn_recording_upstream(
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let path = req
-                    .uri()
-                    .path_and_query()
-                    .map(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let path = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string();
                 seen.lock().unwrap().push(UpstreamHit { path, api_key });
                 let mut builder = axum::http::Response::builder().status(status);
                 for (name, value) in extra_headers {
@@ -2845,11 +2839,8 @@ async fn amd_kds_unknown_query_is_rejected_and_known_params_are_canonicalised() 
     let app = create_app_from_config(cfg);
     let hwid = "ab".repeat(64);
 
-    let (status, _, body) = send(
-        app.clone(),
-        get(&format!("/vcek/v1/Genoa/cert_chain?junk=1")),
-    )
-    .await;
+    let (status, _, body) =
+        send(app.clone(), get(&format!("/vcek/v1/Genoa/cert_chain?junk=1"))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body, "Invalid request parameters.");
     assert!(seen.lock().unwrap().is_empty());
@@ -2862,10 +2853,7 @@ async fn amd_kds_unknown_query_is_rejected_and_known_params_are_canonicalised() 
     assert_eq!(status, StatusCode::OK);
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
-    assert_eq!(
-        seen[0].path,
-        format!("/vcek/v1/Genoa/{hwid}?blSPL=1&teeSPL=2")
-    );
+    assert_eq!(seen[0].path, format!("/vcek/v1/Genoa/{hwid}?blSPL=1&teeSPL=2"));
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);
@@ -2907,11 +2895,7 @@ async fn amd_kds_dot_segments_are_rejected_without_touching_upstream() {
     let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-dots");
     let app = create_app_from_config(cfg);
 
-    let req = Request::builder()
-        .method("GET")
-        .uri("/vcek/v1/../../x")
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().method("GET").uri("/vcek/v1/../../x").body(Body::empty()).unwrap();
     let (status, _, body) = send(app.clone(), req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body, "Invalid request parameters.");
