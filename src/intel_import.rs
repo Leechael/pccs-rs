@@ -161,6 +161,15 @@ fn read_snapshot(conn: &Connection, source_hash: String) -> Result<Snapshot> {
                 return Err(format!("{table}.{required}: missing required column"));
             }
         }
+        if TABLES.contains(&table.as_str()) {
+            for column in &columns {
+                if !required_columns(&table).contains(&column.as_str())
+                    && !matches!(column.as_str(), "created_time" | "updated_time")
+                {
+                    return Err(format!("{table}.{column}: unsupported column"));
+                }
+            }
+        }
         let records = stmt
             .query_map([], |row| {
                 let mut fields = BTreeMap::new();
@@ -288,7 +297,9 @@ fn convert(snapshot: &mut Snapshot) -> Result<()> {
         {
             return Err("pcs_certificates.cert: expected URL-encoded PEM".into());
         }
-        certificates.insert(id, cert);
+        if certificates.insert(id, cert).is_some() {
+            return Err("pcs_certificates: duplicate id".into());
+        }
     }
     for row in snapshot.rows.remove("fmspc_tcbs").unwrap() {
         let raw_body = row.text("tcbinfo")?;
@@ -475,21 +486,11 @@ fn signed_document(raw_body: &str, field: &str) -> Result<serde_json::Value> {
 }
 
 fn der_crl(bytes: Vec<u8>, table: &str) -> Result<Vec<u8>> {
-    if bytes.len() < 2 || bytes[0] != 0x30 {
-        return Err(format!("{table}: expected DER CRL"));
-    }
-    let (length, header) = if bytes[1] < 0x80 {
-        (bytes[1] as usize, 2)
-    } else {
-        let width = (bytes[1] & 0x7F) as usize;
-        if width == 0 || width > 4 || bytes.len() < 2 + width {
-            return Err(format!("{table}: invalid DER length"));
-        }
-        (bytes[2..2 + width].iter().fold(0usize, |n, b| (n << 8) | (*b as usize)), 2 + width)
-    };
-    if header + length != bytes.len() {
-        return Err(format!("{table}: invalid DER length"));
-    }
+    use x509_cert::der::Decode;
+    // from_der parses the complete CertificateList and rejects trailing input.
+    // Validate syntax only; retain the original signed bytes, never reserialize.
+    x509_cert::crl::CertificateList::from_der(&bytes)
+        .map_err(|_| format!("{table}: invalid DER CRL"))?;
     Ok(bytes)
 }
 fn convert_collateral(snapshot: &mut Snapshot, certificates: &BTreeMap<i64, String>) -> Result<()> {
@@ -642,7 +643,32 @@ fn private_directory(path: &Path) -> Result<()> {
     }
     builder.create(path).map_err(|e| format!("create private destination: {e}"))
 }
+fn publish_directory(staging: &Path, destination: &Path) -> Result<()> {
+    // One kernel operation: never reserve/check then rename, and never remove
+    // destination on error. NOREPLACE maps to RENAME_EXCL on macOS.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use rustix::fs::{renameat_with, RenameFlags, CWD};
+        renameat_with(CWD, staging, CWD, destination, RenameFlags::NOREPLACE)
+            .map_err(|e| format!("publish destination: {e}"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (staging, destination);
+        Err("publish destination: atomic no-replace publication requires Linux or macOS".into())
+    }
+}
+
 fn publish(snapshot: &Snapshot, destination: &Path) -> Result<()> {
+    publish_with(snapshot, destination, |_, _| {})
+}
+
+// Filesystem boundary seam for deterministic competing-publisher tests.
+fn publish_with(
+    snapshot: &Snapshot,
+    destination: &Path,
+    before_rename: impl FnOnce(&Path, &Path),
+) -> Result<()> {
     let parent =
         destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let staging = parent.join(format!(".pccs-import-{}", uuid::Uuid::new_v4()));
@@ -689,13 +715,8 @@ fn publish(snapshot: &Snapshot, destination: &Path) -> Result<()> {
         fs::File::open(&staging)
             .and_then(|f| f.sync_all())
             .map_err(|e| format!("sync staging directory: {e}"))?;
-        // Reserve the name exclusively. Rename over ONLY our own empty directory;
-        // a competing import/existing path fails here instead of being overwritten.
-        private_directory(destination)?;
-        if let Err(e) = fs::rename(&staging, destination) {
-            let _ = fs::remove_dir(destination);
-            return Err(format!("publish destination: {e}"));
-        }
+        before_rename(&staging, destination);
+        publish_directory(&staging, destination)?;
         #[cfg(unix)]
         fs::File::open(parent).and_then(|f| f.sync_all()).map_err(|e| {
             format!(
@@ -708,4 +729,63 @@ fn publish(snapshot: &Snapshot, destination: &Path) -> Result<()> {
         let _ = fs::remove_dir_all(&staging);
     }
     result
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt};
+
+    /// Intent: regression/migration safety. A competing path created at the
+    /// publication boundary is never replaced or removed, even on rename error.
+    #[test]
+    fn competing_destination_survives_publication() {
+        for kind in ["empty", "nonempty", "symlink", "rename-error"] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("rocks");
+            let foreign = temp.path().join("foreign");
+            fs::create_dir(&foreign).unwrap();
+            let snapshot = Snapshot {
+                rows: BTreeMap::new(),
+                entries: BTreeMap::new(),
+                report: ImportReport {
+                    source_sha256: "synthetic".into(),
+                    db_version: 5,
+                    api_version: 4,
+                    source_rows: BTreeMap::new(),
+                    destination_records: 0,
+                },
+            };
+            let mut foreign_inode = 0;
+            let result = publish_with(&snapshot, &destination, |staging, destination| {
+                // Model another process replacing the old reservation, if any.
+                if destination.exists() {
+                    fs::remove_dir(destination).unwrap();
+                }
+                if kind == "symlink" {
+                    symlink(&foreign, destination).unwrap();
+                } else {
+                    fs::create_dir(destination).unwrap();
+                    if kind == "nonempty" {
+                        fs::write(destination.join("marker"), b"foreign data").unwrap();
+                    }
+                }
+                foreign_inode = fs::symlink_metadata(destination).unwrap().ino();
+                if kind == "rename-error" {
+                    fs::remove_dir_all(staging).unwrap();
+                }
+            });
+            assert!(result.is_err(), "competing {kind} destination was overwritten");
+            assert!(result.unwrap_err().contains("publish destination"));
+            assert_eq!(fs::symlink_metadata(&destination).unwrap().ino(), foreign_inode);
+            if kind == "nonempty" {
+                assert_eq!(fs::read(destination.join("marker")).unwrap(), b"foreign data");
+            } else if kind == "symlink" {
+                assert_eq!(fs::read_link(&destination).unwrap(), foreign);
+            } else {
+                assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+            }
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2, "staging leaked");
+        }
+    }
 }
