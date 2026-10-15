@@ -6,7 +6,7 @@ use crate::keys;
 use crate::pcs::{PckCertsResponse, PcsClient};
 use crate::store::{
     IdentityRecord, PckCertRecord, PckCrlRecord, PlatformCert, PlatformCredentials, PlatformPool,
-    RegisteredPlatform, Store, TcbRecord,
+    PlatformPublication, RegisteredPlatform, Store, TcbRecord,
 };
 use crate::validate::UpdateType;
 use std::collections::HashMap;
@@ -23,6 +23,20 @@ struct PckFetchContext<'a> {
     enc_ppid: &'a str,
     platform_manifest: &'a str,
     expected: Option<PlatformCredentials>,
+    unknown_get: bool,
+}
+
+impl PckFetchContext<'_> {
+    fn publication(&self) -> PlatformPublication<'_> {
+        if self.unknown_get && self.expected.is_none() {
+            PlatformPublication::AbsentGet {
+                enc_ppid: self.enc_ppid,
+                platform_manifest: self.platform_manifest,
+            }
+        } else {
+            PlatformPublication::Observed(self.expected.as_ref())
+        }
+    }
 }
 
 pub struct Cache {
@@ -140,8 +154,9 @@ impl Cache {
 
     // ---------------- pckcert ----------------
 
-    /// Node `pckcertService.getPckCert`: known platforms use a cached raw GET
-    /// or local selection exclusively. Only unknown platforms can fetch PCS.
+    /// Intel `pckcertService.getPckCert`: known platforms use only a cached
+    /// GET or local selection. The PCCS mirror adapter can forward missing raw
+    /// keys in LAZY mode when local selection is unavailable.
     pub async fn get_pckcert(
         &self,
         qeid: &str,
@@ -164,14 +179,18 @@ impl Cache {
         self.store.record_miss();
         tracing::info!("cache miss pckcert qeid={qeid} pceid={pceid}");
 
-        // Intel 1.24: platform presence ALWAYS means local selection. Its
-        // error propagates even in LAZY; client/stored credentials are irrelevant.
-        // Do this BEFORE upstream single-flight/negative-cache handling: a prior
-        // unknown GET error must not block the first local GET after a POST.
+        // Try local selection BEFORE upstream single-flight/negative-cache
+        // handling: an unknown GET failure must not block selection after POST.
+        // Intel 1.24 makes this terminal; only the separate LAZY PCCS adapter
+        // may forward a raw key that cannot be selected locally.
         if known_platform {
-            return self.store.select_platform_cert(qeid, pceid, true, |pool| {
+            match self.store.select_platform_cert(qeid, pceid, true, |pool| {
                 self.select_from_pool(pool, cpusvn, pcesvn, pceid)
-            });
+            }) {
+                Ok(rec) => return Ok(rec),
+                Err(e) if self.is_intel || self.mode != CacheMode::Lazy => return Err(e),
+                Err(_) => {}
+            }
         }
 
         let key = keys::pckcert(qeid, pceid, cpusvn, pcesvn);
@@ -185,9 +204,16 @@ impl Cache {
                 if version == 3 {
                     return Err(error::PCS_V3_REACHED_EOL);
                 }
-                // Only an unknown platform can fetch, with the client's
-                // encrypted PPID and no Manifest. None records that observed
-                // absence; a concurrent registration must reject this response.
+                let expected = self.store.get_platform_pool(qeid, pceid).map(|p| p.credentials());
+                // A platform may have been registered while waiting for this
+                // raw key. Intel still must not refill a known platform.
+                if self.is_intel && expected.is_some() {
+                    return self.store.select_platform_cert(qeid, pceid, true, |pool| {
+                        self.select_from_pool(pool, cpusvn, pcesvn, pceid)
+                    });
+                }
+                // PCCS GET is a proxy protocol, not Intel enrollment: forward
+                // only the caller's optional PPID, never saved credentials.
                 self.note(
                     &key,
                     self.fill_pckcert(
@@ -198,7 +224,8 @@ impl Cache {
                         PckFetchContext {
                             enc_ppid: enc_ppid.unwrap_or(""),
                             platform_manifest: "",
-                            expected: None,
+                            expected,
+                            unknown_get: true,
                         },
                     )
                     .await
@@ -284,7 +311,7 @@ impl Cache {
         if !self.pcs.enabled() {
             return Err(error::NO_CACHE_DATA);
         }
-        if enc_ppid.is_empty() && platform_manifest.is_empty() {
+        if self.is_intel && enc_ppid.is_empty() && platform_manifest.is_empty() {
             tracing::error!("Missing encrypted ppid or platform manifest.");
             return Err(error::INVALID_REQ);
         }
@@ -292,15 +319,23 @@ impl Cache {
 
         // A PCCS upstream without a platform manifest serves a single cert.
         if !self.is_intel && platform_manifest.is_empty() {
-            let rec =
-                self.pcs.fetch_pckcert_pccs(qeid, cpusvn, pcesvn, pceid, Some(enc_ppid)).await?;
+            let rec = self
+                .pcs
+                .fetch_pckcert_pccs(
+                    qeid,
+                    cpusvn,
+                    pcesvn,
+                    pceid,
+                    (!enc_ppid.is_empty()).then_some(enc_ppid),
+                )
+                .await?;
             if !Self::cacheable(crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN, &rec.issuer_chain)
             {
                 return Ok(Some(rec));
             }
             // This is one selected cert, not a complete Intel pool. Preserve
             // the old inventory and publish its new raw/GET mapping atomically.
-            self.store.merge_pckcert(&rec, context.expected.as_ref())?;
+            self.store.merge_pckcert_after_fetch(&rec, context.publication())?;
             return Ok(Some(rec));
         }
 
@@ -369,9 +404,9 @@ impl Cache {
             .transpose()?;
         // An unavailable new raw level must not become an untracked GET hit.
         let persist = self.mode != CacheMode::Lazy || resp.not_available.is_empty();
-        self.store.replace_platform_certs_with_selection(
+        self.store.replace_platform_certs_after_fetch(
             &pool,
-            context.expected.as_ref(),
+            context.publication(),
             &tcbs,
             selected.as_ref().filter(|_| persist),
             |fresh, raw| {
@@ -685,6 +720,7 @@ impl Cache {
                             enc_ppid: &p.enc_ppid,
                             platform_manifest: &p.platform_manifest,
                             expected,
+                            unknown_get: false,
                         },
                     )
                     .await?;
@@ -705,6 +741,7 @@ impl Cache {
                             enc_ppid: &p.enc_ppid,
                             platform_manifest: &p.platform_manifest,
                             expected,
+                            unknown_get: false,
                         },
                     )
                     .await?;
@@ -1271,10 +1308,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_pckcert_without_ppid_or_manifest_is_a_400() {
+    async fn lazy_intel_pckcert_without_ppid_or_manifest_is_a_400() {
         let calls = Arc::new(AtomicU64::new(0));
         let base = spawn_pccs(calls.clone()).await;
-        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        let (_dir, mut cache) = cache_with(&base, CacheMode::Lazy);
+        Arc::get_mut(&mut cache).unwrap().is_intel = true;
         let err =
             cache.get_pckcert("QE9", &"AB".repeat(16), "00FF", "0001", None, 4).await.unwrap_err();
         assert_err(&err, &error::INVALID_REQ);
@@ -1683,7 +1721,12 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
                 &"22".repeat(16),
                 "3333",
                 "4444",
-                PckFetchContext { enc_ppid: "", platform_manifest: "MANIFEST", expected: None },
+                PckFetchContext {
+                    enc_ppid: "",
+                    platform_manifest: "MANIFEST",
+                    expected: None,
+                    unknown_get: false,
+                },
             )
             .await
             .unwrap()
@@ -1729,7 +1772,12 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             .store_pckcerts(
                 "QET",
                 "0001",
-                &PckFetchContext { enc_ppid: "PP", platform_manifest: "", expected: None },
+                &PckFetchContext {
+                    enc_ppid: "PP",
+                    platform_manifest: "",
+                    expected: None,
+                    unknown_get: false,
+                },
                 &resp,
                 None,
             )
@@ -1823,7 +1871,12 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             .store_pckcerts(
                 "QE5",
                 "4444",
-                &PckFetchContext { enc_ppid: "PP", platform_manifest: "", expected: None },
+                &PckFetchContext {
+                    enc_ppid: "PP",
+                    platform_manifest: "",
+                    expected: None,
+                    unknown_get: false,
+                },
                 &resp,
                 None,
             )
@@ -1847,7 +1900,12 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             .store_pckcerts(
                 "QE5",
                 "0001",
-                &PckFetchContext { enc_ppid: "PP", platform_manifest: "", expected: None },
+                &PckFetchContext {
+                    enc_ppid: "PP",
+                    platform_manifest: "",
+                    expected: None,
+                    unknown_get: false
+                },
                 &empty,
                 None
             )
@@ -1860,7 +1918,12 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
             .store_pckcerts(
                 "QE6",
                 "0001",
-                &PckFetchContext { enc_ppid: "PP", platform_manifest: "", expected: None },
+                &PckFetchContext {
+                    enc_ppid: "PP",
+                    platform_manifest: "",
+                    expected: None,
+                    unknown_get: false
+                },
                 &chainless,
                 None
             )
