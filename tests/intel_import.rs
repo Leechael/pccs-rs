@@ -14,6 +14,9 @@ use tower::ServiceExt;
 const FMSPC: &str = "1234567890AB";
 const RAW_TCB: &str = "{\n  \"tcbInfo\": { \"id\": \"SGX\", \"fmspc\": \"1234567890AB\", \"tcbType\": 0, \"tcbLevels\": [] },\n  \"signature\": \"synthetic-not-cryptographically-valid\"\n}\n";
 const PCK: &str = include_str!("fixtures/pck-synthetic.pem");
+// Hand-encoded X.509 v2 CertificateList: synthetic issuer/dates/signature;
+// no private key or production collateral. Signature is deliberately not authentic.
+const CRL: &[u8] = include_bytes!("fixtures/crl-synthetic.der");
 const ROOT: &str = "-----BEGIN%20CERTIFICATE-----%0AMAA=%0A-----END%20CERTIFICATE-----%0A";
 const SIGNING: &str = "-----BEGIN%20CERTIFICATE-----%0AMAE=%0A-----END%20CERTIFICATE-----%0A";
 
@@ -211,18 +214,15 @@ async fn restores_identity_crls_queue_states_and_policy_metadata() {
     let source = temp.path().join("snapshot.db");
     let destination = temp.path().join("rocks");
     let db = snapshot(&source);
-    db.execute(
-        "INSERT INTO pcs_certificates VALUES (1,?1,?2)",
-        params![ROOT.as_bytes(), vec![0x30u8, 1, 0]],
-    )
-    .unwrap();
+    db.execute("INSERT INTO pcs_certificates VALUES (1,?1,?2)", params![ROOT.as_bytes(), CRL])
+        .unwrap();
     db.execute("INSERT INTO pcs_certificates VALUES (3,?1,NULL)", [SIGNING.as_bytes()]).unwrap();
     db.execute("INSERT INTO pcs_certificates VALUES (4,?1,NULL)", [SIGNING.as_bytes()]).unwrap();
     let identity = "{\n \"enclaveIdentity\": {\"id\":\"TD_QE\"}, \"signature\":\"synthetic\"\n}\n";
     db.execute("INSERT INTO enclave_identities VALUES (3,4,'EARLY',?1,1,3)", [identity.as_bytes()])
         .unwrap();
-    db.execute("INSERT INTO pck_crl VALUES ('PLATFORM',?1,1,4)", [vec![0x30u8, 1, 1]]).unwrap();
-    db.execute("INSERT INTO crl_cache VALUES ('https://certificates.trustedservices.intel.com/IntelSGXRootCA.der',?1)", [vec![0x30u8,1,2]]).unwrap();
+    db.execute("INSERT INTO pck_crl VALUES ('PLATFORM',?1,1,4)", [CRL]).unwrap();
+    db.execute("INSERT INTO crl_cache VALUES ('https://certificates.trustedservices.intel.com/IntelSGXRootCA.der',?1)", [CRL]).unwrap();
     for (id, state, pce) in [("01", 0, "0001"), ("02", 1, "13107"), ("03", 9, "13107")] {
         db.execute(
             "INSERT INTO platforms_registered VALUES (?1,'0000',?2,?3,?4,NULL,?5)",
@@ -245,8 +245,10 @@ async fn restores_identity_crls_queue_states_and_policy_metadata() {
     )
     .unwrap();
     drop(db);
+    let original = std::fs::read(&source).unwrap();
     let output = import(&source, &destination);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read(&source).unwrap(), original);
     // These metadata fields deliberately have no HTTP getter. Inspect the
     // CLI's documented RocksDB output artifact, using public keys/record types,
     // before testing public queue drains; counts alone cannot prove retention.
@@ -287,13 +289,13 @@ async fn restores_identity_crls_queue_states_and_policy_metadata() {
     let (status, _, body) =
         get(offline(&destination), "/sgx/certification/v4/pckcrl?ca=platform&encoding=der").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, [0x30, 1, 1]);
+    assert_eq!(body, CRL);
     let (status, _, body) = get(offline(&destination), "/sgx/certification/v4/rootcacrl").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"300100");
+    assert_eq!(body, hex::encode(CRL).as_bytes());
     let (status,_,body) = get(offline(&destination), "/sgx/certification/v4/crl?uri=https://certificates.trustedservices.intel.com/IntelSGXRootCA.der").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, [0x30, 1, 2]);
+    assert_eq!(body, CRL);
     let (status, _, body) =
         get(offline(&destination), "/sgx/certification/v4/appraisalpolicy?fmspc=1234567890ab")
             .await;
@@ -436,6 +438,68 @@ fn rejects_invalid_snapshot_without_publishing_or_mutating_source() {
     }
 }
 
+/// Intent: regression/migration safety. Complete CRL syntax and full DER
+/// consumption are required in every CRL source; rejection is read-only.
+#[test]
+fn rejects_malformed_crls_without_publishing_or_mutating_source() {
+    let mut inner_trailing = CRL.to_vec();
+    inner_trailing[1] += 1;
+    inner_trailing.push(0);
+    let mut trailing = CRL.to_vec();
+    trailing.push(0);
+    for payload in [vec![0x30, 1, 0], inner_trailing, trailing] {
+        for table in ["pcs_certificates", "pck_crl", "crl_cache"] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("snapshot.db");
+            let destination = temp.path().join("rocks");
+            let db = snapshot(&source);
+            db.execute("INSERT INTO pcs_certificates VALUES (1,?1,NULL)", [ROOT.as_bytes()])
+                .unwrap();
+            db.execute("INSERT INTO pcs_certificates VALUES (4,?1,NULL)", [SIGNING.as_bytes()])
+                .unwrap();
+            match table {
+                "pcs_certificates" => db.execute("UPDATE pcs_certificates SET crl=?1 WHERE id=1", [&payload]),
+                "pck_crl" => db.execute("INSERT INTO pck_crl VALUES ('PLATFORM',?1,1,4)", [&payload]),
+                _ => db.execute("INSERT INTO crl_cache VALUES ('https://certificates.trustedservices.intel.com/IntelSGXRootCA.der',?1)", [&payload]),
+            }.unwrap();
+            drop(db);
+            let original = std::fs::read(&source).unwrap();
+            let output = import(&source, &destination);
+            assert!(!output.status.success(), "malformed {table} CRL accepted: {payload:02x?}");
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains(table) && error.contains("DER"), "{error}");
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        }
+    }
+}
+
+/// Intent: regression/migration safety. Certificate joins cannot silently choose
+/// the last duplicate ID when a drifted source schema has lost its primary key.
+#[test]
+fn rejects_duplicate_certificate_ids_without_primary_key() {
+    for second_cert in [ROOT, SIGNING] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("snapshot.db");
+        let destination = temp.path().join("rocks");
+        let db = snapshot(&source);
+        db.execute_batch("DROP TABLE pcs_certificates; CREATE TABLE pcs_certificates (id INTEGER, cert BLOB, crl BLOB);").unwrap();
+        for cert in [ROOT, second_cert] {
+            db.execute("INSERT INTO pcs_certificates VALUES (1,?1,NULL)", [cert.as_bytes()])
+                .unwrap();
+        }
+        drop(db);
+        let original = std::fs::read(&source).unwrap();
+        let output = import(&source, &destination);
+        assert!(!output.status.success(), "duplicate certificate ID was accepted");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("pcs_certificates: duplicate id"));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+}
+
 /// Intent: invariant. A structurally incomplete signed envelope or wrong root
 /// pointer cannot be migrated as a successful collateral response.
 #[test]
@@ -514,6 +578,41 @@ async fn retains_sgx_tdx_api_versions_and_update_variants() {
     }
 }
 
+/// Intent: regression/migration safety. Known tables cannot carry silently lost
+/// data columns, even when empty; only the documented audit columns are ignored.
+#[test]
+fn rejects_unrecognized_columns_in_known_tables() {
+    for table in [
+        "pcs_version",
+        "platforms",
+        "pck_cert",
+        "platform_tcbs",
+        "pcs_certificates",
+        "pck_certchain",
+        "fmspc_tcbs",
+        "enclave_identities",
+        "pck_crl",
+        "crl_cache",
+        "platforms_registered",
+        "appraisal_policies",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("snapshot.db");
+        let destination = temp.path().join("rocks");
+        let db = snapshot(&source);
+        db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN future_payload BLOB")).unwrap();
+        drop(db);
+        let original = std::fs::read(&source).unwrap();
+        let output = import(&source, &destination);
+        assert!(!output.status.success(), "unknown column in {table} was accepted");
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("{table}.future_payload: unsupported column")));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+}
+
 /// Intent: migration safety (schema evidence only). Exact live DDL with real
 /// NOT NULL timestamps/column order is accepted; payloads remain synthetic.
 #[test]
@@ -535,6 +634,48 @@ fn accepts_live_v5_schema_with_timestamp_columns_and_bookkeeping() {
     assert_eq!(report["source_rows"]["umzug"], 1);
     assert_eq!(report["destination_records"], 0);
     assert_eq!(std::fs::read(&source).unwrap(), original);
+}
+
+/// Intent: migration safety. Any existing destination, including an empty
+/// directory or dangling symlink, is foreign and must remain unchanged.
+#[cfg(unix)]
+#[test]
+fn refuses_preexisting_empty_nonempty_and_symlink_destinations() {
+    use std::os::unix::fs::{symlink, MetadataExt};
+    for kind in ["empty", "nonempty", "symlink", "dangling-symlink"] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("snapshot.db");
+        let destination = temp.path().join("rocks");
+        drop(snapshot(&source));
+        let original = std::fs::read(&source).unwrap();
+        let target = temp.path().join("foreign");
+        if kind == "symlink" || kind == "dangling-symlink" {
+            if kind == "symlink" {
+                std::fs::create_dir(&target).unwrap();
+            }
+            symlink(&target, &destination).unwrap();
+        } else {
+            std::fs::create_dir(&destination).unwrap();
+            if kind == "nonempty" {
+                std::fs::write(destination.join("marker"), b"foreign data").unwrap();
+            }
+        }
+        let inode = std::fs::symlink_metadata(&destination).unwrap().ino();
+        let output = import(&source, &destination);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("destination already exists"));
+        assert_eq!(std::fs::symlink_metadata(&destination).unwrap().ino(), inode);
+        match kind {
+            "nonempty" => {
+                assert_eq!(std::fs::read(destination.join("marker")).unwrap(), b"foreign data")
+            }
+            "empty" => assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0),
+            _ => assert_eq!(std::fs::read_link(&destination).unwrap(), target),
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        let expected_paths = if kind == "symlink" { 3 } else { 2 };
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), expected_paths);
+    }
 }
 
 /// Intent: invariant. A completed import is not a merge target; failed repeats
