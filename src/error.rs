@@ -127,6 +127,10 @@ pub const NVIDIA_NRAS_ACCESS_FAILURE: PccsError = PccsError::new(
     StatusCode::BAD_GATEWAY,
     "Unable to retrieve the attestation result from the NVIDIA NRAS.",
 );
+pub const NVIDIA_OCSP_ACCESS_FAILURE: PccsError = PccsError::new(
+    StatusCode::BAD_GATEWAY,
+    "Unable to retrieve the OCSP response from the NVIDIA OCSP service.",
+);
 
 /// Express `res.send(string)` sets `Content-Type: text/html; charset=utf-8`.
 /// Returning a bare `&str` from axum would say `text/plain`, so success bodies
@@ -163,6 +167,7 @@ mod tests {
         assert_eq!(AMD_KDS_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
         assert_eq!(NVIDIA_RIM_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
         assert_eq!(NVIDIA_NRAS_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(NVIDIA_OCSP_ACCESS_FAILURE.status, StatusCode::BAD_GATEWAY);
         assert_eq!(integrity_error().status.as_u16(), 460);
         assert_eq!(platform_unknown().status.as_u16(), 461);
         assert_eq!(certs_unavailable().status.as_u16(), 462);

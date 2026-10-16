@@ -3,7 +3,7 @@
 Rust + Tokio replacement for
 [Intel PCCS](https://github.com/intel/confidential-computing.tee.dcap.pccs)
 (Provisioning Certificate Caching Service). HTTP API is 1:1 with Node PCCS
-(SGX v3 + v4, TDX v4) and also provides read-through caches for AMD KDS (`/vcek/`, `/vlek/`) and NVIDIA RIM (`/v1/rim/`), plus a CORS proxy for NVIDIA NRAS GPU attestation (`POST /nvidia/nras/attest/gpu`).
+(SGX v3 + v4, TDX v4) and also provides read-through caches for AMD KDS (`/vcek/`, `/vlek/`), NVIDIA RIM (`/v1/rim/`), and NVIDIA OCSP (`POST /ocsp`), plus a CORS proxy for NVIDIA NRAS GPU attestation (`POST /nvidia/nras/attest/gpu`).
 The cache is RocksDB and survives restart.
 
 Sit it behind Caddy or nginx. This repo does not ship a reverse-proxy config.
@@ -124,6 +124,9 @@ db_path = "/var/lib/pccs-rs"
 # nvidia_rim_uri = "https://rim.attestation.nvidia.com"
 # nvidia_rim_cache_ttl_seconds = 2592000 # 30 days
 # nvidia_nras_uri = "https://nras.attestation.nvidia.com"
+# nvidia_ocsp_uri = "https://ocsp.ndis.nvidia.com"
+# nvidia_ocsp_max_ttl_seconds = 86400 # 24 hours
+# nvidia_ocsp_default_ttl_seconds = 3600 # 1 hour
 # proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
 # user_token_hash = ""
@@ -152,6 +155,13 @@ db_path = "/var/lib/pccs-rs"
 - The NVIDIA RIM host defaults to `https://rim.attestation.nvidia.com`.
   Request paths under `/v1/rim/` are forwarded unchanged. A legacy `.../v1/rim`
   suffix on the configured host is stripped.
+- The NVIDIA OCSP host defaults to `https://ocsp.ndis.nvidia.com`.
+  `POST /ocsp` with `Content-Type: application/ocsp-request` is a read-through
+  cache. Cache keys hash the DER CertID list only (the per-request OCSP nonce
+  is excluded). Entries expire at the signed `nextUpdate` (capped by
+  `nvidia_ocsp_max_ttl_seconds`); responses without `nextUpdate` use one hour
+  from `thisUpdate`. Expired OCSP is never served. This is the missing piece
+  for using pccs-rs as a dstack `nvidia_attestation_proxy_url`.
 - The NVIDIA NRAS host defaults to `https://nras.attestation.nvidia.com`.
   `POST /nvidia/nras/attest/gpu` is a **stateless CORS proxy** to
   `{host}/v3/attest/gpu`. Responses are nonce-bound and are **not** stored in
@@ -349,6 +359,8 @@ REQ / OFFLINE answer `461` for those platforms until refilled.
   `cert_chain`, and `crl`), forwarding path and query to `kdsintf.amd.com`
 - NVIDIA RIM-compatible `GET /v1/rim/{*path}`, forwarding path and query to
   `rim.attestation.nvidia.com`
+- NVIDIA OCSP cache `POST /ocsp` → `ocsp.ndis.nvidia.com` (nonce excluded from key;
+  expires at `nextUpdate`; non-LAZY miss is 404)
 - NVIDIA NRAS CORS proxy `POST /nvidia/nras/attest/gpu` →
   `nras.attestation.nvidia.com/v3/attest/gpu` (no persistence; OFFLINE is 503)
 - Auth, Request-ID (always freshly generated), v3 Warning, Intel headers,
