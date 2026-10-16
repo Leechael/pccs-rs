@@ -45,3 +45,9 @@ pub fn healthz_router() -> Router<AppState> {
         .route("/ready", get(health::readiness))
         .route("/startup", get(health::startup))
 }
+
+pub fn amd_kds_router() -> Router<AppState> {
+    Router::new()
+        .route("/vcek/{*rest}", get(handlers::get_amd_kds))
+        .route("/vlek/{*rest}", get(handlers::get_amd_kds))
+}
