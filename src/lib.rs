@@ -48,8 +48,11 @@ pub fn create_app(state: AppState) -> Router {
         .fallback(routes::handlers::not_found)
         .layer(middleware::from_fn(auth::v3_eol_warning));
 
-    let mut app =
-        Router::new().nest("/sgx/certification/v3", sgx_v3).merge(routes::amd_kds_router());
+    let mut app = Router::new()
+        .nest("/sgx/certification/v3", sgx_v3)
+        .merge(routes::amd_kds_router())
+        .merge(routes::nvidia_rim_router())
+        .nest("/nvidia/nras", routes::nvidia_nras_router());
     if pcs_ver == 4 {
         app = app
             .nest("/sgx/certification/v4", routes::sgx_router(state.clone()))
@@ -58,8 +61,11 @@ pub fn create_app(state: AppState) -> Router {
 
     app.nest("/healthz", routes::healthz_router())
         .fallback(routes::handlers::not_found)
-        .layer(middleware::from_fn(auth::add_request_id))
         .layer(DefaultBodyLimit::max(body_limit))
+        // CORS wraps the body-limit 413, but stays inside Request-ID so OPTIONS
+        // preflight (answered without calling next) still gets a fresh id.
+        .layer(middleware::from_fn(routes::handlers::nras_cors))
+        .layer(middleware::from_fn(auth::add_request_id))
         .with_state(state)
 }
 
