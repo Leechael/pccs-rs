@@ -1,22 +1,213 @@
 name: Release
 
+# Manual bump + GHCR publish, modeled on
+# https://github.com/Phala-Network/phala-cloud-gin-starter/.github/workflows/release.yml
+# workflow_dispatch: pick patch/minor/major and an optional ref (default main).
+# issue_comment: on an open same-repo PR, a repo owner/member/collaborator can
+# comment `!release patch|minor|major` to tag that PR head and publish.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: version bump type
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      ref:
+        description: git ref/branch/sha to release from (optional)
+        required: false
+        default: main
+        type: string
+  issue_comment:
+    types: [created]
 
 env:
   CARGO_TERM_COLOR: always
-
-permissions:
-  contents: write
-  packages: write
+  REGISTRY: ghcr.io
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      should_release: ${{ steps.parse.outputs.should_release }}
+      bump: ${{ steps.parse.outputs.bump }}
+      target_sha: ${{ steps.parse.outputs.target_sha }}
+      source: ${{ steps.parse.outputs.source }}
+      repo_lower: ${{ steps.parse.outputs.repo_lower }}
+    steps:
+      - name: parse trigger
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eventName = context.eventName
+            let shouldRelease = false
+            let bump = ''
+            let targetSha = ''
+            let source = eventName
+
+            if (eventName === 'workflow_dispatch') {
+              shouldRelease = true
+              bump = (context.payload.inputs?.bump || '').toLowerCase()
+              targetSha = context.payload.inputs?.ref || context.ref.replace('refs/heads/', '')
+            }
+
+            if (eventName === 'issue_comment') {
+              const body = (context.payload.comment?.body || '').trim()
+              const match = body.match(/^!release\s+(patch|minor|major)$/i)
+              const assoc = context.payload.comment?.author_association || 'NONE'
+              const allowed = ['OWNER', 'MEMBER', 'COLLABORATOR']
+              const issue = context.payload.issue
+
+              if (
+                match &&
+                issue?.pull_request &&
+                issue.state === 'open' &&
+                allowed.includes(assoc)
+              ) {
+                const prNumber = issue.number
+                const pr = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                })
+                const headRepo = pr.data.head.repo?.full_name || ''
+                const baseRepo = `${context.repo.owner}/${context.repo.repo}`
+                if (pr.data.state !== 'open') {
+                  core.info(`skipping closed PR #${prNumber}`)
+                } else if (headRepo.toLowerCase() !== baseRepo.toLowerCase()) {
+                  core.info(`skipping fork PR #${prNumber} from ${headRepo}`)
+                } else {
+                  shouldRelease = true
+                  bump = match[1].toLowerCase()
+                  targetSha = pr.data.head.sha
+                  source = `pr#${prNumber}`
+                }
+              }
+            }
+
+            core.setOutput('should_release', shouldRelease ? 'true' : 'false')
+            core.setOutput('bump', bump)
+            core.setOutput('target_sha', targetSha)
+            core.setOutput('source', source)
+            core.setOutput('repo_lower', `${context.repo.owner.toLowerCase()}/${context.repo.repo.toLowerCase()}`)
+
+  create-tag:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-tag
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.target_sha }}
+          fetch-depth: 0
+          # Tagging only runs trusted shell steps; write token is needed for git push.
+          # Fork PR heads are rejected in prepare so untrusted remotes never reach here.
+          persist-credentials: true
+
+      - name: fetch tags
+        run: git fetch --tags --force
+
+      - name: compute next version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest=$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)
+          if [ -z "$latest" ]; then
+            latest="v0.0.0"
+          fi
+
+          raw="${latest#v}"
+          IFS='.' read -r major minor patch <<< "$raw"
+          bump="${{ needs.prepare.outputs.bump }}"
+
+          case "$bump" in
+            patch)
+              patch=$((patch + 1))
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            *)
+              echo "invalid bump: $bump" >&2
+              exit 1
+              ;;
+          esac
+
+          next="v${major}.${minor}.${patch}"
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+            echo "tag already exists: $next" >&2
+            exit 1
+          fi
+
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          prev="${{ steps.version.outputs.previous_tag }}"
+          if [ "$prev" = "v0.0.0" ] && [ -z "$(git tag -l 'v*')" ]; then
+            log=$(git log --pretty=format:'- %s (%h)')
+          else
+            log=$(git log --pretty=format:'- %s (%h)' "${prev}"..HEAD)
+          fi
+          if [ -z "$log" ]; then
+            log='- no user-facing changes'
+          fi
+          {
+            echo 'changelog<<EOF'
+            echo "$log"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: create and push tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$version" -m "release $version"
+          git push origin "$version"
+
   build:
     name: Build x86_64-linux
+    needs: [prepare, create-tag]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.create-tag.outputs.version }}
+          persist-credentials: false
       - uses: actions/cache@v4
         with:
           path: |
@@ -51,7 +242,8 @@ jobs:
           mkdir -p dist
           tar -C target/x86_64-unknown-linux-gnu/release -czf dist/pccs-rs-x86_64-unknown-linux-gnu.tar.gz pccs-rs
           (cd dist && sha256sum pccs-rs-x86_64-unknown-linux-gnu.tar.gz > pccs-rs-x86_64-unknown-linux-gnu.tar.gz.sha256)
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ needs.create-tag.outputs.version }}"
+          VERSION="${VERSION#v}"
           chmod +x packaging/build-deb.sh
           ./packaging/build-deb.sh \
             --version "$VERSION" \
@@ -61,28 +253,55 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+          CHANGELOG: ${{ needs.create-tag.outputs.changelog }}
+          VERSION: ${{ needs.create-tag.outputs.version }}
+          REPO_LOWER: ${{ needs.prepare.outputs.repo_lower }}
+        run: |
+          set -euo pipefail
+          image_tag="${VERSION#v}"
+          {
+            echo "## changelog"
+            echo
+            printf '%s\n' "$CHANGELOG"
+            echo
+            echo "## docker image"
+            echo
+            echo '```bash'
+            echo "docker pull ghcr.io/${REPO_LOWER}:${image_tag}"
+            echo "docker pull ghcr.io/${REPO_LOWER}:latest"
+            echo '```'
+          } > /tmp/release-notes.md
+          gh release create "$VERSION" dist/* \
+            --title "$VERSION" \
+            --notes-file /tmp/release-notes.md
 
   docker:
     name: Publish GHCR image
+    needs: [prepare, create-tag]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.create-tag.outputs.version }}
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
           flavor: |
-            latest=auto
+            latest=true
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ needs.create-tag.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.create-tag.outputs.version }}
       - uses: docker/build-push-action@v6
         with:
           context: .
