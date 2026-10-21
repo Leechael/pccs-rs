@@ -37,6 +37,14 @@ pub const DEFAULT_UPSTREAM_MAX_ATTEMPTS: u32 = 6;
 /// request to a socket the far end has already closed. 0 disables pooling.
 pub const DEFAULT_UPSTREAM_POOL_IDLE_SECS: u64 = 60;
 
+/// Intel PCS + LAZY only: re-fetch a known platform's PCK cert pool when a GET
+/// asks for a raw TCB the pool has never seen. Deviation from Node parity.
+pub const DEFAULT_POOL_REFETCH_ON_NEW_TCB: bool = true;
+/// Minimum seconds between two pool re-fetches of one platform. In memory only.
+pub const DEFAULT_POOL_REFETCH_INTERVAL_SECS: u64 = 86_400;
+/// Re-fetch every known platform's pool during the scheduled refresh.
+pub const DEFAULT_SCHEDULED_POOL_REFRESH: bool = true;
+
 pub const DEFAULT_MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../packaging/config.toml");
@@ -332,6 +340,9 @@ struct TomlConfig {
     upstream_max_concurrent: Option<usize>,
     upstream_max_attempts: Option<u32>,
     upstream_pool_idle_seconds: Option<u64>,
+    pool_refetch_on_new_tcb: Option<bool>,
+    pool_refetch_interval_seconds: Option<u64>,
+    scheduled_pool_refresh: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +375,13 @@ pub struct Config {
     pub upstream_max_concurrent: usize,
     pub upstream_max_attempts: u32,
     pub upstream_pool_idle_secs: u64,
+    /// Intel PCS + LAZY only: re-fetch a known platform's PCK cert pool when a
+    /// `/pckcert` GET asks for a raw TCB the pool has never seen.
+    pub pool_refetch_on_new_tcb: bool,
+    /// Minimum seconds between two such re-fetches of one platform.
+    pub pool_refetch_interval_secs: u64,
+    /// Re-fetch every known platform's pool during the scheduled refresh.
+    pub scheduled_pool_refresh: bool,
     /// Problems noticed while parsing config, before tracing exists. `main`
     /// logs these right after the subscriber is installed; see
     /// `parse_body_size_reporting`.
@@ -404,6 +422,9 @@ impl Default for Config {
             upstream_max_concurrent: DEFAULT_UPSTREAM_MAX_CONCURRENT,
             upstream_max_attempts: DEFAULT_UPSTREAM_MAX_ATTEMPTS,
             upstream_pool_idle_secs: DEFAULT_UPSTREAM_POOL_IDLE_SECS,
+            pool_refetch_on_new_tcb: DEFAULT_POOL_REFETCH_ON_NEW_TCB,
+            pool_refetch_interval_secs: DEFAULT_POOL_REFETCH_INTERVAL_SECS,
+            scheduled_pool_refresh: DEFAULT_SCHEDULED_POOL_REFRESH,
             warnings: Vec::new(),
         }
     }
@@ -636,6 +657,15 @@ fn apply_toml(cfg: &mut Config, file: TomlConfig) {
     }
     if let Some(n) = file.upstream_pool_idle_seconds {
         cfg.upstream_pool_idle_secs = n;
+    }
+    if let Some(v) = file.pool_refetch_on_new_tcb {
+        cfg.pool_refetch_on_new_tcb = v;
+    }
+    if let Some(n) = file.pool_refetch_interval_seconds {
+        cfg.pool_refetch_interval_secs = n;
+    }
+    if let Some(v) = file.scheduled_pool_refresh {
+        cfg.scheduled_pool_refresh = v;
     }
 }
 
@@ -1014,6 +1044,9 @@ mod tests {
                 upstream_max_concurrent = 8
                 upstream_max_attempts = 9
                 upstream_pool_idle_seconds = 10
+                pool_refetch_on_new_tcb = false
+                pool_refetch_interval_seconds = 60
+                scheduled_pool_refresh = false
             "#,
         )
         .unwrap();
@@ -1038,6 +1071,10 @@ mod tests {
         assert_eq!(cfg.upstream_max_concurrent, 8);
         assert_eq!(cfg.upstream_max_attempts, 9);
         assert_eq!(cfg.upstream_pool_idle_secs, 10);
+        // Pool re-fetch knobs are TOML-only: no CLI / env counterpart.
+        assert!(!cfg.pool_refetch_on_new_tcb);
+        assert_eq!(cfg.pool_refetch_interval_secs, 60);
+        assert!(!cfg.scheduled_pool_refresh);
 
         // CLI wins over the file.
         let cfg = parse_serve([
@@ -1225,6 +1262,22 @@ mod tests {
         let file: TomlConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
         assert_eq!(file.api_key.as_deref(), Some(""));
         assert_eq!(file.db_path.as_deref(), Some(Path::new("/var/lib/pccs-rs")));
+        // The pool re-fetch deviation ships documented but commented out.
+        for key in [
+            "# pool_refetch_on_new_tcb = true",
+            "# pool_refetch_interval_seconds = 86400",
+            "# scheduled_pool_refresh = true",
+        ] {
+            assert!(DEFAULT_CONFIG_TOML.contains(key), "template must mention {key}");
+        }
+    }
+
+    #[test]
+    fn pool_refetch_defaults_are_on_with_a_daily_throttle() {
+        let cfg = Config::default();
+        assert!(cfg.pool_refetch_on_new_tcb);
+        assert_eq!(cfg.pool_refetch_interval_secs, 86_400);
+        assert!(cfg.scheduled_pool_refresh);
     }
 
     #[test]

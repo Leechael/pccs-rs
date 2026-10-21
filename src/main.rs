@@ -395,7 +395,7 @@ fn spawn_refresh_scheduler(
             let wait = (next - now).to_std().unwrap_or(std::time::Duration::from_secs(60));
             tracing::info!("next scheduled refresh at {next} (in {wait:?})");
             tokio::time::sleep(wait).await;
-            match cache.refresh(None, None).await {
+            match cache.scheduled_refresh().await {
                 Ok(()) => tracing::info!("scheduled refresh complete"),
                 Err(e) => tracing::warn!("scheduled refresh: {e}"),
             }
