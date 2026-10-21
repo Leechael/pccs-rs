@@ -3,9 +3,8 @@ name: Release
 # Manual bump + GHCR publish, modeled on
 # https://github.com/Phala-Network/phala-cloud-gin-starter/.github/workflows/release.yml
 # workflow_dispatch: pick patch/minor/major and an optional ref (default main).
-# issue_comment: on an open PR, a repo owner/member/collaborator can comment
-#   !release patch|minor|major
-# to tag that PR head and publish the same artifacts.
+# issue_comment: on an open same-repo PR, a repo owner/member/collaborator can
+# comment `!release patch|minor|major` to tag that PR head and publish.
 on:
   workflow_dispatch:
     inputs:
@@ -65,18 +64,32 @@ jobs:
               const match = body.match(/^!release\s+(patch|minor|major)$/i)
               const assoc = context.payload.comment?.author_association || 'NONE'
               const allowed = ['OWNER', 'MEMBER', 'COLLABORATOR']
+              const issue = context.payload.issue
 
-              if (match && context.payload.issue?.pull_request && allowed.includes(assoc)) {
-                const prNumber = context.payload.issue.number
+              if (
+                match &&
+                issue?.pull_request &&
+                issue.state === 'open' &&
+                allowed.includes(assoc)
+              ) {
+                const prNumber = issue.number
                 const pr = await github.rest.pulls.get({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   pull_number: prNumber,
                 })
-                shouldRelease = true
-                bump = match[1].toLowerCase()
-                targetSha = pr.data.head.sha
-                source = `pr#${prNumber}`
+                const headRepo = pr.data.head.repo?.full_name || ''
+                const baseRepo = `${context.repo.owner}/${context.repo.repo}`
+                if (pr.data.state !== 'open') {
+                  core.info(`skipping closed PR #${prNumber}`)
+                } else if (headRepo.toLowerCase() !== baseRepo.toLowerCase()) {
+                  core.info(`skipping fork PR #${prNumber} from ${headRepo}`)
+                } else {
+                  shouldRelease = true
+                  bump = match[1].toLowerCase()
+                  targetSha = pr.data.head.sha
+                  source = `pr#${prNumber}`
+                }
               }
             }
 
@@ -90,6 +103,9 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-tag
+      cancel-in-progress: false
     permissions:
       contents: write
     outputs:
@@ -102,6 +118,9 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.target_sha }}
           fetch-depth: 0
+          # Tagging only runs trusted shell steps; write token is needed for git push.
+          # Fork PR heads are rejected in prepare so untrusted remotes never reach here.
+          persist-credentials: true
 
       - name: fetch tags
         run: git fetch --tags --force
@@ -140,7 +159,7 @@ jobs:
           esac
 
           next="v${major}.${minor}.${patch}"
-          if git rev-parse "$next" >/dev/null 2>&1; then
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
             echo "tag already exists: $next" >&2
             exit 1
           fi
@@ -188,6 +207,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: refs/tags/${{ needs.create-tag.outputs.version }}
+          persist-credentials: false
       - uses: actions/cache@v4
         with:
           path: |
@@ -238,6 +258,7 @@ jobs:
           REPO_LOWER: ${{ needs.prepare.outputs.repo_lower }}
         run: |
           set -euo pipefail
+          image_tag="${VERSION#v}"
           {
             echo "## changelog"
             echo
@@ -246,7 +267,7 @@ jobs:
             echo "## docker image"
             echo
             echo '```bash'
-            echo "docker pull ghcr.io/${REPO_LOWER}:${VERSION}"
+            echo "docker pull ghcr.io/${REPO_LOWER}:${image_tag}"
             echo "docker pull ghcr.io/${REPO_LOWER}:latest"
             echo '```'
           } > /tmp/release-notes.md
@@ -265,25 +286,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: refs/tags/${{ needs.create-tag.outputs.version }}
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: set image tags
-        id: img
-        shell: bash
-        run: |
-          set -euo pipefail
-          repo_name=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          repo="${{ env.REGISTRY }}/${repo_name}"
-          version="${{ needs.create-tag.outputs.version }}"
-          raw="${version#v}"
-          major="${raw%%.*}"
-          minor="${raw#*.}"
-          minor="${minor%%.*}"
-          echo "tags=${repo}:${raw},${repo}:${major}.${minor},${repo}:latest" >> "$GITHUB_OUTPUT"
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          flavor: |
+            latest=true
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.create-tag.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.create-tag.outputs.version }}
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -291,6 +309,7 @@ jobs:
           provenance: false
           sbom: false
           platforms: linux/amd64
-          tags: ${{ steps.img.outputs.tags }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
