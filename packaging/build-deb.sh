@@ -78,7 +78,7 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${ARCH}
-Depends: libc6 (>= 2.31)
+Depends: libc6 (>= 2.31), ca-certificates
 Installed-Size: ${SIZE_KB}
 Maintainer: Leechael <yanleech@gmail.com>
 Homepage: https://github.com/Leechael/pccs-rs
