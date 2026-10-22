@@ -1,11 +1,13 @@
 //! NVIDIA OCSP request/response helpers for the collateral cache.
 //!
 //! Cache keys hash the DER `requestList`; `requestExtensions` are not part of
-//! the key. A request carrying an OCSP nonce is never cached at all: the
-//! responder echoes the nonce in its signed response, so a stored copy would
-//! fail the next client's nonce check. Expiry follows
-//! the signed `nextUpdate` (capped by a configured max TTL); responses without
-//! `nextUpdate` use `thisUpdate + default_ttl`, matching the NVIDIA verifier.
+//! the key, so requests with different OCSP nonces share one entry. This
+//! matches NVIDIA's Trust Outpost relying-party policy, which accepts a cached
+//! response whose responder nonce differs; freshness is proven by the GPU
+//! attestation evidence nonce. Expiry follows the signed `nextUpdate` (capped by
+//! a configured max TTL); responses without `nextUpdate` use
+//! `thisUpdate + default_ttl`, matching the NVIDIA verifier. A response with an
+//! `unknown` certificate status is never cached.
 
 use crate::error::{self, PccsError};
 use chrono::{DateTime, NaiveDateTime};
@@ -15,6 +17,8 @@ use sha2::{Digest, Sha256};
 struct ResponseValidity {
     this_update: i64,
     next_update: Option<i64>,
+    /// CertStatus is `unknown` [2].
+    unknown: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -24,8 +28,8 @@ struct Tlv<'a> {
     raw: &'a [u8],
 }
 
-/// id-pkix-ocsp-nonce, 1.3.6.1.5.5.7.48.1.2.
-const OID_OCSP_NONCE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
+/// CertStatus `unknown` [2] IMPLICIT NULL.
+const CERT_STATUS_UNKNOWN: u8 = 0x82;
 
 /// id-pkix-ocsp-basic, 1.3.6.1.5.5.7.48.1.1.
 const OID_OCSP_BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
@@ -33,8 +37,6 @@ const OID_OCSP_BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 
 pub struct OcspRequest {
     /// Hex SHA-256 of the DER requestList.
     pub cache_key: String,
-    /// The request carries an id-pkix-ocsp-nonce request extension.
-    pub has_nonce: bool,
 }
 
 pub fn parse_request(request: &[u8]) -> Result<OcspRequest, PccsError> {
@@ -52,16 +54,15 @@ pub fn parse_request(request: &[u8]) -> Result<OcspRequest, PccsError> {
             0x30 => {
                 validate_request_list(field.value)?;
                 // Only the optional requestExtensions [2] may follow.
-                let mut has_nonce = false;
                 if !tbs_fields.is_empty() {
                     let extensions = take_expected(&mut tbs_fields, 0xa2)?;
-                    has_nonce = has_nonce_extension(parse_single(extensions.value, 0x30)?.value)?;
+                    validate_extensions(parse_single(extensions.value, 0x30)?.value)?;
                 }
                 if !tbs_fields.is_empty() {
                     return Err(error::INVALID_REQ);
                 }
                 let cache_key = hex::encode(Sha256::digest(field.raw));
-                return Ok(OcspRequest { cache_key, has_nonce });
+                return Ok(OcspRequest { cache_key });
             }
             _ => return Err(error::INVALID_REQ),
         }
@@ -81,6 +82,11 @@ pub fn response_cache_expiry(
     let max_ttl = i64::try_from(max_ttl_seconds).map_err(|_| error::INTERNAL_ERROR)?;
     let mut expires_at = now.checked_add(max_ttl).ok_or(error::INTERNAL_ERROR)?;
     for item in validity {
+        // The responder does not know the certificate; that answer can change
+        // as soon as it learns of it, so it is relayed but never stored.
+        if item.unknown {
+            return Err(error::INVALID_REQ);
+        }
         // Do not cache a response which claims to have been produced in the
         // future. The guest performs the authoritative freshness check.
         if item.this_update > now {
@@ -97,13 +103,12 @@ pub fn response_cache_expiry(
 }
 
 /// Walk `Extensions` (SEQUENCE OF Extension { extnID, critical?, extnValue })
-/// and report whether one of them is the OCSP nonce.
-fn has_nonce_extension(mut extensions: &[u8]) -> Result<bool, PccsError> {
-    let mut found = false;
+/// and reject a malformed list. The extensions are not part of the cache key.
+fn validate_extensions(mut extensions: &[u8]) -> Result<(), PccsError> {
     while !extensions.is_empty() {
         let extension = take_expected(&mut extensions, 0x30)?;
         let mut fields = extension.value;
-        let oid = take_expected(&mut fields, 0x06)?;
+        take_expected(&mut fields, 0x06)?;
         if peek_tag(fields) == Some(0x01) {
             take_expected(&mut fields, 0x01)?;
         }
@@ -111,9 +116,8 @@ fn has_nonce_extension(mut extensions: &[u8]) -> Result<bool, PccsError> {
         if !fields.is_empty() {
             return Err(error::INVALID_REQ);
         }
-        found |= oid.value == OID_OCSP_NONCE;
     }
-    Ok(found)
+    Ok(())
 }
 
 fn validate_request_list(mut request_list: &[u8]) -> Result<(), PccsError> {
@@ -189,6 +193,7 @@ fn response_validity(response: &[u8]) -> Result<Vec<ResponseValidity>, PccsError
         if cert_status.tag & 0xc0 != 0x80 {
             return Err(error::INVALID_REQ);
         }
+        let unknown = cert_status.tag == CERT_STATUS_UNKNOWN;
         let this_update = take_expected(&mut fields, 0x18)?;
         let this_update = parse_generalized_time(this_update.value)?;
         let next_update = if peek_tag(fields) == Some(0xa0) {
@@ -205,7 +210,7 @@ fn response_validity(response: &[u8]) -> Result<Vec<ResponseValidity>, PccsError
         if !fields.is_empty() {
             return Err(error::INVALID_REQ);
         }
-        validity.push(ResponseValidity { this_update, next_update });
+        validity.push(ResponseValidity { this_update, next_update, unknown });
     }
     if validity.is_empty() {
         return Err(error::INVALID_REQ);
@@ -295,6 +300,9 @@ fn take_tlv<'a>(input: &mut &'a [u8]) -> Result<Tlv<'a>, PccsError> {
 mod tests {
     use super::*;
 
+    /// id-pkix-ocsp-nonce, 1.3.6.1.5.5.7.48.1.2.
+    const OID_OCSP_NONCE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
+
     fn der(tag: u8, value: &[u8]) -> Vec<u8> {
         let mut result = vec![tag];
         if value.len() < 128 {
@@ -347,12 +355,30 @@ mod tests {
         response_type: &[u8],
         after_data: &[Vec<u8>],
     ) -> Vec<u8> {
+        let signed = single_response(der(0x80, &[]), this_update, next_update);
+        response_data_with(vec![signed], response_type, after_data)
+    }
+
+    /// One SingleResponse with the given encoded CertStatus.
+    fn single_response(
+        cert_status: Vec<u8>,
+        this_update: &str,
+        next_update: Option<&str>,
+    ) -> Vec<u8> {
         let cert_id = sequence(&[der(0x02, &[1])]);
-        let mut single = vec![cert_id, der(0x80, &[]), der(0x18, this_update.as_bytes())];
+        let mut single = vec![cert_id, cert_status, der(0x18, this_update.as_bytes())];
         if let Some(next_update) = next_update {
             single.push(der(0xa0, &der(0x18, next_update.as_bytes())));
         }
-        let responses = sequence(&[sequence(&single)]);
+        sequence(&single)
+    }
+
+    fn response_data_with(
+        singles: Vec<Vec<u8>>,
+        response_type: &[u8],
+        after_data: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let responses = sequence(&singles);
         let response_data =
             sequence(&[der(0x82, &[7; 20]), der(0x18, b"20260716120000Z"), responses]);
         let mut basic = vec![response_data];
@@ -363,16 +389,16 @@ mod tests {
     }
 
     #[test]
-    fn nonce_extension_is_detected() {
+    fn request_extensions_are_not_part_of_the_key() {
         let plain = parse_request(&request_with(&[])).unwrap();
-        assert!(!plain.has_nonce);
         let nonced = parse_request(&request_with(&[nonce_extension(1)])).unwrap();
-        assert!(nonced.has_nonce);
         assert_eq!(nonced.cache_key, plain.cache_key);
-        // id-pkix-ocsp-response (acceptable responses) is not a nonce.
+        let other = parse_request(&request_with(&[nonce_extension(2)])).unwrap();
+        assert_eq!(other.cache_key, plain.cache_key);
+        // id-pkix-ocsp-response (acceptable responses) alongside a nonce.
         let acceptable = extension(&[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x04], &[]);
-        assert!(!parse_request(&request_with(&[acceptable.clone()])).unwrap().has_nonce);
-        assert!(parse_request(&request_with(&[acceptable, nonce_extension(2)])).unwrap().has_nonce);
+        let both = parse_request(&request_with(&[acceptable, nonce_extension(2)])).unwrap();
+        assert_eq!(both.cache_key, plain.cache_key);
         // An Extension without extnValue is malformed.
         let broken = sequence(&[der(0x06, OID_OCSP_NONCE)]);
         assert!(parse_request(&request_with(&[broken])).is_err());
@@ -449,6 +475,42 @@ mod tests {
         assert!(!cacheable(&[algorithm.clone()]));
         assert!(!cacheable(&[algorithm.clone(), signature.clone(), certs, der(0x05, &[])]));
         assert!(!cacheable(&[algorithm, signature, der(0xa0, &der(0x02, &[1]))]));
+    }
+
+    /// CertStatus: good [0] NULL, revoked [1] RevokedInfo, unknown [2] NULL.
+    fn status_good() -> Vec<u8> {
+        der(0x80, &[])
+    }
+    fn status_revoked() -> Vec<u8> {
+        der(0xa1, &der(0x18, b"20260101000000Z"))
+    }
+    fn status_unknown() -> Vec<u8> {
+        der(0x82, &[])
+    }
+
+    fn cacheable_with(statuses: Vec<Vec<u8>>) -> bool {
+        let signature = vec![sequence(&[der(0x06, &[0x2a, 0x03])]), der(0x03, &[0])];
+        let singles = statuses
+            .into_iter()
+            .map(|status| single_response(status, "20260716114500Z", Some("20260716123000Z")))
+            .collect();
+        let response = response_data_with(singles, OID_OCSP_BASIC, &signature);
+        response_cache_expiry(&response, 1_784_202_600, 86_400, 3_600).is_ok()
+    }
+
+    #[test]
+    fn good_and_revoked_responses_are_cacheable() {
+        assert!(cacheable_with(vec![status_good()]));
+        assert!(cacheable_with(vec![status_revoked()]));
+        assert!(cacheable_with(vec![status_good(), status_revoked()]));
+    }
+
+    #[test]
+    fn unknown_status_is_not_cacheable() {
+        assert!(!cacheable_with(vec![status_unknown()]));
+        // One unknown among several SingleResponses keeps the whole answer out.
+        assert!(!cacheable_with(vec![status_good(), status_unknown()]));
+        assert!(!cacheable_with(vec![status_unknown(), status_revoked()]));
     }
 
     #[test]

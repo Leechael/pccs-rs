@@ -127,6 +127,7 @@ db_path = "/var/lib/pccs-rs"
 # nvidia_ocsp_uri = "https://ocsp.ndis.nvidia.com"
 # nvidia_ocsp_max_ttl_seconds = 86400 # 24 hours
 # nvidia_ocsp_default_ttl_seconds = 3600 # 1 hour
+# readthrough_max_entries_per_kind = 10000 # AMD KDS, NVIDIA RIM and NVIDIA OCSP each
 # proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
 # user_token_hash = ""
@@ -166,12 +167,27 @@ db_path = "/var/lib/pccs-rs"
   `POST /ocsp` with `Content-Type: application/ocsp-request` is a read-through
   cache. The cache key is the SHA-256 of the full DER `requestList` (every
   CertID plus any `singleRequestExtensions`); `requestExtensions` are not part
-  of the key. A request carrying an OCSP nonce is relayed and never cached:
-  the responder echoes the nonce in its signed response. Entries expire at the
+  of the key, so requests that differ only in their OCSP nonce share one
+  entry and are served from it, including in `req` and `offline` mode. A cached
+  response carries the responder nonce of the request that filled it. This
+  matches NVIDIA's Trust Outpost relying-party policy
+  (`allow_trust_outpost_ocsp.rego`), which accepts a cached OCSP response whose
+  nonce does not match; freshness is still guaranteed by the nonce in the GPU
+  attestation evidence. Verifiers behind this proxy must use that policy.
+  Entries expire at the
   signed `nextUpdate` (capped by `nvidia_ocsp_max_ttl_seconds`); responses
   without `nextUpdate` expire `nvidia_ocsp_default_ttl_seconds` (default one
-  hour) after `thisUpdate`. Expired OCSP is never served. This is the missing piece
+  hour) after `thisUpdate`. Expired OCSP is never served. A response with an
+  `unknown` certificate status (in any of its SingleResponses) is relayed but
+  not stored; `good` and `revoked` are cached. This is the missing piece
   for using pccs-rs as a dstack `nvidia_attestation_proxy_url`.
+- Each read-through kind (AMD KDS, NVIDIA RIM, NVIDIA OCSP) keeps at most
+  `readthrough_max_entries_per_kind` entries (default 10000; CLI
+  `--readthrough-max-entries-per-kind`, env
+  `PCCS_READTHROUGH_MAX_ENTRIES_PER_KIND`; a value below 1 is treated as 1).
+  When a kind is full, writing a new entry evicts the oldest-written one
+  (FIFO); refreshing an existing entry renews its age. Expiry and the daily
+  sweep still remove entries earlier.
 - The NVIDIA NRAS host defaults to `https://nras.attestation.nvidia.com`.
   `POST /nvidia/nras/attest/gpu` is a **stateless CORS proxy** to
   `{host}/v3/attest/gpu`. Responses are nonce-bound and are **not** stored in
@@ -372,7 +388,7 @@ REQ / OFFLINE answer `461` for those platforms until refilled.
   host (`amd_kds_uri`, default `https://kdsintf.amd.com`)
 - NVIDIA RIM-compatible `GET /v1/rim/{*path}`, forwarding path and query to
   `rim.attestation.nvidia.com`
-- NVIDIA OCSP cache `POST /ocsp` → `ocsp.ndis.nvidia.com` (nonce requests relayed uncached;
+- NVIDIA OCSP cache `POST /ocsp` → `ocsp.ndis.nvidia.com` (nonce is not part of the key;
   expires at `nextUpdate`; non-LAZY miss is 404)
 - NVIDIA NRAS CORS proxy `POST /nvidia/nras/attest/gpu` →
   `nras.attestation.nvidia.com/v3/attest/gpu` (no persistence; OFFLINE is 503)

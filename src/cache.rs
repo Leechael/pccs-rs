@@ -247,7 +247,10 @@ fn canonicalize_nvidia_rim(path_and_query: &str) -> Result<String, PccsError> {
 }
 
 impl Cache {
-    pub fn new(store: Store, pcs: PcsClient, cfg: &Config) -> Self {
+    pub fn new(mut store: Store, pcs: PcsClient, cfg: &Config) -> Self {
+        store.set_readthrough_max_entries(
+            usize::try_from(cfg.readthrough_max_entries_per_kind).unwrap_or(usize::MAX),
+        );
         Self {
             mode: cfg.cache_mode,
             pcs_version: cfg.pcs_version(),
@@ -445,19 +448,12 @@ impl Cache {
     }
     /// Cached NVIDIA OCSP proxy. Cache key hashes the DER requestList.
     /// Expired entries are never served. OFFLINE never calls upstream;
-    /// non-LAZY misses return NO_CACHE_DATA. A nonce-bearing request is a miss
-    /// that is never cached: the responder echoes the nonce in its signed
-    /// response, so a stored copy would fail another client's nonce check.
+    /// non-LAZY misses return NO_CACHE_DATA. The OCSP nonce is not part of the
+    /// key: a nonce-bearing request shares the entry of its CertID list, as
+    /// NVIDIA's Trust Outpost relying-party policy accepts a cached responder
+    /// nonce.
     pub async fn get_nvidia_ocsp(&self, body: &[u8]) -> Result<AmdKdsResponse, PccsError> {
         let request = crate::ocsp::parse_request(body)?;
-        if request.has_nonce {
-            self.store.record_miss();
-            if self.mode != CacheMode::Lazy {
-                return Err(error::NO_CACHE_DATA);
-            }
-            self.store.record_upstream();
-            return self.post_nvidia_ocsp(body).await;
-        }
         let cache_key = request.cache_key;
         let store_key = keys::nvidia_ocsp(&cache_key);
         let now = unix_time();
@@ -523,7 +519,9 @@ impl Cache {
                 return Ok(resp);
             }
         };
-        // deferred: hard size bound for the OCSP cache | impact: /ocsp is unauthenticated, so distinct CertIDs the responder answers with 200 can fill disk until their nextUpdate (at most nvidia_ocsp_max_ttl_secs) and the next scheduled sweep | trigger: auth or a quota on /ocsp is decided
+        // The store caps this kind at `readthrough_max_entries_per_kind` and
+        // evicts the oldest-written entry, so unauthenticated /ocsp traffic
+        // cannot grow the cache without bound.
         let rec = NvidiaOcspRecord {
             cache_key,
             body: resp.body.clone(),
@@ -2146,6 +2144,37 @@ mod tests {
             content_type: None,
             fetched_at: 0,
             expires_at,
+        }
+    }
+
+    /// `ocsp_request` plus an id-pkix-ocsp-nonce request extension.
+    fn ocsp_request_with_nonce(nonce: u8) -> Vec<u8> {
+        fn der(tag: u8, value: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag, value.len() as u8];
+            out.extend_from_slice(value);
+            out
+        }
+        let algorithm = der(0x30, &der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a]));
+        let cert_id = der(
+            0x30,
+            &[algorithm, der(0x04, &[1; 20]), der(0x04, &[2; 20]), der(0x02, &[3])].concat(),
+        );
+        let list = der(0x30, &der(0x30, &cert_id));
+        let oid = der(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02]);
+        let nonce_ext = der(0x30, &[oid, der(0x04, &der(0x04, &[nonce; 16]))].concat());
+        let extensions = der(0xa2, &der(0x30, &nonce_ext));
+        der(0x30, &der(0x30, &[list, extensions].concat()))
+    }
+
+    #[tokio::test]
+    async fn nvidia_ocsp_nonce_request_is_served_from_cache_in_every_mode() {
+        let plain = ocsp_request();
+        let key = crate::ocsp::parse_request(&plain).unwrap().cache_key;
+        for mode in [CacheMode::Offline, CacheMode::Req, CacheMode::Lazy] {
+            let (_dir, cache) = ocsp_cache("", mode);
+            cache.store.put_nvidia_ocsp(&ocsp_record(&key, unix_time() + 3600)).unwrap();
+            let hit = cache.get_nvidia_ocsp(&ocsp_request_with_nonce(9)).await.unwrap();
+            assert_eq!((hit.status, hit.body), (200, b"ocsp".to_vec()), "{mode:?}");
         }
     }
 
