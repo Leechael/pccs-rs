@@ -302,8 +302,9 @@ jobs:
           tags: |
             type=semver,pattern={{version}},value=${{ needs.create-tag.outputs.version }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.create-tag.outputs.version }}
-      # The base images come from public.ecr.aws anonymously, which can return
-      # 429. Retry the build twice with backoff; the last attempt fails the job.
+      # The base images are pulled anonymously from mirror.gcr.io; a registry
+      # can still return 429. Retry the build twice with backoff; the last
+      # attempt fails the job.
       - uses: docker/build-push-action@v7
         id: build1
         continue-on-error: true

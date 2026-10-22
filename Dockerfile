@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/rust:1-bookworm AS builder
+FROM mirror.gcr.io/library/rust:1-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         clang \
@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # bookworm-slim, pinned by index digest. Bump the digest to pick up new base
 # layers; apt-get below still pulls the current bookworm(-security) packages.
-FROM public.ecr.aws/docker/library/debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+FROM mirror.gcr.io/library/debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 # The upstream PCS client trusts the system store (rustls-native-certs).
 # ca-certificates 20250419~deb12u2 drops the emSign ECC Root CA - G3 and Comodo
 # AAA roots behind the compromised eMudhra intermediates (CVE-2026-111943).
