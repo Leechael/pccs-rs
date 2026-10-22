@@ -26,6 +26,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# Minimum-version guard: 0.103.16 distrusts the eMudhra/emSign intermediate CA
+# keys (CVE-2026-111943, RUSTSEC-2026-0383) regardless of which roots the
+# system trust store holds. Not used directly; no features are enabled here.
+rustls-webpki = { version = "0.103.16", default-features = false }
 subtle = "2"
 bytes = "1"
 thiserror = "2"
