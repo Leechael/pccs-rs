@@ -164,10 +164,13 @@ db_path = "/var/lib/pccs-rs"
   suffix on the configured host is stripped.
 - The NVIDIA OCSP host defaults to `https://ocsp.ndis.nvidia.com`.
   `POST /ocsp` with `Content-Type: application/ocsp-request` is a read-through
-  cache. Cache keys hash the DER CertID list only (the per-request OCSP nonce
-  is excluded). Entries expire at the signed `nextUpdate` (capped by
-  `nvidia_ocsp_max_ttl_seconds`); responses without `nextUpdate` use one hour
-  from `thisUpdate`. Expired OCSP is never served. This is the missing piece
+  cache. The cache key is the SHA-256 of the full DER `requestList` (every
+  CertID plus any `singleRequestExtensions`); `requestExtensions` are not part
+  of the key. A request carrying an OCSP nonce is relayed and never cached:
+  the responder echoes the nonce in its signed response. Entries expire at the
+  signed `nextUpdate` (capped by `nvidia_ocsp_max_ttl_seconds`); responses
+  without `nextUpdate` expire `nvidia_ocsp_default_ttl_seconds` (default one
+  hour) after `thisUpdate`. Expired OCSP is never served. This is the missing piece
   for using pccs-rs as a dstack `nvidia_attestation_proxy_url`.
 - The NVIDIA NRAS host defaults to `https://nras.attestation.nvidia.com`.
   `POST /nvidia/nras/attest/gpu` is a **stateless CORS proxy** to
@@ -346,6 +349,7 @@ JSON.
 | `crl/` | uri | CRL bytes |
 | `amd-kds/` | complete upstream URL | response bytes, content headers, fetch time |
 | `nvidia-rim/` | complete upstream URL | response bytes, content headers, fetch time |
+| `nvidia-ocsp/` | SHA-256 hex of the DER `requestList` (not CityHash) | response bytes, content type, fetch time, expiry |
 | `appraisal/` | fmspc | policy list (GET joins defaults) |
 | `preg/` | qeid / pceid / cpusvn / pcesvn | registration queue |
 
@@ -368,7 +372,7 @@ REQ / OFFLINE answer `461` for those platforms until refilled.
   host (`amd_kds_uri`, default `https://kdsintf.amd.com`)
 - NVIDIA RIM-compatible `GET /v1/rim/{*path}`, forwarding path and query to
   `rim.attestation.nvidia.com`
-- NVIDIA OCSP cache `POST /ocsp` → `ocsp.ndis.nvidia.com` (nonce excluded from key;
+- NVIDIA OCSP cache `POST /ocsp` → `ocsp.ndis.nvidia.com` (nonce requests relayed uncached;
   expires at `nextUpdate`; non-LAZY miss is 404)
 - NVIDIA NRAS CORS proxy `POST /nvidia/nras/attest/gpu` →
   `nras.attestation.nvidia.com/v3/attest/gpu` (no persistence; OFFLINE is 503)
