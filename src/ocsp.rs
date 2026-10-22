@@ -37,6 +37,14 @@ pub fn request_cache_key(request: &[u8]) -> Result<String, PccsError> {
             // requestList is the first untagged SEQUENCE in TBSRequest.
             0x30 => {
                 validate_request_list(field.value)?;
+                // Only the optional requestExtensions [2] may follow.
+                if !tbs_fields.is_empty() {
+                    let extensions = take_expected(&mut tbs_fields, 0xa2)?;
+                    parse_single(extensions.value, 0x30)?;
+                }
+                if !tbs_fields.is_empty() {
+                    return Err(error::INVALID_REQ);
+                }
                 return Ok(hex::encode(Sha256::digest(field.raw)));
             }
             _ => return Err(error::INVALID_REQ),
@@ -297,6 +305,27 @@ mod tests {
     #[test]
     fn cache_key_rejects_malformed_requests() {
         assert!(request_cache_key(&[0x30, 0x01, 0]).is_err());
+    }
+
+    fn request_with_tail(tail: &[Vec<u8>]) -> Vec<u8> {
+        let algorithm = sequence(&[der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a])]);
+        let cert_id =
+            sequence(&[algorithm, der(0x04, &[1; 20]), der(0x04, &[2; 20]), der(0x02, &[3])]);
+        let list = sequence(&[sequence(&[cert_id])]);
+        let mut tbs = vec![list];
+        tbs.extend_from_slice(tail);
+        sequence(&[sequence(&tbs)])
+    }
+
+    #[test]
+    fn cache_key_rejects_fields_after_request_list() {
+        let extensions = der(0xa2, &sequence(&[]));
+        assert!(request_cache_key(&request_with_tail(&[])).is_ok());
+        assert!(request_cache_key(&request_with_tail(&[extensions.clone()])).is_ok());
+        // An unknown field, junk after the extensions, and a non-SEQUENCE [2].
+        assert!(request_cache_key(&request_with_tail(&[der(0xa3, &[])])).is_err());
+        assert!(request_cache_key(&request_with_tail(&[extensions, der(0x05, &[])])).is_err());
+        assert!(request_cache_key(&request_with_tail(&[der(0xa2, &der(0x04, &[1]))])).is_err());
     }
 
     #[test]
