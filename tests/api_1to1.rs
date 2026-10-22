@@ -3433,6 +3433,39 @@ async fn amd_kds_unknown_query_is_rejected_and_known_params_are_canonicalised() 
 }
 
 #[tokio::test]
+async fn amd_kds_turin_vcek_kms_form_reaches_upstream_canonicalised() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-turin");
+    let app = create_app_from_config(cfg);
+    let turin = "0123456789abcdef";
+    let milan = "cd".repeat(64);
+
+    // The form sev-snp-qvl sends for Turin: 16-hex hwid, fmcSPL first.
+    let kms = format!("/vcek/v1/Turin/{turin}?fmcSPL=1&blSPL=2&teeSPL=3&snpSPL=4&ucodeSPL=5");
+    let (status, _, body) = send(app.clone(), get(&kms)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "ok");
+
+    let milan_req = format!("/vcek/v1/Milan/{milan}?blSPL=2&teeSPL=3&snpSPL=4&ucodeSPL=5");
+    let (status, _, _) = send(app.clone(), get(&milan_req)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[0].path,
+        format!("/vcek/v1/Turin/{turin}?blSPL=2&fmcSPL=1&snpSPL=4&teeSPL=3&ucodeSPL=5")
+    );
+    assert_eq!(
+        seen[1].path,
+        format!("/vcek/v1/Milan/{milan}?blSPL=2&snpSPL=4&teeSPL=3&ucodeSPL=5")
+    );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
 async fn amd_kds_redirect_is_a_bad_gateway_and_client_errors_pass_through() {
     let (upstream, seen) = spawn_recording_upstream(
         StatusCode::FOUND,

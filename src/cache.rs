@@ -158,7 +158,7 @@ fn is_alnum_segment(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-const AMD_HWID_QUERY_PARAMS: &[&str] = &["blSPL", "snpSPL", "teeSPL", "ucodeSPL"];
+const AMD_HWID_QUERY_PARAMS: &[&str] = &["blSPL", "fmcSPL", "snpSPL", "teeSPL", "ucodeSPL"];
 
 fn is_spl_value(value: &str) -> bool {
     (1..=3).contains(&value.len())
@@ -1711,6 +1711,37 @@ mod tests {
         assert_err(
             &canonicalize_amd_kds("/vcek/v1/Genoa/abcd?blSPL=1&blSPL=2").unwrap_err(),
             &error::INVALID_REQ,
+        );
+    }
+
+    #[test]
+    fn amd_kds_turin_kms_query_with_fmc_spl_is_sorted() {
+        // sev-snp-qvl: Turin uses chip_id[..8] (16 hex) and adds fmcSPL.
+        let turin = "0123456789abcdef";
+        assert_eq!(
+            canonicalize_amd_kds(&format!(
+                "/vcek/v1/Turin/{turin}?fmcSPL=1&blSPL=2&teeSPL=3&snpSPL=4&ucodeSPL=5"
+            ))
+            .unwrap(),
+            format!("/vcek/v1/Turin/{turin}?blSPL=2&fmcSPL=1&snpSPL=4&teeSPL=3&ucodeSPL=5")
+        );
+        assert_err(
+            &canonicalize_amd_kds(&format!("/vcek/v1/Turin/{turin}?fmcSPL=256")).unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(
+            &canonicalize_amd_kds(&format!("/vcek/v1/Turin/{turin}?fmcSPL=1&fmcSPL=1"))
+                .unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        // Milan/Genoa: full 64-byte chip_id (128 hex), no fmcSPL.
+        let genoa = "ab".repeat(64);
+        assert_eq!(
+            canonicalize_amd_kds(&format!(
+                "/vcek/v1/Genoa/{genoa}?blSPL=2&teeSPL=3&snpSPL=4&ucodeSPL=5"
+            ))
+            .unwrap(),
+            format!("/vcek/v1/Genoa/{genoa}?blSPL=2&snpSPL=4&teeSPL=3&ucodeSPL=5")
         );
     }
 
