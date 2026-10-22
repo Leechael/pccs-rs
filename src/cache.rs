@@ -388,12 +388,16 @@ impl Cache {
     /// Delete the expired read-through records no request came back for.
     fn sweep_expired(&self) {
         let now = unix_time();
-        let ttl = self.amd_kds_cache_ttl_secs;
-        let expired = |rec: &AmdKdsRecord| now.saturating_sub(rec.fetched_at) >= ttl;
-        match self.store.sweep_prefix(keys::AMD_KDS, expired) {
-            Ok(0) => {}
-            Ok(n) => tracing::info!("swept {n} expired amd kds records"),
-            Err(e) => tracing::warn!("amd kds sweep: {e}"),
+        for (prefix, ttl) in [
+            (keys::AMD_KDS, self.amd_kds_cache_ttl_secs),
+            (keys::NVIDIA_RIM, self.nvidia_rim_cache_ttl_secs),
+        ] {
+            let expired = |rec: &AmdKdsRecord| now.saturating_sub(rec.fetched_at) >= ttl;
+            match self.store.sweep_prefix(prefix, expired) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("swept {n} expired {prefix} records"),
+                Err(e) => tracing::warn!("{prefix} sweep: {e}"),
+            }
         }
     }
 
@@ -1683,6 +1687,40 @@ mod tests {
             let _ = cache.scheduled_refresh().await;
             assert!(cache.store.get_amd_kds(&stale).is_none(), "{mode:?} kept an expired record");
             assert!(cache.store.get_amd_kds(&fresh).is_some(), "{mode:?} swept a fresh record");
+        }
+    }
+
+    fn rim_cache(nvidia_rim_uri: &str, mode: CacheMode) -> (TestDir, Arc<Cache>) {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-cache-{}", uuid::Uuid::new_v4()));
+        let cfg = Config {
+            uri: String::new(),
+            nvidia_rim_uri: nvidia_rim_uri.into(),
+            cache_mode: mode,
+            db_path: dir.clone(),
+            upstream_max_attempts: 1,
+            ..Config::default()
+        };
+        let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
+        let pcs = PcsClient::new(&cfg).unwrap();
+        (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
+    }
+
+    #[tokio::test]
+    async fn expired_nvidia_rim_records_are_deleted_on_lookup_and_swept() {
+        let host = "http://127.0.0.1:0";
+        let looked_up = format!("{host}/v1/rim/looked-up");
+        let stale = format!("{host}/v1/rim/stale");
+        let fresh = format!("{host}/v1/rim/fresh");
+        for mode in [CacheMode::Offline, CacheMode::Lazy] {
+            let (_dir, cache) = rim_cache(host, mode);
+            for (url, at) in [(&looked_up, 0), (&stale, 0), (&fresh, unix_time())] {
+                cache.store.put_nvidia_rim(&amd_record(url, at)).unwrap();
+            }
+            assert!(cache.get_nvidia_rim("/v1/rim/looked-up").await.is_err());
+            assert!(cache.store.get_nvidia_rim(&looked_up).is_none(), "{mode:?} lookup kept it");
+            let _ = cache.scheduled_refresh().await;
+            assert!(cache.store.get_nvidia_rim(&stale).is_none(), "{mode:?} sweep kept it");
+            assert!(cache.store.get_nvidia_rim(&fresh).is_some(), "{mode:?} swept a fresh one");
         }
     }
 
