@@ -421,3 +421,61 @@ pub async fn get_appraisal_policy(
 pub async fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
+
+/// Paths that consume a request body. Everything else — every GET, `/refresh`,
+/// and unmatched routes — must not carry one.
+fn route_expects_body(method: &Method, path: &str) -> bool {
+    match (method, path) {
+        (&Method::POST, "/sgx/certification/v3/platforms" | "/sgx/certification/v4/platforms") => {
+            true
+        }
+        (
+            &Method::PUT,
+            "/sgx/certification/v3/platformcollateral" | "/sgx/certification/v4/platformcollateral",
+        ) => true,
+        (
+            &Method::PUT,
+            "/sgx/certification/v3/appraisalpolicy" | "/sgx/certification/v4/appraisalpolicy",
+        ) => true,
+        (&Method::POST, "/ocsp") => true,
+        (&Method::POST, "/nvidia/nras/attest/gpu") => true,
+        _ => false,
+    }
+}
+
+/// A client advertised a body: non-zero Content-Length, or a chunked body.
+fn request_carries_body(headers: &HeaderMap) -> bool {
+    if let Some(len) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if len > 0 {
+            return true;
+        }
+    }
+    headers
+        .get(header::TRANSFER_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.to_ascii_lowercase().split(',').any(|part| part.trim() == "chunked"))
+}
+
+/// Routes that take no body answer 413 when the request advertises one.
+pub async fn reject_unexpected_body(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let has_body = request_carries_body(req.headers());
+    if has_body && !route_expects_body(&method, &path) {
+        return error::CONTENT_TOO_LARGE.into_response();
+    }
+    next.run(req).await
+}
+
+/// `/pckcrl/` and the like must not match `/pckcrl`. A trailing slash is 404.
+pub async fn reject_trailing_slash(req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if path.len() > 1 && path.ends_with('/') {
+        return not_found().await;
+    }
+    next.run(req).await
+}

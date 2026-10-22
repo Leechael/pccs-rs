@@ -32,9 +32,10 @@ pub const DEFAULT_REFRESH: &str = "0 0 1 * * *";
 /// Packaged default path. systemd always passes `--config` pointing here.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/pccs-rs/config.toml";
 
-/// Node `pccs_server.js` server timeouts.
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
-pub const DEFAULT_HEADERS_TIMEOUT_SECS: u64 = 10;
+/// Receive-side server timeouts. Header read is 30s; the whole request
+/// (headers + body) is 60s. Neither bound response production.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_HEADERS_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_KEEPALIVE_TIMEOUT_SECS: u64 = 60;
 
 /// Upstream client limits (see `pcs.rs`).
@@ -280,11 +281,11 @@ pub struct ServeArgs {
     pub max_open_files: Option<i32>,
 
     /// Time allowed to *receive* a request (headers + body), like Node's
-    /// `server.requestTimeout`. Does not bound response production. Default 15.
+    /// `server.requestTimeout`. Does not bound response production. Default 60.
     #[arg(long, env = "PCCS_REQUEST_TIMEOUT_SECONDS")]
     pub request_timeout_seconds: Option<u64>,
 
-    /// Request-header read timeout (seconds). Default 10.
+    /// Request-header read timeout (seconds). Default 30.
     #[arg(long, env = "PCCS_HEADERS_TIMEOUT_SECONDS")]
     pub headers_timeout_seconds: Option<u64>,
 
@@ -1091,6 +1092,10 @@ mod tests {
         assert_eq!(cfg.nvidia_nras_uri, DEFAULT_NVIDIA_NRAS_URI);
         assert_eq!(cfg.nvidia_ocsp_uri, DEFAULT_NVIDIA_OCSP_URI);
         assert_eq!(cfg.readthrough_max_entries_per_kind, DEFAULT_READTHROUGH_MAX_ENTRIES_PER_KIND);
+        assert_eq!(cfg.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
+        assert_eq!(cfg.headers_timeout_secs, DEFAULT_HEADERS_TIMEOUT_SECS);
+        assert_eq!(cfg.request_timeout_secs, 60);
+        assert_eq!(cfg.headers_timeout_secs, 30);
         assert!(is_sha512_hex(DEFAULT_USER_TOKEN_HASH));
         let test = Config::test_default();
         assert!(is_sha512_hex(test.admin_token_hash.as_str()));

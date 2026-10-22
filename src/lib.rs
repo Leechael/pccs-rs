@@ -17,6 +17,7 @@ pub mod ocsp;
 pub mod pcs;
 pub mod routes;
 pub mod selection;
+pub mod server;
 pub mod store;
 pub mod validate;
 
@@ -64,6 +65,8 @@ pub fn create_app(state: AppState) -> Router {
     app.nest("/healthz", routes::healthz_router())
         .fallback(routes::handlers::not_found)
         .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn(routes::handlers::reject_unexpected_body))
+        .layer(middleware::from_fn(routes::handlers::reject_trailing_slash))
         // CORS wraps the body-limit 413, but stays inside Request-ID so OPTIONS
         // preflight (answered without calling next) still gets a fresh id.
         .layer(middleware::from_fn(routes::handlers::nras_cors))
