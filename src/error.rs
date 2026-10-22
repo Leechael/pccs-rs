@@ -79,6 +79,37 @@ where
     }
 }
 
+/// Raw request body under the same receive bounds as `PccsJson`: `408` when
+/// the body stalls past `RequestTimeoutSeconds`, `413 Content too large.` past
+/// the body limit, `400` for any other read failure.
+pub struct PccsBytes(pub axum::body::Bytes);
+
+impl FromRequest<crate::auth::AppState> for PccsBytes {
+    type Rejection = PccsError;
+
+    async fn from_request(
+        req: Request,
+        state: &crate::auth::AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let budget = std::time::Duration::from_secs(state.config.request_timeout_secs);
+        let read = axum::body::Bytes::from_request(req, state);
+        let Ok(result) = tokio::time::timeout(budget, read).await else {
+            tracing::warn!("timed out reading request body");
+            return Err(REQUEST_TIMEOUT);
+        };
+        match result {
+            Ok(body) => Ok(Self(body)),
+            Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                Err(CONTENT_TOO_LARGE)
+            }
+            Err(rejection) => {
+                tracing::debug!("unreadable request body: {rejection}");
+                Err(INVALID_REQ)
+            }
+        }
+    }
+}
+
 pub const SUCCESS: (u16, &str) = (200, "Operation successful.");
 pub const INVALID_REQ: PccsError =
     PccsError::new(StatusCode::BAD_REQUEST, "Invalid request parameters.");

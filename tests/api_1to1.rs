@@ -5319,6 +5319,40 @@ async fn nvidia_nras_stalled_body_is_408_with_cors() {
 }
 
 #[tokio::test]
+async fn nvidia_ocsp_stalled_body_is_408() {
+    let mut cfg = Config::test_default();
+    cfg.request_timeout_secs = 1;
+    let router = app_cfg(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ocsp")
+        .header("content-type", "application/ocsp-request")
+        .body(Body::new(StalledBody(Some(bytes::Bytes::from_static(&[0x30, 0x10])))))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (status, _, body) = send(router, req).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(body.as_ref(), b"Request Timeout");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_oversize_body_is_413() {
+    let mut cfg = Config::test_default();
+    cfg.max_body_size = 64;
+    let router = app_cfg(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ocsp")
+        .header("content-type", "application/ocsp-request")
+        .body(Body::from(vec![0u8; 256]))
+        .unwrap();
+    let (status, _, body) = send(router, req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body.as_ref(), b"Content too large.");
+}
+
+#[tokio::test]
 async fn nvidia_nras_oversize_body_is_413_with_cors() {
     let mut cfg = Config::test_default();
     cfg.max_body_size = 64;
