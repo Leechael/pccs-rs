@@ -45,6 +45,17 @@ pub struct Cache {
     pub mode: CacheMode,
     pub pcs_version: u32,
     pub is_intel: bool,
+    /// Intel PCS + LAZY only: re-fetch a known platform's pool when a GET asks
+    /// for a raw TCB the pool has never seen.
+    pub pool_refetch_on_new_tcb: bool,
+    /// Re-fetch known platform pools during the scheduled refresh.
+    pub scheduled_pool_refresh: bool,
+    /// Minimum time between two re-fetches of one platform.
+    pub pool_refetch_interval: std::time::Duration,
+    /// Wall-clock bound on one synchronous pool re-fetch.
+    pub refetch_timeout: std::time::Duration,
+    /// Bounded concurrency for the scheduled pool refresh.
+    pub refresh_concurrency: usize,
     /// Per-key locks so N concurrent misses on the same key produce one
     /// upstream request; the losers re-read the store after acquiring.
     inflight: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -52,11 +63,23 @@ pub struct Cache {
     refresh_lock: Mutex<()>,
     /// Recent upstream failures per key; see `key_lock`.
     failures: Mutex<HashMap<String, (std::time::Instant, PccsError)>>,
+    /// Last attempted pool re-fetch per platform, success or failure. In
+    /// memory only: losing it on restart just allows one extra fetch.
+    refetch_marks: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// How long a failed upstream fetch suppresses a retry by the requests already
 /// queued behind it. Short on purpose — this is stampede control, not caching.
 const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Upper bound on the synchronous pool re-fetch a `/pckcert` GET may run.
+/// DCAP clients cache the PCK cert, so a stale first answer sticks: answer
+/// inside a request-sized budget instead of the full upstream retry budget.
+const POOL_REFETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Platforms refreshed at once by the scheduled run. The upstream client bounds
+/// the requests themselves; this only bounds the tasks.
+const POOL_REFRESH_CONCURRENCY: usize = 8;
 
 impl Cache {
     pub fn new(store: Store, pcs: PcsClient, cfg: &Config) -> Self {
@@ -66,9 +89,15 @@ impl Cache {
             is_intel: cfg.is_intel_upstream(),
             store,
             pcs,
+            pool_refetch_on_new_tcb: cfg.pool_refetch_on_new_tcb,
+            scheduled_pool_refresh: cfg.scheduled_pool_refresh,
+            pool_refetch_interval: std::time::Duration::from_secs(cfg.pool_refetch_interval_secs),
+            refetch_timeout: POOL_REFETCH_TIMEOUT,
+            refresh_concurrency: POOL_REFRESH_CONCURRENCY.min(cfg.upstream_max_concurrent.max(1)),
             inflight: Mutex::new(HashMap::new()),
             refresh_lock: Mutex::new(()),
             failures: Mutex::new(HashMap::new()),
+            refetch_marks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -154,9 +183,13 @@ impl Cache {
 
     // ---------------- pckcert ----------------
 
-    /// Intel `pckcertService.getPckCert`: known platforms use only a cached
-    /// GET or local selection. The PCCS mirror adapter can forward missing raw
-    /// keys in LAZY mode when local selection is unavailable.
+    /// Intel `pckcertService.getPckCert`: known platforms use a cached GET or
+    /// local selection. The PCCS mirror adapter can forward missing raw keys in
+    /// LAZY mode when local selection is unavailable.
+    ///
+    /// One documented deviation, Intel PCS + LAZY only: a request for a raw TCB
+    /// the platform's pool has never seen re-fetches that pool first through
+    /// `refetch_pool_for_new_raw_tcb`. Every other case keeps Node's behaviour.
     pub async fn get_pckcert(
         &self,
         qeid: &str,
@@ -184,6 +217,17 @@ impl Cache {
         // Intel 1.24 makes this terminal; only the separate LAZY PCCS adapter
         // may forward a raw key that cannot be selected locally.
         if known_platform {
+            // Deviation from Node parity (Intel PCS + LAZY only): a raw TCB this
+            // platform has never seen may have a certificate upstream now (TCB
+            // raised by a BIOS/microcode update, or an Intel TCB recovery).
+            // Re-fetch the pool with the *stored* credential, bounded and
+            // throttled; on any failure fall through to exactly today's local
+            // selection.
+            if let Some(rec) =
+                self.refetch_pool_for_new_raw_tcb(qeid, pceid, cpusvn, pcesvn, version).await
+            {
+                return Ok(rec);
+            }
             match self.store.select_platform_cert(qeid, pceid, true, |pool| {
                 self.select_from_pool(pool, cpusvn, pcesvn, pceid)
             }) {
@@ -295,6 +339,132 @@ impl Cache {
             platform_manifest: pool.platform_manifest.clone(),
         };
         Ok(rec)
+    }
+
+    /// Was `(cpusvn, pcesvn)` already mapped for this platform?
+    fn raw_tcb_known(pool: &PlatformPool, cpusvn: &str, pcesvn: &str) -> bool {
+        pool.raw_tcbs.iter().any(|r| {
+            r.cpu_svn.eq_ignore_ascii_case(cpusvn) && r.pce_svn.eq_ignore_ascii_case(pcesvn)
+        })
+    }
+
+    /// A full pool can only be re-fetched with a stored credential. The
+    /// caller's request PPID is never one: Node stores it only for a platform
+    /// the cache did not know, and an all-zero PPID is refused upstream.
+    fn has_stored_credential(pool: &PlatformPool) -> bool {
+        if !pool.platform_manifest.is_empty() {
+            return true;
+        }
+        !pool.enc_ppid.is_empty() && !pool.enc_ppid.bytes().all(|b| b == b'0')
+    }
+
+    /// Whether this platform's last re-fetch attempt is old enough to retry.
+    async fn refetch_due(&self, platform: &str) -> bool {
+        if self.pool_refetch_interval.is_zero() {
+            return true;
+        }
+        let marks = self.refetch_marks.lock().await;
+        marks.get(platform).is_none_or(|at| at.elapsed() >= self.pool_refetch_interval)
+    }
+
+    /// Record an attempt *before* it runs: a broken upstream must not be retried
+    /// by every new raw TCB of the same platform.
+    async fn mark_refetch(&self, platform: &str) {
+        let now = std::time::Instant::now();
+        let mut marks = self.refetch_marks.lock().await;
+        if marks.len() > 1024 {
+            let interval = self.pool_refetch_interval;
+            marks.retain(|_, at| interval.is_zero() || at.elapsed() < interval);
+        }
+        marks.insert(platform.to_string(), now);
+    }
+
+    /// Deviation from Node parity (Intel PCS + LAZY only). A raw TCB the pool
+    /// has never seen means the platform's TCB was raised: BIOS/microcode update,
+    /// or Intel publishing a TCB recovery. Intel then issues PCK certs for the
+    /// new levels, but a locally cached pool can only answer with a lower-TCB
+    /// cert, which DCAP appraises as `OutOfDate`.
+    ///
+    /// Verified upstream behaviour: `GET /pckcerts` with the encrypted PPID
+    /// already stored for the platform returns the new levels, and a manifest
+    /// POST with the stored manifest does too. No new registration is needed, so
+    /// the pool is re-fetched with the stored credential and every known raw TCB
+    /// is re-selected exactly as registration and refresh publish it.
+    ///
+    /// Runs synchronously — DCAP clients cache the PCK cert, so a stale first
+    /// answer sticks — bounded by `refetch_timeout`. Any failure or timeout
+    /// returns `None`, leaving the request to today's local selection with the
+    /// old pool untouched: never worse than without this deviation.
+    async fn refetch_pool_for_new_raw_tcb(
+        &self,
+        qeid: &str,
+        pceid: &str,
+        cpusvn: &str,
+        pcesvn: &str,
+        version: u32,
+    ) -> Option<PckCertRecord> {
+        if !self.pool_refetch_on_new_tcb
+            || self.mode != CacheMode::Lazy
+            || !self.is_intel
+            || !self.pcs.enabled()
+            || version < 4
+            || self.pcs_version < 4
+        {
+            return None;
+        }
+        let pool = self.store.get_platform_pool(qeid, pceid)?;
+        if Self::raw_tcb_known(&pool, cpusvn, pcesvn) || !Self::has_stored_credential(&pool) {
+            return None;
+        }
+        // Single-flight per platform through the existing per-key lock, with
+        // the throttle check inside it so queued requests do not each fetch.
+        let platform = platform_key(&pool.qe_id, &pool.pce_id);
+        let _guard = self.key_lock(&format!("pool-refetch/{platform}")).await.ok()?;
+        // Re-read under the lock: a concurrent fill or registration may have
+        // published the level, replaced the pool, or changed the credential.
+        let pool = self.store.get_platform_pool(qeid, pceid)?;
+        if Self::raw_tcb_known(&pool, cpusvn, pcesvn) || !Self::has_stored_credential(&pool) {
+            return None;
+        }
+        if !self.refetch_due(&platform).await {
+            tracing::debug!("PCK cert pool re-fetch is throttled; selecting locally");
+            return None;
+        }
+        self.mark_refetch(&platform).await;
+        self.store.record_upstream();
+        let context = PckFetchContext {
+            enc_ppid: &pool.enc_ppid,
+            platform_manifest: &pool.platform_manifest,
+            expected: Some(pool.credentials()),
+            unknown_get: false,
+        };
+        let fetched = tokio::time::timeout(self.refetch_timeout, async {
+            let resp = if !pool.platform_manifest.is_empty() {
+                self.pcs
+                    .fetch_pckcerts_intel_manifest(&pool.platform_manifest, &pool.pce_id)
+                    .await?
+            } else {
+                self.pcs.fetch_pckcerts_intel(&pool.enc_ppid, &pool.pce_id).await?
+            };
+            self.store_pckcerts(&pool.qe_id, &pool.pce_id, &context, &resp, Some((cpusvn, pcesvn)))
+                .await
+        })
+        .await;
+        match fetched {
+            Ok(Ok(Some(rec))) => {
+                tracing::info!("re-fetched a PCK cert pool after an unknown raw TCB");
+                Some(rec)
+            }
+            Ok(Ok(None)) => None,
+            Ok(Err(e)) => {
+                tracing::warn!("PCK cert pool re-fetch failed; selecting locally: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("PCK cert pool re-fetch timed out; selecting locally");
+                None
+            }
+        }
     }
 
     /// Node `commonCacheLogic.getPckCertFromPCS`.
@@ -910,7 +1080,8 @@ impl Cache {
     }
 
     /// Node `refreshAllPckcerts`: one upstream call per platform, then
-    /// re-selection for every raw TCB that platform has.
+    /// re-selection for every raw TCB that platform has. The admin
+    /// `/refresh?type=certs` path stops at the first failure.
     async fn refresh_certs(self: &Arc<Self>, fmspc: &str) -> Result<(), PccsError> {
         if !self.pcs.enabled() || self.pcs_version == 3 {
             return Ok(());
@@ -919,69 +1090,162 @@ impl Cache {
             if !pool.fmspc.eq_ignore_ascii_case(fmspc) {
                 continue;
             }
-            let expected = pool.credentials();
-            let resp = if !pool.platform_manifest.is_empty() {
-                self.pcs.fetch_pckcerts_intel_manifest(&pool.platform_manifest, &pool.pce_id).await
-            } else if self.is_intel {
-                self.pcs.fetch_pckcerts_intel(&pool.enc_ppid, &pool.pce_id).await
-            } else {
-                // A PCCS upstream has no cert-pool endpoint; re-fetch the
-                // selected cert for every known raw TCB instead.
-                for raw in &pool.raw_tcbs {
-                    if let Ok(fresh) = self
-                        .pcs
-                        .fetch_pckcert_pccs(
-                            &pool.qe_id,
-                            &raw.cpu_svn,
-                            &raw.pce_svn,
-                            &pool.pce_id,
-                            Some(&pool.enc_ppid),
-                        )
-                        .await
-                    {
-                        if Self::cacheable(
-                            crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
-                            &fresh.issuer_chain,
-                        ) {
-                            self.store.merge_pckcert(&fresh, Some(&expected))?;
-                        }
-                    }
-                }
+            // Node uses the cert-pool endpoint whenever a manifest is stored,
+            // whichever upstream serves it; only a manifest-less PCCS mirror
+            // falls back to one selected cert per raw TCB.
+            if self.is_intel || !pool.platform_manifest.is_empty() {
+                self.refresh_platform_pool(&pool).await?;
                 continue;
-            };
-            let resp = resp.map_err(|e| {
-                tracing::error!("Failed to refresh PCK certs for {}: {e}", pool.qe_id);
-                error::NO_CACHE_DATA
-            })?;
-            let fresh = self.pckcert_pool(
-                &pool.qe_id,
-                &pool.pce_id,
-                &pool.enc_ppid,
-                &pool.platform_manifest,
-                &resp,
-            )?;
-            // Intel refreshService uses SGX EARLY only, ephemerally. This
-            // refresh must not overwrite shared TCB collateral (even on a
-            // selection failure), nor depend on SGX STANDARD or TDX fetches.
-            let tcb =
-                self.pcs.fetch_tcb(0, &fresh.fmspc, self.pcs_version, UpdateType::Early).await?;
-            self.store.replace_platform_certs_with_selection(
-                &fresh,
-                Some(&expected),
-                &[],
-                None,
-                |fresh, raw| {
-                    self.select_from_pool_with_tcb(
-                        fresh,
+            }
+            let expected = pool.credentials();
+            // A PCCS upstream has no cert-pool endpoint; re-fetch the selected
+            // cert for every known raw TCB instead.
+            for raw in &pool.raw_tcbs {
+                if let Ok(fresh) = self
+                    .pcs
+                    .fetch_pckcert_pccs(
+                        &pool.qe_id,
                         &raw.cpu_svn,
                         &raw.pce_svn,
-                        &fresh.pce_id,
-                        &tcb,
+                        &pool.pce_id,
+                        Some(&pool.enc_ppid),
                     )
-                },
-            )?;
+                    .await
+                {
+                    if Self::cacheable(
+                        crate::headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+                        &fresh.issuer_chain,
+                    ) {
+                        self.store.merge_pckcert(&fresh, Some(&expected))?;
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Re-fetch one platform's pool and re-select every raw TCB it knows. The
+    /// credential is always the pool's own; the caller's PPID is irrelevant.
+    async fn refresh_platform_pool(&self, pool: &PlatformPool) -> Result<(), PccsError> {
+        let expected = pool.credentials();
+        let resp = if !pool.platform_manifest.is_empty() {
+            self.pcs.fetch_pckcerts_intel_manifest(&pool.platform_manifest, &pool.pce_id).await
+        } else {
+            self.pcs.fetch_pckcerts_intel(&pool.enc_ppid, &pool.pce_id).await
+        }
+        .map_err(|e| {
+            tracing::error!("Failed to refresh PCK certs for {}: {e}", pool.qe_id);
+            error::NO_CACHE_DATA
+        })?;
+        let fresh = self.pckcert_pool(
+            &pool.qe_id,
+            &pool.pce_id,
+            &pool.enc_ppid,
+            &pool.platform_manifest,
+            &resp,
+        )?;
+        // Intel refreshService uses SGX EARLY only, ephemerally. This refresh
+        // must not overwrite shared TCB collateral (even on a selection
+        // failure), nor depend on SGX STANDARD or TDX fetches.
+        let tcb = self.pcs.fetch_tcb(0, &fresh.fmspc, self.pcs_version, UpdateType::Early).await?;
+        self.store.replace_platform_certs_with_selection(
+            &fresh,
+            Some(&expected),
+            &[],
+            None,
+            |fresh, raw| {
+                self.select_from_pool_with_tcb(
+                    fresh,
+                    &raw.cpu_svn,
+                    &raw.pce_svn,
+                    &fresh.pce_id,
+                    &tcb,
+                )
+            },
+        )
+    }
+
+    /// The cron scheduler's run: Node `refreshService.refreshCache` collateral,
+    /// then (deviation, Intel PCS + LAZY only) every known platform's pool.
+    /// Node refreshes collateral only, so a TCB raise no client has hit yet
+    /// would never reach the cache.
+    ///
+    /// The two halves are independent: a collateral failure is logged and the
+    /// pool sweep still runs (the collateral result is what this returns), and
+    /// a per-platform pool failure never affects the collateral result.
+    pub async fn scheduled_refresh(self: &Arc<Self>) -> Result<(), PccsError> {
+        if self.mode == CacheMode::Offline {
+            return Err(error::SERVICE_UNAVAILABLE);
+        }
+        let _guard = self.refresh_lock.lock().await;
+        // Collateral first, exactly as before: the pool pass is additive, so a
+        // collateral failure still reports the way it always has.
+        let collateral = self.refresh_collateral().await;
+        if let Err(e) = &collateral {
+            tracing::warn!("scheduled collateral refresh: {e}");
+        }
+        // Pools even when collateral failed: a CRL or identity outage has
+        // nothing to do with a raised platform TCB.
+        self.refresh_platform_pools().await;
+        collateral
+    }
+
+    /// Re-fetch the pool of every known platform with a stored credential,
+    /// across all FMSPCs. Unlike the admin path this never aborts: one platform
+    /// with a rejected credential, a broken TCB document or an upstream error is
+    /// logged and skipped so the rest of the run still lands.
+    pub async fn refresh_platform_pools(self: &Arc<Self>) {
+        if !self.scheduled_pool_refresh
+            || self.mode != CacheMode::Lazy
+            || !self.is_intel
+            || !self.pcs.enabled()
+            || self.pcs_version == 3
+        {
+            return;
+        }
+        let pools = match self.blocking(|c| c.store.list_platform_pools()).await {
+            Ok(pools) => pools,
+            Err(e) => {
+                tracing::error!("scheduled pool refresh: {e}");
+                return;
+            }
+        };
+        // A request already re-fetched these inside the throttle interval; a
+        // second upstream round trip would only add load.
+        let recently: Vec<String> = {
+            let interval = self.pool_refetch_interval;
+            let marks = self.refetch_marks.lock().await;
+            marks
+                .iter()
+                .filter(|(_, at)| !interval.is_zero() && at.elapsed() < interval)
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        let queue: Vec<PlatformPool> = pools
+            .into_iter()
+            .filter(|p| Self::has_stored_credential(p))
+            .filter(|p| !recently.contains(&platform_key(&p.qe_id, &p.pce_id)))
+            .collect();
+        let mut pending = queue.into_iter();
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            while tasks.len() < self.refresh_concurrency.max(1) {
+                let Some(pool) = pending.next() else { break };
+                let me = self.clone();
+                tasks.spawn(async move {
+                    let key = platform_key(&pool.qe_id, &pool.pce_id);
+                    (key, me.refresh_platform_pool(&pool).await)
+                });
+            }
+            match tasks.join_next().await {
+                Some(Ok((key, Ok(())))) => tracing::debug!("refreshed PCK cert pool {key}"),
+                Some(Ok((key, Err(e)))) => {
+                    tracing::warn!("scheduled pool refresh skipped {key}: {e}");
+                }
+                Some(Err(e)) => tracing::error!("scheduled pool refresh task failed: {e}"),
+                None => break,
+            }
+        }
     }
 
     /// Run a full-prefix RocksDB scan off the async runtime.
@@ -993,6 +1257,12 @@ impl Cache {
         let me = self.clone();
         tokio::task::spawn_blocking(move || f(&me)).await.map_err(|_| error::INTERNAL_ERROR)
     }
+}
+
+/// Upper-cased `qe_id:pce_id`: the key for both the per-platform re-fetch lock
+/// and the in-memory throttle marks.
+fn platform_key(qeid: &str, pceid: &str) -> String {
+    format!("{}:{}", qeid.to_ascii_uppercase(), pceid.to_ascii_uppercase())
 }
 
 /// Node `cachingMode.getRawCpuSvnFromTcb`: the 16 `sgxtcbcompNNsvn` fields

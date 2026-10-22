@@ -1903,6 +1903,544 @@ async fn migration_startup_seeding_is_explicit_and_missing_seed_fails() {
     assert_eq!(body.as_ref(), b"No cache data for this platform.");
 }
 
+// ---------------------------------------------------------------------------
+// PCK cert pool re-fetch: deviation from Node parity, Intel PCS + LAZY only.
+// ---------------------------------------------------------------------------
+
+/// DER bytes of `PCK_FMSPC` in the synthetic certificate's SGX extension.
+const PCK_FMSPC_BYTES: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x90, 0xAB];
+const ALT_FMSPC: &str = "00906EA10000";
+
+/// Synthetic Intel PCS whose cert pool can gain a TCB level. Each credential
+/// path counts its own requests so a test can assert exactly which one a
+/// re-fetch used, and the TCB endpoints describe the levels the pool holds.
+#[derive(Clone, Default)]
+struct PoolUpstream {
+    /// TCB levels (single CPUSVN byte) currently issued, ascending.
+    levels: Arc<RwLock<Vec<u8>>>,
+    /// Stored-PPID `GET pckcerts` requests.
+    ppid_gets: Arc<AtomicU64>,
+    /// Manifest `POST pckcerts` requests.
+    manifest_posts: Arc<AtomicU64>,
+    /// Single-cert `GET pckcert` requests, which this deviation never uses.
+    single_gets: Arc<AtomicU64>,
+    /// Answer 502 to every pool request.
+    fail: Arc<AtomicBool>,
+    /// Never answer a pool request, so only the bounded timeout can end it.
+    hang: Arc<AtomicBool>,
+}
+
+impl PoolUpstream {
+    fn with_levels(levels: &[u8]) -> Self {
+        Self { levels: Arc::new(RwLock::new(levels.to_vec())), ..Self::default() }
+    }
+
+    fn pool_gets(&self) -> u64 {
+        self.ppid_gets.load(Ordering::Relaxed) + self.manifest_posts.load(Ordering::Relaxed)
+    }
+}
+
+/// The 16-component CPUSVN of one synthetic TCB level.
+fn pool_cpusvn(svn: u8) -> String {
+    format!("{svn:02X}").repeat(16)
+}
+
+fn pool_tcbm(svn: u8) -> String {
+    format!("{}{PCK_PCESVN}", pool_cpusvn(svn))
+}
+
+/// Rewrite the FMSPC in a synthetic cert's SGX extension.
+fn migration_pck_with_fmspc(cert: &str, fmspc: &str) -> String {
+    use base64::Engine;
+    let body: String = cert.lines().filter(|line| !line.starts_with("-----")).collect();
+    let mut der = base64::engine::general_purpose::STANDARD.decode(body).unwrap();
+    let mut needle = vec![0x04, 0x06];
+    needle.extend(PCK_FMSPC_BYTES);
+    let offset = der.windows(needle.len()).position(|w| w == needle).unwrap();
+    for i in 0..6 {
+        der[offset + 2 + i] = u8::from_str_radix(&fmspc[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        base64::engine::general_purpose::STANDARD.encode(der)
+    )
+}
+
+/// Synthetic cert at TCB level `svn` for `fmspc`.
+fn pool_cert(svn: u8, fmspc: &str) -> String {
+    let cert = migration_pck_with_cpu(svn);
+    if fmspc.eq_ignore_ascii_case(PCK_FMSPC) {
+        cert
+    } else {
+        migration_pck_with_fmspc(&cert, fmspc)
+    }
+}
+
+/// A TCB info document for exactly `levels`, as the mock's `tcb` endpoints
+/// serve it. Selection only reads `sgxtcbcomponents` + `pcesvn`.
+fn pool_tcb_document(levels: &[u8], fmspc: &str, prod: u8) -> serde_json::Value {
+    let tcb_levels: Vec<serde_json::Value> = levels
+        .iter()
+        .map(|svn| {
+            let sgx: Vec<serde_json::Value> = (0..16).map(|_| json!({ "svn": svn })).collect();
+            let tdx: Vec<serde_json::Value> =
+                (0..16).map(|_| json!({ "svn": if prod == 1 { *svn } else { 0 } })).collect();
+            json!({
+                "tcb": {
+                    "sgxtcbcomponents": sgx,
+                    "tdxtcbcomponents": tdx,
+                    "pcesvn": 0x3333
+                },
+                "tcbStatus": "UpToDate"
+            })
+        })
+        .collect();
+    json!({
+        "id": if prod == 1 { "TDX" } else { "SGX" },
+        "fmspc": fmspc,
+        "pceId": PCK_PCEID,
+        "tcbType": 0,
+        "tcbLevels": tcb_levels
+    })
+}
+
+fn pool_tcb_response(info: serde_json::Value) -> axum::response::Response {
+    let body = json!({ "tcbInfo": info, "signature": "pool-signature" });
+    let mut resp = axum::Json(body).into_response();
+    resp.headers_mut().insert(headers::TCB_INFO_ISSUER_CHAIN, "pool-tcb-chain".parse().unwrap());
+    resp
+}
+
+/// A pool response for the test's current upstream state. A manifest POST also
+/// selects which FMSPC's certs the pool carries, so one mock can serve several
+/// platforms.
+async fn pool_response(up: &PoolUpstream, fmspc: &str) -> axum::response::Response {
+    if up.fail.load(Ordering::Relaxed) {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    if up.hang.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+    let levels = up.levels.read().await.clone();
+    let entries: Vec<serde_json::Value> = levels
+        .iter()
+        .map(|svn| json!({ "tcbm": pool_tcbm(*svn), "cert": pool_cert(*svn, fmspc) }))
+        .collect();
+    let mut resp = axum::Json(entries).into_response();
+    resp.headers_mut().insert(headers::SGX_FMSPC, fmspc.parse().unwrap());
+    resp.headers_mut().insert(headers::SGX_PCK_CERTIFICATE_CA_TYPE, "platform".parse().unwrap());
+    resp.headers_mut()
+        .insert(headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN, "pool-chain".parse().unwrap());
+    resp
+}
+
+async fn spawn_pool_intel(up: PoolUpstream) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::routing::get;
+    type PoolQuery = std::collections::HashMap<String, String>;
+    let stored_ppid = "E".repeat(768);
+    let stored_pceid = PCK_PCEID.to_string();
+    let gets = {
+        let up = up.clone();
+        let stored_ppid = stored_ppid.clone();
+        let stored_pceid = stored_pceid.clone();
+        move |axum::extract::Query(q): axum::extract::Query<PoolQuery>| {
+            let up = up.clone();
+            let stored_ppid = stored_ppid.clone();
+            let stored_pceid = stored_pceid.clone();
+            async move {
+                up.ppid_gets.fetch_add(1, Ordering::Relaxed);
+                if q.get("encrypted_ppid") != Some(&stored_ppid)
+                    || q.get("pceid") != Some(&stored_pceid)
+                {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                pool_response(&up, PCK_FMSPC).await
+            }
+        }
+    };
+    let posts = {
+        let up = up.clone();
+        move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let up = up.clone();
+            async move {
+                up.manifest_posts.fetch_add(1, Ordering::Relaxed);
+                if body["pceid"] != PCK_PCEID {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                let fmspc = match body["platformManifest"].as_str().unwrap_or("") {
+                    "ABCD" => PCK_FMSPC,
+                    "EFGH" => ALT_FMSPC,
+                    _ => return StatusCode::NOT_FOUND.into_response(),
+                };
+                pool_response(&up, fmspc).await
+            }
+        }
+    };
+    let sgx_tcb = {
+        let up = up.clone();
+        move |axum::extract::Query(q): axum::extract::Query<PoolQuery>| {
+            let up = up.clone();
+            async move {
+                let fmspc = q.get("fmspc").cloned().unwrap_or_default();
+                let levels = up.levels.read().await.clone();
+                pool_tcb_response(pool_tcb_document(&levels, &fmspc, 0))
+            }
+        }
+    };
+    let tdx_tcb = {
+        let up = up.clone();
+        move |axum::extract::Query(q): axum::extract::Query<PoolQuery>| {
+            let up = up.clone();
+            async move {
+                let fmspc = q.get("fmspc").cloned().unwrap_or_default();
+                let levels = up.levels.read().await.clone();
+                pool_tcb_response(pool_tcb_document(&levels, &fmspc, 1))
+            }
+        }
+    };
+    let single = {
+        let up = up.clone();
+        move || {
+            let up = up.clone();
+            async move {
+                up.single_gets.fetch_add(1, Ordering::Relaxed);
+                StatusCode::BAD_GATEWAY.into_response()
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route("/sgx/certification/v4/pckcerts", get(gets).post(posts))
+        .route("/sgx/certification/v4/tcb", get(sgx_tcb))
+        .route("/tdx/certification/v4/tcb", get(tdx_tcb))
+        .route("/sgx/certification/v4/pckcert", get(single));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (format!("http://{addr}/sgx/certification/v4/"), handle)
+}
+
+/// Seed a known platform whose pool holds exactly `pool_levels` certificates,
+/// plus every `tracked` raw TCB level. Older local selection would have mapped
+/// each tracked level to the pool's first certificate.
+fn seed_known_pool(
+    cache: &pccs_rs::cache::Cache,
+    qe_id: &str,
+    fmspc: &str,
+    manifest: &str,
+    enc_ppid: &str,
+    pool_levels: &[u8],
+    tracked: &[u8],
+) {
+    use pccs_rs::store::{PlatformCert, PlatformPool, RawTcb, TcbRecord};
+    let selected = *pool_levels.first().expect("a pool needs at least one certificate");
+    // Local selection reads the fmspc's TCB info, so a known platform has one.
+    let doc = json!({
+        "tcbInfo": pool_tcb_document(pool_levels, fmspc, 0),
+        "signature": "pool-signature"
+    });
+    cache
+        .store
+        .put_tcb(&TcbRecord {
+            prod_type: 0,
+            fmspc: fmspc.into(),
+            version: 4,
+            update_type: "STANDARD".into(),
+            raw_body: doc.to_string(),
+            tcbinfo: doc,
+            issuer_chain: "pool-tcb-chain".into(),
+        })
+        .unwrap();
+    cache
+        .store
+        .put_platform_pool(&PlatformPool {
+            qe_id: qe_id.into(),
+            pce_id: PCK_PCEID.into(),
+            enc_ppid: enc_ppid.into(),
+            platform_manifest: manifest.into(),
+            fmspc: fmspc.into(),
+            ca: "PLATFORM".into(),
+            issuer_chain: "pool-chain".into(),
+            certs: pool_levels
+                .iter()
+                .map(|svn| PlatformCert { tcbm: pool_tcbm(*svn), cert: pool_cert(*svn, fmspc) })
+                .collect(),
+            raw_tcbs: tracked
+                .iter()
+                .map(|raw| RawTcb {
+                    cpu_svn: pool_cpusvn(*raw),
+                    pce_svn: PCK_PCESVN.into(),
+                    tcbm: pool_tcbm(selected),
+                })
+                .collect(),
+        })
+        .unwrap();
+}
+
+fn pool_pck_path(qe_id: &str, cpusvn: &str) -> String {
+    format!(
+        "/sgx/certification/v4/pckcert?qeid={qe_id}&cpusvn={cpusvn}&pcesvn={PCK_PCESVN}&pceid={PCK_PCEID}"
+    )
+}
+
+/// Build a lazy cache whose `is_intel` policy is forced on, as the loopback
+/// mock is not an Intel host. Returns the router and the cache so the test can
+/// assert store state after the HTTP call; `tune` exists for test-only knobs
+/// such as the re-fetch timeout.
+fn pool_state(
+    mut cfg: Config,
+    tune: impl FnOnce(&mut pccs_rs::cache::Cache),
+) -> (axum::Router, Arc<pccs_rs::cache::Cache>) {
+    cfg.cache_mode = CacheMode::Lazy;
+    let mut state = pccs_rs::app_state(cfg);
+    {
+        let cache = Arc::get_mut(&mut state.cache).unwrap();
+        cache.is_intel = true;
+        tune(cache);
+    }
+    let cache = state.cache.clone();
+    (pccs_rs::create_app(state), cache)
+}
+
+/// `cfg_empty()` plus the pool re-fetch flags a test exercises.
+fn pool_cfg(uri: String, refetch: bool, scheduled: bool) -> Config {
+    let mut cfg = cfg_empty();
+    cfg.uri = uri;
+    cfg.pool_refetch_on_new_tcb = refetch;
+    cfg.scheduled_pool_refresh = scheduled;
+    cfg
+}
+
+// Intent: regression / deviation from Node parity. A known platform whose pool
+// stops at TCB X re-fetches with its stored PPID when a GET asks for a brand new
+// raw TCB Y > X, answers with Y's cert, and re-selects every known raw level.
+#[tokio::test]
+async fn pool_refetch_on_new_raw_tcb_answers_with_the_new_cert() {
+    let up = PoolUpstream::with_levels(&[0x22, 0x33]);
+    let (uri, server) = spawn_pool_intel(up.clone()).await;
+    let (router, cache) = pool_state(pool_cfg(uri, true, false), |_| {});
+    // Pool stops at TCB 0x22; the platform already tracks a higher raw level.
+    seed_known_pool(&cache, "AA", PCK_FMSPC, "", &"E".repeat(768), &[0x22], &[0x44]);
+
+    // The tracked level still selects the only cert the old pool has.
+    let (status, h, body) =
+        send(router.clone(), get(&pool_pck_path("AA", &pool_cpusvn(0x44)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), pool_cert(0x22, PCK_FMSPC).as_bytes());
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), pool_tcbm(0x22).as_str());
+    assert_eq!(up.pool_gets(), 0, "a known raw TCB never fetches");
+
+    // A new raw TCB re-fetches once and is answered with the 0x33 cert.
+    let (status, h, body) =
+        send(router.clone(), get(&pool_pck_path("AA", &pool_cpusvn(0x33)))).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body.as_ref(), pool_cert(0x33, PCK_FMSPC).as_bytes());
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), pool_tcbm(0x33).as_str());
+    assert_eq!(up.ppid_gets.load(Ordering::Relaxed), 1, "exactly one pool fetch");
+    assert_eq!(up.manifest_posts.load(Ordering::Relaxed), 0);
+    assert_eq!(up.single_gets.load(Ordering::Relaxed), 0, "never a caller PPID fetch");
+
+    // Re-selection moved the tracked raw level onto the fresh pool's cert.
+    let (status, h, body) =
+        send(router.clone(), get(&pool_pck_path("AA", &pool_cpusvn(0x44)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), pool_cert(0x33, PCK_FMSPC).as_bytes());
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), pool_tcbm(0x33).as_str());
+    let pool = cache.store.get_platform_pool("AA", PCK_PCEID).unwrap();
+    assert_eq!(pool.certs.len(), 2);
+    assert_eq!(pool.raw_tcbs.len(), 2);
+    assert!(pool.raw_tcbs.iter().all(|raw| raw.tcbm == pool_tcbm(0x33)));
+    assert_eq!(pool.enc_ppid, "E".repeat(768), "stored credential unchanged");
+    server.abort();
+}
+
+// Intent: regression / deviation. One re-fetch per platform per interval: a
+// second new raw TCB selects locally, another platform is not throttled, and
+// the scheduled pool refresh skips what a request already re-fetched.
+#[tokio::test]
+async fn pool_refetch_is_throttled_per_platform() {
+    let up = PoolUpstream::with_levels(&[0x22, 0x33]);
+    let (uri, server) = spawn_pool_intel(up.clone()).await;
+    let (router, cache) = pool_state(pool_cfg(uri, true, true), |_| {});
+    seed_known_pool(&cache, "AA", PCK_FMSPC, "ABCD", "", &[0x22], &[0x22]);
+    seed_known_pool(&cache, "BB", ALT_FMSPC, "EFGH", "", &[0x22], &[0x22]);
+
+    let (status, _, body) =
+        send(router.clone(), get(&pool_pck_path("AA", &pool_cpusvn(0x33)))).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body.as_ref(), pool_cert(0x33, PCK_FMSPC).as_bytes());
+    assert_eq!(up.manifest_posts.load(Ordering::Relaxed), 1);
+
+    // Inside the interval: local selection from the fresh pool, no upstream.
+    let (status, h, body) =
+        send(router.clone(), get(&pool_pck_path("AA", &pool_cpusvn(0x55)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), pool_cert(0x33, PCK_FMSPC).as_bytes());
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), pool_tcbm(0x33).as_str());
+    assert_eq!(up.manifest_posts.load(Ordering::Relaxed), 1, "throttled: no second fetch");
+    assert_eq!(up.pool_gets(), 1);
+
+    // The throttle is per platform: BB is still fetched by the scheduled run,
+    // while AA (re-fetched above) is skipped.
+    cache.refresh_platform_pools().await;
+    assert_eq!(up.manifest_posts.load(Ordering::Relaxed), 2, "only BB is refreshed");
+    let bb = cache.store.get_platform_pool("BB", PCK_PCEID).unwrap();
+    assert_eq!(bb.certs.len(), 2);
+    let rec = cache.store.get_pckcert("BB", &pool_cpusvn(0x22), PCK_PCESVN, PCK_PCEID).unwrap();
+    assert_eq!(rec.tcbm, pool_tcbm(0x22), "BB's tracked level keeps its exact cert");
+    server.abort();
+}
+
+// Intent: regression / invariant. A failing or hanging upstream never makes a
+// request worse than before: 200 with the old pool's cert, old pool intact, and
+// the throttle recorded so the next new raw TCB does not retry immediately.
+#[tokio::test]
+async fn pool_refetch_failure_keeps_the_old_pool_and_answers_locally() {
+    for hang in [false, true] {
+        let up = PoolUpstream::with_levels(&[0x22, 0x33]);
+        let (uri, server) = spawn_pool_intel(up.clone()).await;
+        let (router, cache) = pool_state(pool_cfg(uri, true, false), |cache| {
+            cache.refetch_timeout = std::time::Duration::from_millis(500);
+        });
+        seed_known_pool(&cache, "AA", PCK_FMSPC, "", &"E".repeat(768), &[0x22], &[0x44]);
+        up.fail.store(!hang, Ordering::Relaxed);
+        up.hang.store(hang, Ordering::Relaxed);
+
+        let (status, h, body) =
+            send(router.clone(), get(&pool_pck_path("AA", &pool_cpusvn(0x33)))).await;
+        assert_eq!(status, StatusCode::OK, "hang={hang}: {}", String::from_utf8_lossy(&body));
+        assert_eq!(body.as_ref(), pool_cert(0x22, PCK_FMSPC).as_bytes(), "hang={hang}");
+        assert_eq!(h.get(headers::SGX_TCBM).unwrap(), pool_tcbm(0x22).as_str());
+        assert_eq!(up.ppid_gets.load(Ordering::Relaxed), 1, "the attempt was made");
+
+        let pool = cache.store.get_platform_pool("AA", PCK_PCEID).unwrap();
+        assert_eq!(pool.certs.len(), 1, "cert pool untouched");
+        assert_eq!(pool.enc_ppid, "E".repeat(768));
+        // Today's local selection still tracks the requested raw level.
+        assert!(pool.raw_tcbs.iter().any(|raw| raw.cpu_svn == pool_cpusvn(0x33)));
+
+        // Throttle recorded on failure: a different new level selects locally.
+        let (status, _, body) =
+            send(router.clone(), get(&pool_pck_path("AA", &pool_cpusvn(0x55)))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), pool_cert(0x22, PCK_FMSPC).as_bytes());
+        assert_eq!(up.ppid_gets.load(Ordering::Relaxed), 1, "no immediate retry");
+        server.abort();
+    }
+}
+
+// Intent: regression / invariant. A manifest-bearing pool re-fetches through
+// the manifest POST, a PPID-only pool through the stored encrypted PPID, and a
+// zero/absent request PPID is never used or stored.
+#[tokio::test]
+async fn pool_refetch_uses_the_stored_credential_of_each_pool_kind() {
+    let up = PoolUpstream::with_levels(&[0x22, 0x33]);
+    let (uri, server) = spawn_pool_intel(up.clone()).await;
+
+    // Manifest pool.
+    let (router, cache) = pool_state(pool_cfg(uri.clone(), true, false), |_| {});
+    seed_known_pool(&cache, "AA", PCK_FMSPC, "ABCD", "", &[0x22], &[0x22]);
+    let (status, _, body) = send(router, get(&pool_pck_path("AA", &pool_cpusvn(0x33)))).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body.as_ref(), pool_cert(0x33, PCK_FMSPC).as_bytes());
+    assert_eq!(up.manifest_posts.load(Ordering::Relaxed), 1);
+    assert_eq!(up.ppid_gets.load(Ordering::Relaxed), 0, "manifest pool never uses the PPID path");
+    let pool = cache.store.get_platform_pool("AA", PCK_PCEID).unwrap();
+    assert_eq!(pool.platform_manifest, "ABCD");
+    assert!(pool.enc_ppid.is_empty());
+    let rec = cache.store.get_pckcert("AA", &pool_cpusvn(0x33), PCK_PCESVN, PCK_PCEID).unwrap();
+    assert_eq!(rec.platform_manifest, "ABCD");
+    assert!(rec.encrypted_ppid.is_none());
+
+    // PPID-only pool, requested with an all-zero caller PPID.
+    let (router, cache) = pool_state(pool_cfg(uri, true, false), |_| {});
+    seed_known_pool(&cache, "BB", PCK_FMSPC, "", &"E".repeat(768), &[0x22], &[0x22]);
+    let path =
+        format!("{}&encrypted_ppid={}", pool_pck_path("BB", &pool_cpusvn(0x33)), "0".repeat(768));
+    let (status, _, body) = send(router, get(&path)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body.as_ref(), pool_cert(0x33, PCK_FMSPC).as_bytes());
+    assert_eq!(up.ppid_gets.load(Ordering::Relaxed), 1);
+    assert_eq!(up.manifest_posts.load(Ordering::Relaxed), 1, "no manifest POST for this pool");
+    let pool = cache.store.get_platform_pool("BB", PCK_PCEID).unwrap();
+    assert_eq!(pool.enc_ppid, "E".repeat(768), "the caller's zero PPID is never stored");
+    assert!(pool.platform_manifest.is_empty());
+    let rec = cache.store.get_pckcert("BB", &pool_cpusvn(0x33), PCK_PCESVN, PCK_PCEID).unwrap();
+    assert_eq!(rec.encrypted_ppid.as_deref(), Some("E".repeat(768).as_str()));
+    server.abort();
+}
+
+// Intent: regression / deviation, scheduled path. The scheduled pool refresh
+// covers every FMSPC, and one platform with a rejected credential is logged and
+// skipped instead of aborting the run.
+#[tokio::test]
+async fn scheduled_pool_refresh_covers_every_fmspc_and_skips_failures() {
+    let up = PoolUpstream::with_levels(&[0x22, 0x33]);
+    let (uri, server) = spawn_pool_intel(up.clone()).await;
+    let (_, cache) = pool_state(pool_cfg(uri, false, true), |_| {});
+    seed_known_pool(&cache, "AA", PCK_FMSPC, "ABCD", "", &[0x22], &[0x44]);
+    seed_known_pool(&cache, "BB", ALT_FMSPC, "EFGH", "", &[0x22], &[0x44]);
+    // The mock rejects any other manifest, so this platform's fetch fails.
+    seed_known_pool(&cache, "CC", PCK_FMSPC, "REJECTED", "", &[0x22], &[0x44]);
+
+    cache.refresh_platform_pools().await;
+
+    for (qe_id, fmspc) in [("AA", PCK_FMSPC), ("BB", ALT_FMSPC)] {
+        let pool = cache.store.get_platform_pool(qe_id, PCK_PCEID).unwrap();
+        assert_eq!(pool.certs.len(), 2, "{qe_id}: fresh pool published");
+        let rec =
+            cache.store.get_pckcert(qe_id, &pool_cpusvn(0x44), PCK_PCESVN, PCK_PCEID).unwrap();
+        assert_eq!(rec.tcbm, pool_tcbm(0x33), "{qe_id}: raw level re-selected");
+        assert_eq!(rec.cert, pool_cert(0x33, fmspc));
+        assert_eq!(rec.fmspc, fmspc);
+    }
+    let cc = cache.store.get_platform_pool("CC", PCK_PCEID).unwrap();
+    assert_eq!(cc.certs.len(), 1, "the failed platform keeps its old pool");
+    assert_eq!(up.manifest_posts.load(Ordering::Relaxed), 3, "all three were attempted");
+    server.abort();
+}
+
+// Intent: regression / parity. With both flags off, a known platform answers a
+// new raw TCB exactly as Intel PCCS does: local selection only, no pool fetch,
+// and no scheduled pool refresh.
+#[tokio::test]
+async fn pool_refetch_flags_off_keep_node_parity() {
+    let up = PoolUpstream::with_levels(&[0x22, 0x33]);
+    let (uri, server) = spawn_pool_intel(up.clone()).await;
+    let (router, cache) = pool_state(pool_cfg(uri, false, false), |_| {});
+    seed_known_pool(&cache, "AA", PCK_FMSPC, "", &"E".repeat(768), &[0x22], &[0x44]);
+
+    let (status, h, body) = send(router, get(&pool_pck_path("AA", &pool_cpusvn(0x33)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_ref(), pool_cert(0x22, PCK_FMSPC).as_bytes());
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), pool_tcbm(0x22).as_str());
+    assert_eq!(up.pool_gets(), 0, "parity: a known platform never re-fetches");
+
+    cache.refresh_platform_pools().await;
+    assert_eq!(up.pool_gets(), 0, "parity: scheduled refresh covers collateral only");
+    let pool = cache.store.get_platform_pool("AA", PCK_PCEID).unwrap();
+    assert_eq!(pool.certs.len(), 1);
+    server.abort();
+}
+
+// Intent: regression / guard. A raw TCB the pool already maps is a local
+// selection even when its GET record is absent; it must never trigger a fetch.
+#[tokio::test]
+async fn pool_refetch_guard_existing_raw_tcb_never_refetches() {
+    let up = PoolUpstream::with_levels(&[0x22, 0x33]);
+    let (uri, server) = spawn_pool_intel(up.clone()).await;
+    let (router, cache) = pool_state(pool_cfg(uri, true, false), |_| {});
+    seed_known_pool(&cache, "AA", PCK_FMSPC, "", &"E".repeat(768), &[0x22], &[0x22]);
+
+    let (status, h, body) = send(router, get(&pool_pck_path("AA", &pool_cpusvn(0x22)))).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body.as_ref(), pool_cert(0x22, PCK_FMSPC).as_bytes());
+    assert_eq!(h.get(headers::SGX_TCBM).unwrap(), pool_tcbm(0x22).as_str());
+    assert_eq!(up.pool_gets(), 0, "a known raw TCB never re-fetches the pool");
+    server.abort();
+}
+
 /// A structurally valid JWS-like appraisal policy (Node parses segment[1] as
 /// base64url JSON and reads `policy_payload.policy_array[].environment.class_id`).
 fn jws_policy(class_id: &str, marker: &str) -> String {
@@ -2587,6 +3125,11 @@ async fn platforms_source_fmspc_list() {
 fn cfg_empty() -> Config {
     let mut c = Config::test_default();
     c.no_seed = true;
+    // These tests pin Node parity, which is exactly what the pool re-fetch
+    // deviation replaces. Keep it opt-in here so every parity assertion below
+    // states the behaviour it is protecting; `pool_cfg` turns it back on.
+    c.pool_refetch_on_new_tcb = false;
+    c.scheduled_pool_refresh = false;
     c
 }
 

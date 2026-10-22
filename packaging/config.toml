@@ -31,6 +31,13 @@ db_path = "/var/lib/pccs-rs"
 # upstream_max_concurrent = 64
 # upstream_max_attempts = 6
 # upstream_pool_idle_seconds = 60
+# Intel PCS + LAZY only: re-fetch a known platform's PCK cert pool when a GET
+# asks for a raw TCB the pool has never seen. Default true.
+# pool_refetch_on_new_tcb = true
+# Minimum seconds between two such re-fetches for one platform. Default 86400.
+# pool_refetch_interval_seconds = 86400
+# Re-fetch known platform pools during the scheduled refresh. Default true.
+# scheduled_pool_refresh = true
 # rocksdb_block_cache_mb = 8
 # rocksdb_write_buffer_mb = 64
 # rocksdb_max_write_buffers = 2
