@@ -1,7 +1,9 @@
 //! NVIDIA OCSP request/response helpers for the collateral cache.
 //!
-//! Cache keys hash the DER `requestList` only, deliberately excluding the
-//! per-request OCSP nonce that lives in `requestExtensions`. Expiry follows
+//! Cache keys hash the DER `requestList`; `requestExtensions` are not part of
+//! the key. A request carrying an OCSP nonce is never cached at all: the
+//! responder echoes the nonce in its signed response, so a stored copy would
+//! fail the next client's nonce check. Expiry follows
 //! the signed `nextUpdate` (capped by a configured max TTL); responses without
 //! `nextUpdate` use `thisUpdate + default_ttl`, matching the NVIDIA verifier.
 
@@ -22,8 +24,17 @@ struct Tlv<'a> {
     raw: &'a [u8],
 }
 
-/// Hex SHA-256 of the request's CertID list, excluding request extensions.
-pub fn request_cache_key(request: &[u8]) -> Result<String, PccsError> {
+/// id-pkix-ocsp-nonce, 1.3.6.1.5.5.7.48.1.2.
+const OID_OCSP_NONCE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
+
+pub struct OcspRequest {
+    /// Hex SHA-256 of the DER requestList.
+    pub cache_key: String,
+    /// The request carries an id-pkix-ocsp-nonce request extension.
+    pub has_nonce: bool,
+}
+
+pub fn parse_request(request: &[u8]) -> Result<OcspRequest, PccsError> {
     let outer = parse_single(request, 0x30)?;
     let mut outer_fields = outer.value;
     let tbs = take_expected(&mut outer_fields, 0x30)?;
@@ -38,14 +49,16 @@ pub fn request_cache_key(request: &[u8]) -> Result<String, PccsError> {
             0x30 => {
                 validate_request_list(field.value)?;
                 // Only the optional requestExtensions [2] may follow.
+                let mut has_nonce = false;
                 if !tbs_fields.is_empty() {
                     let extensions = take_expected(&mut tbs_fields, 0xa2)?;
-                    parse_single(extensions.value, 0x30)?;
+                    has_nonce = has_nonce_extension(parse_single(extensions.value, 0x30)?.value)?;
                 }
                 if !tbs_fields.is_empty() {
                     return Err(error::INVALID_REQ);
                 }
-                return Ok(hex::encode(Sha256::digest(field.raw)));
+                let cache_key = hex::encode(Sha256::digest(field.raw));
+                return Ok(OcspRequest { cache_key, has_nonce });
             }
             _ => return Err(error::INVALID_REQ),
         }
@@ -78,6 +91,26 @@ pub fn response_cache_expiry(
         return Err(error::INVALID_REQ);
     }
     u64::try_from(expires_at).map_err(|_| error::INTERNAL_ERROR)
+}
+
+/// Walk `Extensions` (SEQUENCE OF Extension { extnID, critical?, extnValue })
+/// and report whether one of them is the OCSP nonce.
+fn has_nonce_extension(mut extensions: &[u8]) -> Result<bool, PccsError> {
+    let mut found = false;
+    while !extensions.is_empty() {
+        let extension = take_expected(&mut extensions, 0x30)?;
+        let mut fields = extension.value;
+        let oid = take_expected(&mut fields, 0x06)?;
+        if peek_tag(fields) == Some(0x01) {
+            take_expected(&mut fields, 0x01)?;
+        }
+        take_expected(&mut fields, 0x04)?;
+        if !fields.is_empty() {
+            return Err(error::INVALID_REQ);
+        }
+        found |= oid.value == OID_OCSP_NONCE;
+    }
+    Ok(found)
 }
 
 fn validate_request_list(mut request_list: &[u8]) -> Result<(), PccsError> {
@@ -264,15 +297,26 @@ mod tests {
         der(0x30, &parts.concat())
     }
 
-    fn request(nonce: u8) -> Vec<u8> {
+    fn extension(oid: &[u8], value: &[u8]) -> Vec<u8> {
+        sequence(&[der(0x06, oid), der(0x04, value)])
+    }
+
+    /// RFC 8954 nonce extension: id-pkix-ocsp-nonce, extnValue wrapping the
+    /// DER OCTET STRING nonce.
+    fn nonce_extension(nonce: u8) -> Vec<u8> {
+        extension(OID_OCSP_NONCE, &der(0x04, &[nonce; 16]))
+    }
+
+    fn request_with(extensions: &[Vec<u8>]) -> Vec<u8> {
         let algorithm = sequence(&[der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a])]);
         let cert_id =
             sequence(&[algorithm, der(0x04, &[1; 20]), der(0x04, &[2; 20]), der(0x02, &[3])]);
         let request = sequence(&[cert_id]);
         let list = sequence(&[request]);
-        // Models requestExtensions [2], where the OCSP nonce lives.
-        let extensions = der(0xa2, &sequence(&[der(0x04, &[nonce; 16])]));
-        sequence(&[sequence(&[list, extensions])])
+        if extensions.is_empty() {
+            return sequence(&[sequence(&[list])]);
+        }
+        sequence(&[sequence(&[list, der(0xa2, &sequence(extensions))])])
     }
 
     fn response(this_update: &str, next_update: Option<&str>) -> Vec<u8> {
@@ -294,17 +338,24 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_ignores_ocsp_nonce() {
-        let nonce = std::process::id() as u8;
-        assert_eq!(
-            request_cache_key(&request(nonce)).unwrap(),
-            request_cache_key(&request(nonce.wrapping_add(1))).unwrap()
-        );
+    fn nonce_extension_is_detected() {
+        let plain = parse_request(&request_with(&[])).unwrap();
+        assert!(!plain.has_nonce);
+        let nonced = parse_request(&request_with(&[nonce_extension(1)])).unwrap();
+        assert!(nonced.has_nonce);
+        assert_eq!(nonced.cache_key, plain.cache_key);
+        // id-pkix-ocsp-response (acceptable responses) is not a nonce.
+        let acceptable = extension(&[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x04], &[]);
+        assert!(!parse_request(&request_with(&[acceptable.clone()])).unwrap().has_nonce);
+        assert!(parse_request(&request_with(&[acceptable, nonce_extension(2)])).unwrap().has_nonce);
+        // An Extension without extnValue is malformed.
+        let broken = sequence(&[der(0x06, OID_OCSP_NONCE)]);
+        assert!(parse_request(&request_with(&[broken])).is_err());
     }
 
     #[test]
     fn cache_key_rejects_malformed_requests() {
-        assert!(request_cache_key(&[0x30, 0x01, 0]).is_err());
+        assert!(parse_request(&[0x30, 0x01, 0]).is_err());
     }
 
     fn request_with_tail(tail: &[Vec<u8>]) -> Vec<u8> {
@@ -319,13 +370,13 @@ mod tests {
 
     #[test]
     fn cache_key_rejects_fields_after_request_list() {
-        let extensions = der(0xa2, &sequence(&[]));
-        assert!(request_cache_key(&request_with_tail(&[])).is_ok());
-        assert!(request_cache_key(&request_with_tail(&[extensions.clone()])).is_ok());
+        let extensions = der(0xa2, &sequence(&[nonce_extension(1)]));
+        assert!(parse_request(&request_with_tail(&[])).is_ok());
+        assert!(parse_request(&request_with_tail(&[extensions.clone()])).is_ok());
         // An unknown field, junk after the extensions, and a non-SEQUENCE [2].
-        assert!(request_cache_key(&request_with_tail(&[der(0xa3, &[])])).is_err());
-        assert!(request_cache_key(&request_with_tail(&[extensions, der(0x05, &[])])).is_err());
-        assert!(request_cache_key(&request_with_tail(&[der(0xa2, &der(0x04, &[1]))])).is_err());
+        assert!(parse_request(&request_with_tail(&[der(0xa3, &[])])).is_err());
+        assert!(parse_request(&request_with_tail(&[extensions, der(0x05, &[])])).is_err());
+        assert!(parse_request(&request_with_tail(&[der(0xa2, &der(0x04, &[1]))])).is_err());
     }
 
     #[test]

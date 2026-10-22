@@ -3574,7 +3574,7 @@ fn ocsp_sequence(parts: &[Vec<u8>]) -> Vec<u8> {
     ocsp_der(0x30, &parts.concat())
 }
 
-fn sample_ocsp_request(nonce: u8) -> Vec<u8> {
+fn sample_ocsp_request(nonce: Option<u8>) -> Vec<u8> {
     let algorithm = ocsp_sequence(&[ocsp_der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a])]);
     let cert_id = ocsp_sequence(&[
         algorithm,
@@ -3584,7 +3584,15 @@ fn sample_ocsp_request(nonce: u8) -> Vec<u8> {
     ]);
     let request = ocsp_sequence(&[cert_id]);
     let list = ocsp_sequence(&[request]);
-    let extensions = ocsp_der(0xa2, &ocsp_sequence(&[ocsp_der(0x04, &[nonce; 16])]));
+    let Some(nonce) = nonce else {
+        return ocsp_sequence(&[ocsp_sequence(&[list])]);
+    };
+    // requestExtensions [2] holding one id-pkix-ocsp-nonce extension.
+    let nonce_extension = ocsp_sequence(&[
+        ocsp_der(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02]),
+        ocsp_der(0x04, &ocsp_der(0x04, &[nonce; 16])),
+    ]);
+    let extensions = ocsp_der(0xa2, &ocsp_sequence(&[nonce_extension]));
     ocsp_sequence(&[ocsp_sequence(&[list, extensions])])
 }
 
@@ -3618,16 +3626,13 @@ fn ocsp_post(body: Vec<u8>) -> Request<Body> {
         .unwrap()
 }
 
-#[tokio::test]
-async fn nvidia_ocsp_is_cached_by_cert_id_ignoring_nonce() {
-    let calls = Arc::new(AtomicU64::new(0));
-    let mock_calls = calls.clone();
-    // Far-future nextUpdate so the cached entry stays fresh for the test.
+async fn spawn_ocsp(calls: Arc<AtomicU64>) -> String {
+    // Far-future nextUpdate so a cached entry stays fresh for the test.
     let body = sample_ocsp_response("20200101120000Z", Some("20990102120000Z"));
     let upstream_app = axum::Router::new().route(
         "/",
         axum::routing::post(move |req_body: bytes::Bytes| {
-            let calls = mock_calls.clone();
+            let calls = calls.clone();
             let body = body.clone();
             async move {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -3641,30 +3646,59 @@ async fn nvidia_ocsp_is_cached_by_cert_id_ignoring_nonce() {
     tokio::spawn(async move {
         axum::serve(listener, upstream_app).await.ok();
     });
+    format!("http://{addr}")
+}
 
-    let db_path = std::env::temp_dir().join(format!("pccs-rs-ocsp-cache-{}", uuid::Uuid::new_v4()));
+fn ocsp_cfg(upstream: String, db_name: &str) -> (Config, std::path::PathBuf) {
+    let db_path = std::env::temp_dir().join(format!("{db_name}-{}", uuid::Uuid::new_v4()));
     let cfg = Config {
         uri: String::new(),
-        nvidia_ocsp_uri: format!("http://{addr}"),
+        nvidia_ocsp_uri: upstream,
         db_path: db_path.clone(),
         upstream_max_attempts: 1,
         ..Config::test_default()
     };
+    (cfg, db_path)
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_without_nonce_is_cached_by_cert_id() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let (cfg, db_path) = ocsp_cfg(spawn_ocsp(calls.clone()).await, "pccs-rs-ocsp-cache");
     let app = create_app_from_config(cfg);
 
-    let (status, headers, resp) = send(app.clone(), ocsp_post(sample_ocsp_request(1))).await;
+    let (status, headers, resp) = send(app.clone(), ocsp_post(sample_ocsp_request(None))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get("content-type").unwrap(), "application/ocsp-response");
     assert!(!resp.is_empty());
 
-    let (status, _, resp2) = send(app.clone(), ocsp_post(sample_ocsp_request(2))).await;
+    let (status, _, resp2) = send(app.clone(), ocsp_post(sample_ocsp_request(None))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(resp, resp2);
-    assert_eq!(
-        calls.load(Ordering::Relaxed),
-        1,
-        "nonce-only differences must share one cache entry"
-    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+/// The responder echoes the request nonce in its signed response, so a cached
+/// answer would fail another client's nonce check.
+#[tokio::test]
+async fn nvidia_ocsp_with_nonce_bypasses_the_cache() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let (cfg, db_path) = ocsp_cfg(spawn_ocsp(calls.clone()).await, "pccs-rs-ocsp-nonce");
+    let app = create_app_from_config(cfg);
+
+    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(Some(1)))).await;
+    assert_eq!(status, StatusCode::OK);
+    // Not written: the same CertID without a nonce still misses.
+    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(None))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "a nonce response must not be cached");
+    // Not read: the cached entry is never served to a nonce-bearing request.
+    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(Some(2)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 3, "a nonce request must reach the responder");
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);
@@ -3682,7 +3716,7 @@ async fn nvidia_ocsp_rejects_wrong_content_type() {
         .method("POST")
         .uri("/ocsp")
         .header("content-type", "application/json")
-        .body(Body::from(sample_ocsp_request(1)))
+        .body(Body::from(sample_ocsp_request(None)))
         .unwrap();
     let (status, _, _) = send(app, req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -3700,7 +3734,7 @@ async fn nvidia_ocsp_transport_failure_is_a_bad_gateway() {
         ..Config::test_default()
     };
     let app = create_app_from_config(cfg);
-    let (status, _, body) = send(app.clone(), ocsp_post(sample_ocsp_request(1))).await;
+    let (status, _, body) = send(app.clone(), ocsp_post(sample_ocsp_request(None))).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body, "Unable to retrieve the OCSP response from the NVIDIA OCSP service.");
     drop(app);
@@ -3737,8 +3771,10 @@ async fn nvidia_ocsp_offline_never_calls_upstream() {
         ..Config::test_default()
     };
     let app = create_app_from_config(cfg);
-    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(1))).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    for nonce in [None, Some(1)] {
+        let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(nonce))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);

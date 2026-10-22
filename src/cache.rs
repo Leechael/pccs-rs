@@ -443,14 +443,25 @@ impl Cache {
                 .map(|s| s.to_string()),
         })
     }
-    /// Cached NVIDIA OCSP proxy. Cache key hashes the DER requestList only
-    /// (nonce excluded). Expired entries are never served. OFFLINE never calls
-    /// upstream; non-LAZY misses return NO_CACHE_DATA.
+    /// Cached NVIDIA OCSP proxy. Cache key hashes the DER requestList.
+    /// Expired entries are never served. OFFLINE never calls upstream;
+    /// non-LAZY misses return NO_CACHE_DATA. A nonce-bearing request is a miss
+    /// that is never cached: the responder echoes the nonce in its signed
+    /// response, so a stored copy would fail another client's nonce check.
     pub async fn get_nvidia_ocsp(&self, body: &[u8]) -> Result<AmdKdsResponse, PccsError> {
         if self.nvidia_ocsp_uri.is_empty() {
             return Err(error::NVIDIA_OCSP_ACCESS_FAILURE);
         }
-        let cache_key = crate::ocsp::request_cache_key(body)?;
+        let request = crate::ocsp::parse_request(body)?;
+        if request.has_nonce {
+            self.store.record_miss();
+            if self.mode != CacheMode::Lazy {
+                return Err(error::NO_CACHE_DATA);
+            }
+            self.store.record_upstream();
+            return self.post_nvidia_ocsp(body).await;
+        }
+        let cache_key = request.cache_key;
         let store_key = keys::nvidia_ocsp(&cache_key);
         let now = unix_time();
         if let Some(rec) = self.store.get_nvidia_ocsp(&cache_key) {
@@ -490,40 +501,15 @@ impl Cache {
         }
 
         self.store.record_upstream();
-        let url = self.nvidia_ocsp_uri.clone();
-        let fetched = self
-            .pcs
-            .post_bytes_once(&url, "application/ocsp-request", body)
-            .await
-            .map_err(|_| error::NVIDIA_OCSP_ACCESS_FAILURE);
-        let (status, headers, resp_body) = self.note(&store_key, fetched).await?;
-        let content_type = headers
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .or_else(|| Some("application/ocsp-response".into()));
-        let retry_after = headers
-            .get(axum::http::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        if (100..200).contains(&status) || (300..400).contains(&status) {
-            return self.note(&store_key, Err(error::NVIDIA_OCSP_ACCESS_FAILURE)).await;
-        }
-        if status != 200 {
-            let rec = AmdKdsResponse {
-                status,
-                body: resp_body,
-                content_type,
-                content_disposition: None,
-                retry_after,
-            };
-            self.remember(&store_key, RecentOutcome::Response(rec.clone())).await;
-            return Ok(rec);
+        let resp = self.note(&store_key, self.post_nvidia_ocsp(body).await).await?;
+        if resp.status != 200 {
+            self.remember(&store_key, RecentOutcome::Response(resp.clone())).await;
+            return Ok(resp);
         }
 
         let now_i64 = i64::try_from(unix_time()).map_err(|_| error::INTERNAL_ERROR)?;
         let expires_at = match crate::ocsp::response_cache_expiry(
-            &resp_body,
+            &resp.body,
             now_i64,
             self.nvidia_ocsp_max_ttl_secs,
             self.nvidia_ocsp_default_ttl_secs,
@@ -532,29 +518,39 @@ impl Cache {
             Err(err) => {
                 tracing::warn!("nvidia ocsp response not cacheable: {err}");
                 // Still relay a successful upstream answer; just do not persist it.
-                return Ok(AmdKdsResponse {
-                    status,
-                    body: resp_body,
-                    content_type,
-                    content_disposition: None,
-                    retry_after,
-                });
+                return Ok(resp);
             }
         };
         let rec = NvidiaOcspRecord {
             cache_key,
-            body: resp_body.clone(),
-            content_type: content_type.clone(),
+            body: resp.body.clone(),
+            content_type: resp.content_type.clone(),
             fetched_at: unix_time(),
             expires_at,
         };
         self.store.put_nvidia_ocsp(&rec)?;
+        Ok(AmdKdsResponse { retry_after: None, ..resp })
+    }
+
+    /// One POST to the OCSP responder. 1xx/3xx count as an access failure;
+    /// every other status is relayed.
+    async fn post_nvidia_ocsp(&self, body: &[u8]) -> Result<AmdKdsResponse, PccsError> {
+        let (status, headers, body) = self
+            .pcs
+            .post_bytes_once(&self.nvidia_ocsp_uri, "application/ocsp-request", body)
+            .await
+            .map_err(|_| error::NVIDIA_OCSP_ACCESS_FAILURE)?;
+        if (100..200).contains(&status) || (300..400).contains(&status) {
+            return Err(error::NVIDIA_OCSP_ACCESS_FAILURE);
+        }
+        let header = |name| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
         Ok(AmdKdsResponse {
-            status: 200,
-            body: resp_body,
-            content_type,
+            status,
+            body,
+            content_type: header(axum::http::header::CONTENT_TYPE)
+                .or_else(|| Some("application/ocsp-response".into())),
             content_disposition: None,
-            retry_after: None,
+            retry_after: header(axum::http::header::RETRY_AFTER),
         })
     }
 
