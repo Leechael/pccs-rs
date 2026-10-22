@@ -180,12 +180,9 @@ fn canonicalize_query(query: Option<&str>, allowed: &[&str]) -> Result<String, P
     };
     let mut seen: Vec<(String, String)> = Vec::new();
     for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         if key.is_empty() {
-            continue;
+            return Err(error::INVALID_REQ);
         }
         if !allowed.iter().any(|allowed| *allowed == key) {
             return Err(error::INVALID_REQ);
@@ -1758,6 +1755,20 @@ mod tests {
             .unwrap(),
             format!("/vcek/v1/Genoa/{genoa}?blSPL=2&snpSPL=4&teeSPL=3&ucodeSPL=5")
         );
+    }
+
+    #[test]
+    fn empty_query_pairs_and_keys_are_rejected() {
+        for path in [
+            "/vcek/v1/Milan/cert_chain?&",
+            "/vcek/v1/Milan/ABCD?blSPL=1&&snpSPL=2",
+            "/vcek/v1/Milan/ABCD?blSPL=1&",
+            "/vcek/v1/Milan/ABCD?=3",
+            "/vlek/v1/Genoa/crl?=",
+        ] {
+            assert_err(&canonicalize_amd_kds(path).unwrap_err(), &error::INVALID_REQ);
+        }
+        assert_err(&canonicalize_nvidia_rim("/v1/rim/some-id?&").unwrap_err(), &error::INVALID_REQ);
     }
 
     #[test]
