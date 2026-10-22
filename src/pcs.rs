@@ -369,6 +369,10 @@ impl PcsClient {
                 error::PCS_ACCESS_FAILURE
             })?
             .to_bytes();
+        if status == 200 && body.is_empty() {
+            tracing::warn!("upstream returned an empty 200 body");
+            return Err(error::PCS_ACCESS_FAILURE);
+        }
         Ok((status, hdrs, body.to_vec()))
     }
 
@@ -1243,6 +1247,23 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0].1, "/sgx/certification/v4/tcb?fmspc=00a067110000&update=early");
         assert_eq!(seen[1].1, "/tdx/certification/v4/tcb?fmspc=00A067110000&update=standard");
+    }
+
+    #[tokio::test]
+    async fn empty_200_body_is_an_upstream_failure() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/sgx/certification/v4/tcb", get(|| async { axum::body::Body::empty() }))
+            .route("/sgx/certification/v4/pckcrl", get(|| async { axum::body::Body::empty() }))
+            .route("/sgx/certification/v4/rootcacrl", get(|| async { axum::body::Body::empty() }));
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        let tcb = client.fetch_tcb(0, "00A067110000", 4, UpdateType::Standard).await.unwrap_err();
+        assert_eq!(tcb.status, StatusCode::BAD_GATEWAY);
+        let crl = client.fetch_pckcrl("processor").await.unwrap_err();
+        assert_eq!(crl.status, StatusCode::BAD_GATEWAY);
+        let root = client.fetch_rootcacrl().await.unwrap_err();
+        assert_eq!(root.status, StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

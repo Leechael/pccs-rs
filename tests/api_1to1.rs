@@ -3906,7 +3906,11 @@ async fn every_documented_route_is_registered() {
             .header(headers::ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN)
             .header(headers::USER_TOKEN, DEFAULT_USER_TOKEN)
             .header("content-type", "application/json")
-            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
+            .body(if *method == "GET" || path.contains("/refresh") {
+                Body::empty()
+            } else {
+                Body::from("{}")
+            })
             .unwrap();
         let (status, _, _) = send(app(), req).await;
         assert_ne!(
@@ -5084,7 +5088,11 @@ async fn auth_not_bypassed_by_duplicate_slashes() {
             .method(*method)
             .uri(*path)
             .header("content-type", "application/json")
-            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
+            .body(if *method == "GET" || path.contains("/refresh") {
+                Body::empty()
+            } else {
+                Body::from("{}")
+            })
             .unwrap();
         let (status, _, body) = send(router.clone(), req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path} without token must be 401");
@@ -5096,7 +5104,11 @@ async fn auth_not_bypassed_by_duplicate_slashes() {
             .uri(*path)
             .header(headers::ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN)
             .header("content-type", "application/json")
-            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
+            .body(if *method == "GET" || path.contains("/refresh") {
+                Body::empty()
+            } else {
+                Body::from("{}")
+            })
             .unwrap();
         let (status, _, _) = send(router.clone(), req).await;
         assert!(
@@ -5111,7 +5123,11 @@ async fn auth_not_bypassed_by_duplicate_slashes() {
             .method(*method)
             .uri(&double_slash_path)
             .header("content-type", "application/json")
-            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
+            .body(if *method == "GET" || path.contains("/refresh") {
+                Body::empty()
+            } else {
+                Body::from("{}")
+            })
             .unwrap();
         let (status, _, _) = send(router.clone(), req).await;
         assert_eq!(
@@ -5126,7 +5142,11 @@ async fn auth_not_bypassed_by_duplicate_slashes() {
             .uri(&double_slash_path)
             .header(headers::ADMIN_TOKEN, DEFAULT_ADMIN_TOKEN)
             .header("content-type", "application/json")
-            .body(if *method == "GET" { Body::empty() } else { Body::from("{}") })
+            .body(if *method == "GET" || path.contains("/refresh") {
+                Body::empty()
+            } else {
+                Body::from("{}")
+            })
             .unwrap();
         let (status, _, _) = send(router.clone(), req).await;
         assert_eq!(
@@ -5167,10 +5187,10 @@ async fn auth_not_bypassed_by_duplicate_slashes() {
     assert_eq!(status, StatusCode::NOT_FOUND, "double-slash POST must be 404");
 }
 
-/// Finding G: concurrent refreshes are serialised, and an upstream failure is
-/// reported instead of swallowed.
+/// Concurrent refreshes of the same target share one run; an upstream failure
+/// is reported instead of swallowed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn refresh_is_serialised_and_propagates_failures() {
+async fn refresh_coalesces_same_target_and_propagates_failures() {
     let fail = Arc::new(AtomicBool::new(false));
     let log = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let (uri, _h) = spawn_refresh_mock(fail.clone(), log.clone()).await;
@@ -5186,10 +5206,9 @@ async fn refresh_is_serialised_and_propagates_failures() {
     assert_eq!(status, StatusCode::OK);
     log.lock().await.clear();
 
-    // --- serialisation -----------------------------------------------------
-    // Two refreshes fired together. Each does one 150ms upstream call, so if
-    // `refresh_lock` did not hold they would overlap and the log would read
-    // start,start,end,end.
+    // --- coalescing --------------------------------------------------------
+    // Two refreshes fired together. They share one 150ms upstream call, so the
+    // log is a single start/end pair instead of two runs queued back to back.
     let a = tokio::spawn({
         let r = router.clone();
         async move { send(r, get_admin("/sgx/certification/v4/refresh")).await }
@@ -5203,16 +5222,7 @@ async fn refresh_is_serialised_and_propagates_failures() {
         assert_eq!(status, StatusCode::OK);
     }
     let events = log.lock().await.clone();
-    assert_eq!(
-        events.len(),
-        4,
-        "each refresh should make exactly one upstream tcb call: {events:?}"
-    );
-    assert_eq!(
-        events,
-        vec!["start", "end", "start", "end"],
-        "refreshes must not interleave: {events:?}"
-    );
+    assert_eq!(events, vec!["start", "end"], "same-target callers share one run: {events:?}");
 
     // --- failure propagation ----------------------------------------------
     // The same cached TCB info, but the upstream now 500s. Node's

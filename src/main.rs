@@ -1,14 +1,11 @@
 #![forbid(unsafe_code)]
 
 use clap::Parser;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto;
-use hyper_util::server::graceful::GracefulShutdown;
-use hyper_util::service::TowerToHyperService;
 use pccs_rs::config::{
     Cli, Command, Config, ConfigCommand, DbCommand, DEFAULT_ADMIN_TOKEN_HASH,
     DEFAULT_USER_TOKEN_HASH,
 };
+use pccs_rs::server::{configure_http, serve_http, tune_tcp, SHUTDOWN_GRACE};
 use pccs_rs::{app_state, create_app};
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
@@ -16,16 +13,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
-
-/// How long in-flight requests get to finish after SIGINT / SIGTERM.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-
-/// TCP keepalive on accepted connections. Long-lived keep-alive connections from
-/// the reverse proxy would otherwise be indistinguishable from a proxy that died
-/// without a FIN, and idle NAT / load-balancer state can be dropped underneath
-/// them. Not configurable on purpose: it is a transport-level liveness probe,
-/// unrelated to the HTTP keep-alive idle timeout.
-const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 fn main() {
     match Cli::parse().command {
@@ -152,111 +139,12 @@ async fn run(cfg: Config) {
             std::process::exit(1);
         });
         state.startup.mark_started();
-        serve_http(listener, app, &cfg).await;
+        serve_http(listener, app, &cfg, shutdown_signal()).await;
     }
 
     // Let RocksDB close before the process exits.
     scheduler.abort();
     drop(state);
-}
-
-/// Plain HTTP with the Node `pccs_server.js` connection timeouts and a
-/// graceful shutdown on SIGINT / SIGTERM.
-///
-/// Accepted sockets are tuned for reuse (`TCP_NODELAY`, `SO_KEEPALIVE`) and a
-/// fresh connection must produce its first byte within `HeadersTimeoutSeconds`
-/// before it is handed to hyper — see `configure_http` for why that check lives
-/// here and not in the hyper builder.
-async fn serve_http(listener: tokio::net::TcpListener, app: axum::Router, cfg: &Config) {
-    let mut builder = auto::Builder::new(TokioExecutor::new());
-    configure_http(&mut builder, cfg);
-    let graceful = GracefulShutdown::new();
-    let mut shutdown = std::pin::pin!(shutdown_signal());
-    let first_byte = Duration::from_secs(cfg.headers_timeout_secs);
-
-    // The first-byte wait must not stall the accept loop, and `GracefulShutdown`
-    // is not shareable across tasks, so the wait happens in its own task and the
-    // stream comes back here to be registered and served.
-    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _peer) = match accepted {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!("accept: {e}");
-                        continue;
-                    }
-                };
-                tune_tcp(&stream);
-                let tx = ready_tx.clone();
-                tokio::spawn(async move {
-                    if await_first_byte(&stream, first_byte).await {
-                        let _ = tx.send(stream);
-                    }
-                });
-            }
-            Some(stream) = ready_rx.recv() => {
-                let service = TowerToHyperService::new(app.clone());
-                let conn = builder
-                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                    .into_owned();
-                let conn = graceful.watch(conn);
-                tokio::spawn(async move {
-                    if let Err(e) = conn.await {
-                        tracing::debug!("connection: {e}");
-                    }
-                });
-            }
-            _ = &mut shutdown => {
-                tracing::info!("shutting down");
-                break;
-            }
-        }
-    }
-
-    tokio::select! {
-        _ = graceful.shutdown() => {}
-        _ = tokio::time::sleep(SHUTDOWN_GRACE) => {
-            tracing::warn!("graceful shutdown timed out after {SHUTDOWN_GRACE:?}");
-        }
-    }
-}
-
-/// `false` means the connection is not worth serving: it stayed silent past the
-/// deadline (slowloris / a probe that opens sockets and leaves), or it hung up.
-/// `peek` leaves the byte in the socket buffer for hyper to read.
-async fn await_first_byte(stream: &tokio::net::TcpStream, timeout: Duration) -> bool {
-    if timeout.is_zero() {
-        return true;
-    }
-    match tokio::time::timeout(timeout, stream.peek(&mut [0u8; 1])).await {
-        Ok(Ok(0)) => false,
-        Ok(Ok(_)) => true,
-        Ok(Err(e)) => {
-            tracing::debug!("first byte: {e}");
-            false
-        }
-        Err(_) => {
-            tracing::debug!("no request within {timeout:?} of connect; closing");
-            false
-        }
-    }
-}
-
-/// `TCP_NODELAY` (collateral responses are small; Nagle would add latency to
-/// back-to-back requests on a reused connection) plus `SO_KEEPALIVE`. Failures
-/// are logged, never fatal: the connection is still perfectly serviceable.
-fn tune_tcp(stream: &tokio::net::TcpStream) {
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::debug!("set_nodelay: {e}");
-    }
-    let keepalive =
-        socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE).with_interval(TCP_KEEPALIVE);
-    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
-        tracing::debug!("set_tcp_keepalive: {e}");
-    }
 }
 
 /// The TLS path goes through `axum_server`, which owns its accept loop; this
@@ -274,40 +162,6 @@ impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for TunedAcceptor 
         tune_tcp(&stream);
         std::future::ready(Ok((stream, service)))
     }
-}
-
-/// Connection timeouts, split the way a reverse proxy needs them.
-///
-/// hyper 1.x has a single `header_read_timeout`, and it runs both while a
-/// request head is being read *and* while an idle keep-alive connection waits
-/// for the next request. Driving it from `HeadersTimeoutSeconds` therefore closed
-/// idle connections from Caddy after 10s instead of 60s — a reconnect per
-/// request, and a close/reuse race that surfaces at the proxy as a 502.
-///
-/// So `KeepAliveTimeoutSeconds` owns hyper's timer (0 disables keep-alive
-/// entirely), and `HeadersTimeoutSeconds` is enforced separately, by
-/// `await_first_byte`, on a freshly accepted connection only. That bounds
-/// slowloris on new connections, which is what it was there for.
-///
-/// The trade-off: a *partial* request head that stalls mid-way on an already
-/// established keep-alive connection is bounded by `KeepAliveTimeoutSeconds`
-/// (60s), not by `HeadersTimeoutSeconds` (10s). An attacker must complete one
-/// full request before they can hold a socket for the longer window, and the
-/// concurrency cost of that is the same as any idle keep-alive connection.
-fn configure_http(builder: &mut auto::Builder<TokioExecutor>, cfg: &Config) {
-    let keep_alive = cfg.keepalive_timeout_secs > 0;
-    // With keep-alive off there is no idle wait to bound, so the headers timeout
-    // is the only meaningful value for the single request head.
-    let idle =
-        if keep_alive { cfg.keepalive_timeout_secs } else { cfg.headers_timeout_secs.max(1) };
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .keep_alive(keep_alive)
-        // A client that pipelines back-to-back requests gets their responses
-        // coalesced into one write instead of one syscall each.
-        .pipeline_flush(true)
-        .header_read_timeout(Some(Duration::from_secs(idle)));
 }
 
 async fn shutdown_signal() {
@@ -481,15 +335,6 @@ mod tests {
         assert_eq!(addr.port(), 9090);
     }
 
-    #[test]
-    fn configure_http_both_keepalive_modes() {
-        let mut builder = auto::Builder::new(TokioExecutor::new());
-        let mut cfg = Config::default();
-        configure_http(&mut builder, &cfg);
-        cfg.keepalive_timeout_secs = 0;
-        configure_http(&mut builder, &cfg);
-    }
-
     /// Occurrences of `needle` in the shared log stream. The stream is
     /// process-global and tests run in parallel, so every assertion is a
     /// before/after count on a needle only this test can produce.
@@ -551,39 +396,6 @@ mod tests {
         let (stream, _service) = TunedAcceptor.accept(stream, ()).await.unwrap();
         drop(stream);
         client.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn await_first_byte_peeks_without_consuming() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // A client that sends a byte: true, and the byte is still there.
-        // (Connect before accept: the backlog completes the handshake.)
-        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (mut stream, _) = listener.accept().await.unwrap();
-        client.write_all(b"G").await.unwrap();
-        assert!(await_first_byte(&stream, Duration::from_secs(5)).await);
-        let mut buf = [0u8; 1];
-        stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"G", "peek must not consume the request head");
-
-        // A client that hangs up immediately: false.
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
-        drop(client);
-        assert!(!await_first_byte(&stream, Duration::from_secs(5)).await);
-
-        // A silent client past the deadline: false.
-        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
-        assert!(!await_first_byte(&stream, Duration::from_millis(50)).await);
-
-        // A zero deadline disables the check.
-        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
-        assert!(await_first_byte(&stream, Duration::ZERO).await);
     }
 
     #[tokio::test]

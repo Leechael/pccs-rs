@@ -11,7 +11,7 @@ use crate::store::{
 use crate::validate::UpdateType;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{watch, Mutex, OwnedMutexGuard};
 
 /// Node `Constants.PLATF_REG_NEW` / `PLATF_REG_NOT_AVAILABLE`.
 const PLATF_REG_NEW: u8 = 0;
@@ -67,14 +67,20 @@ pub struct Cache {
     /// Per-key locks so N concurrent misses on the same key produce one
     /// upstream request; the losers re-read the store after acquiring.
     inflight: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    /// Only one refresh at a time; a second admin call waits for the first.
+    /// Only one refresh at a time; a second admin call for a *different*
+    /// target waits for the first. Same-target callers share the in-flight run.
     refresh_lock: Mutex<()>,
+    /// In-flight admin `/refresh` results, keyed by target (`collateral` or
+    /// `certs:<FMSPC>`). Waiters clone the receiver and share that run.
+    refresh_inflight: Mutex<HashMap<String, RefreshWatch>>,
     /// Recent upstream failures / non-200 responses per key; see `key_lock`.
     failures: Mutex<HashMap<String, (std::time::Instant, RecentOutcome)>>,
     /// Last attempted pool re-fetch per platform, success or failure. In
     /// memory only: losing it on restart just allows one extra fetch.
     refetch_marks: Mutex<HashMap<String, std::time::Instant>>,
 }
+
+type RefreshWatch = watch::Receiver<Option<Result<(), PccsError>>>;
 
 /// How long a failed upstream fetch suppresses a retry by the requests already
 /// queued behind it. Short on purpose — this is stampede control, not caching.
@@ -119,6 +125,19 @@ impl From<AmdKdsRecord> for AmdKdsResponse {
             content_type: rec.content_type,
             content_disposition: rec.content_disposition,
             retry_after: None,
+        }
+    }
+}
+
+async fn wait_refresh_result(mut rx: RefreshWatch) -> Option<Result<(), PccsError>> {
+    loop {
+        let current = rx.borrow().clone();
+        if let Some(result) = current {
+            return Some(result);
+        }
+        let changed = rx.changed().await;
+        if changed.is_err() {
+            return None;
         }
     }
 }
@@ -272,6 +291,7 @@ impl Cache {
             refresh_concurrency: POOL_REFRESH_CONCURRENCY.min(cfg.upstream_max_concurrent.max(1)),
             inflight: Mutex::new(HashMap::new()),
             refresh_lock: Mutex::new(()),
+            refresh_inflight: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             refetch_marks: Mutex::new(HashMap::new()),
         }
@@ -1455,12 +1475,46 @@ impl Cache {
         if self.mode == CacheMode::Offline {
             return Err(error::SERVICE_UNAVAILABLE);
         }
-        // Node has no guard and lets two refreshes interleave; we serialise
-        // them so a second admin call waits rather than doubling upstream load.
-        let _guard = self.refresh_lock.lock().await;
-        match certs_fmspc {
-            Some(f) => self.refresh_certs(&f).await,
-            None => self.refresh_collateral().await,
+        let target = match &certs_fmspc {
+            Some(f) => format!("certs:{}", f.to_ascii_uppercase()),
+            None => "collateral".to_string(),
+        };
+        loop {
+            let existing = {
+                let map = self.refresh_inflight.lock().await;
+                map.get(&target).cloned()
+            };
+            if let Some(rx) = existing {
+                let shared = wait_refresh_result(rx).await;
+                if let Some(result) = shared {
+                    return result;
+                }
+                continue;
+            }
+
+            let (tx, rx) = watch::channel(None);
+            {
+                let mut map = self.refresh_inflight.lock().await;
+                if let Some(other) = map.get(&target).cloned() {
+                    drop(map);
+                    let shared = wait_refresh_result(other).await;
+                    if let Some(result) = shared {
+                        return result;
+                    }
+                    continue;
+                }
+                map.insert(target.clone(), rx);
+            }
+
+            // Different targets still run one at a time.
+            let _guard = self.refresh_lock.lock().await;
+            let result = match &certs_fmspc {
+                Some(f) => self.refresh_certs(f).await,
+                None => self.refresh_collateral().await,
+            };
+            let _ = tx.send(Some(result.clone()));
+            self.refresh_inflight.lock().await.remove(&target);
+            return result;
         }
     }
 
