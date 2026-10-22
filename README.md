@@ -335,6 +335,7 @@ JSON.
 | `rootcacrl` | (literal) | CRL bytes |
 | `crl/` | uri | CRL bytes |
 | `amd-kds/` | complete upstream URL | response bytes, content headers, fetch time |
+| `nvidia-rim/` | complete upstream URL | response bytes, content headers, fetch time |
 | `appraisal/` | fmspc | policy list (GET joins defaults) |
 | `preg/` | qeid / pceid / cpusvn / pcesvn | registration queue |
 
