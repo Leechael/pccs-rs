@@ -176,7 +176,9 @@ db_path = "/var/lib/pccs-rs"
   Entries expire at the
   signed `nextUpdate` (capped by `nvidia_ocsp_max_ttl_seconds`); responses
   without `nextUpdate` expire `nvidia_ocsp_default_ttl_seconds` (default one
-  hour) after `thisUpdate`. Expired OCSP is never served. This is the missing piece
+  hour) after `thisUpdate`. Expired OCSP is never served. A response with an
+  `unknown` certificate status (in any of its SingleResponses) is relayed but
+  not stored; `good` and `revoked` are cached. This is the missing piece
   for using pccs-rs as a dstack `nvidia_attestation_proxy_url`.
 - The NVIDIA NRAS host defaults to `https://nras.attestation.nvidia.com`.
   `POST /nvidia/nras/attest/gpu` is a **stateless CORS proxy** to
