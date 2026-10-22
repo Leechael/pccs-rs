@@ -228,12 +228,18 @@ impl Cache {
             format!("/{path_and_query}")
         };
         let url = format!("{}{path_and_query}", self.amd_kds_uri);
+        let key = keys::amd_kds(&url);
         let now = unix_time();
         if let Some(rec) = self.store.get_amd_kds(&url) {
             if now.saturating_sub(rec.fetched_at) < self.amd_kds_cache_ttl_secs {
                 self.store.record_hit();
                 tracing::debug!("cache hit amd kds");
                 return Ok(rec.into());
+            }
+            // LAZY drops it under the key lock instead, so a concurrent fill
+            // that just replaced it is never deleted.
+            if self.mode != CacheMode::Lazy {
+                self.drop_expired(&key);
             }
         }
         self.store.record_miss();
@@ -242,13 +248,13 @@ impl Cache {
             return Err(error::NO_CACHE_DATA);
         }
 
-        let key = keys::amd_kds(&url);
         let _guard = self.key_lock(&key).await?;
         let now = unix_time();
         if let Some(rec) = self.store.get_amd_kds(&url) {
             if now.saturating_sub(rec.fetched_at) < self.amd_kds_cache_ttl_secs {
                 return Ok(rec.into());
             }
+            self.drop_expired(&key);
         }
 
         self.store.record_upstream();
@@ -279,6 +285,26 @@ impl Cache {
             AmdKdsRecord { url, body, content_type, content_disposition, fetched_at: unix_time() };
         self.store.put_amd_kds(&rec)?;
         Ok(rec.into())
+    }
+
+    /// Read-through records are only replaced when the same URL is requested
+    /// again, so an expired one is deleted as soon as a lookup sees it.
+    fn drop_expired(&self, key: &str) {
+        if let Err(e) = self.store.delete_key(key) {
+            tracing::warn!("failed to delete expired {key}: {e}");
+        }
+    }
+
+    /// Delete the expired read-through records no request came back for.
+    fn sweep_expired(&self) {
+        let now = unix_time();
+        let ttl = self.amd_kds_cache_ttl_secs;
+        let expired = |rec: &AmdKdsRecord| now.saturating_sub(rec.fetched_at) >= ttl;
+        match self.store.sweep_prefix(keys::AMD_KDS, expired) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("swept {n} expired amd kds records"),
+            Err(e) => tracing::warn!("amd kds sweep: {e}"),
+        }
     }
 
     // ---------------- pckcert ----------------
@@ -1274,6 +1300,10 @@ impl Cache {
     /// pool sweep still runs (the collateral result is what this returns), and
     /// a per-platform pool failure never affects the collateral result.
     pub async fn scheduled_refresh(self: &Arc<Self>) -> Result<(), PccsError> {
+        // Local only, so it runs in every mode, OFFLINE included.
+        if let Err(e) = self.blocking(Cache::sweep_expired).await {
+            tracing::warn!("expired record sweep: {e}");
+        }
         if self.mode == CacheMode::Offline {
             return Err(error::SERVICE_UNAVAILABLE);
         }
@@ -1496,6 +1526,58 @@ mod tests {
         let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
         let pcs = PcsClient::new(&cfg).unwrap();
         (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
+    }
+
+    fn amd_cache(amd_kds_uri: &str, mode: CacheMode) -> (TestDir, Arc<Cache>) {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-cache-{}", uuid::Uuid::new_v4()));
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: amd_kds_uri.into(),
+            cache_mode: mode,
+            db_path: dir.clone(),
+            upstream_max_attempts: 1,
+            ..Config::default()
+        };
+        let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
+        let pcs = PcsClient::new(&cfg).unwrap();
+        (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
+    }
+
+    fn amd_record(url: &str, fetched_at: u64) -> AmdKdsRecord {
+        AmdKdsRecord {
+            url: url.into(),
+            body: b"cert".to_vec(),
+            content_type: None,
+            content_disposition: None,
+            fetched_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_amd_kds_record_is_deleted_when_a_lookup_finds_it() {
+        let host = "http://127.0.0.1:0";
+        let url = format!("{host}/vcek/v1/Milan/cert_chain");
+        for mode in [CacheMode::Offline, CacheMode::Req, CacheMode::Lazy] {
+            let (_dir, cache) = amd_cache(host, mode);
+            cache.store.put_amd_kds(&amd_record(&url, 0)).unwrap();
+            assert!(cache.get_amd_kds("/vcek/v1/Milan/cert_chain").await.is_err());
+            assert!(cache.store.get_amd_kds(&url).is_none(), "{mode:?} kept an expired record");
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_refresh_sweeps_expired_amd_kds_records() {
+        let host = "http://127.0.0.1:0";
+        let stale = format!("{host}/vcek/v1/Milan/cert_chain");
+        let fresh = format!("{host}/vcek/v1/Genoa/cert_chain");
+        for mode in [CacheMode::Lazy, CacheMode::Offline] {
+            let (_dir, cache) = amd_cache(host, mode);
+            cache.store.put_amd_kds(&amd_record(&stale, 0)).unwrap();
+            cache.store.put_amd_kds(&amd_record(&fresh, unix_time())).unwrap();
+            let _ = cache.scheduled_refresh().await;
+            assert!(cache.store.get_amd_kds(&stale).is_none(), "{mode:?} kept an expired record");
+            assert!(cache.store.get_amd_kds(&fresh).is_some(), "{mode:?} swept a fresh record");
+        }
     }
 
     async fn spawn(app: axum::Router) -> String {

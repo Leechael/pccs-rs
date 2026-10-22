@@ -816,6 +816,36 @@ impl Store {
         self.put_json(&keys::amd_kds(&rec.url), rec)
     }
 
+    pub fn delete_key(&self, key: &str) -> Result<(), PccsError> {
+        self.db.delete(key.as_bytes()).map_err(|_| error::INTERNAL_ERROR)
+    }
+
+    /// Delete every record under `prefix` that `expired` flags, in one batch.
+    /// Only the expired keys are held in memory, never the scanned values.
+    pub fn sweep_prefix<T: for<'de> Deserialize<'de>>(
+        &self,
+        prefix: &str,
+        expired: impl Fn(&T) -> bool,
+    ) -> Result<usize, PccsError> {
+        let mut batch = WriteBatch::default();
+        let mut swept = 0;
+        let iter = self.db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        for item in iter {
+            let (k, v) = item.map_err(|_| error::INTERNAL_ERROR)?;
+            if !k.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if serde_json::from_slice::<T>(&v).is_ok_and(|rec| expired(&rec)) {
+                batch.delete(&k);
+                swept += 1;
+            }
+        }
+        if swept > 0 {
+            self.write_batch(batch)?;
+        }
+        Ok(swept)
+    }
+
     // ---------- registration queue ----------
 
     fn normalize_reg(p: &mut RegisteredPlatform) {
