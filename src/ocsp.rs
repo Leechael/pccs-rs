@@ -154,6 +154,16 @@ fn response_validity(response: &[u8]) -> Result<Vec<ResponseValidity>, PccsError
     let basic = parse_single(basic_der.value, 0x30)?;
     let mut fields = basic.value;
     let response_data = take_expected(&mut fields, 0x30)?;
+    // signatureAlgorithm and signature are mandatory; certs [0] is optional.
+    take_expected(&mut fields, 0x30)?;
+    take_expected(&mut fields, 0x03)?;
+    if !fields.is_empty() {
+        let certs = take_expected(&mut fields, 0xa0)?;
+        parse_single(certs.value, 0x30)?;
+    }
+    if !fields.is_empty() {
+        return Err(error::INVALID_REQ);
+    }
     let mut fields = response_data.value;
 
     // Optional version.
@@ -420,6 +430,25 @@ mod tests {
         let other_oid = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
         let other = response_with("20260716114500Z", next, &other_oid, &signature);
         assert!(response_cache_expiry(&other, now, 86_400, 3_600).is_err());
+    }
+
+    #[test]
+    fn truncated_basic_response_is_not_cacheable() {
+        let now = 1_784_202_600;
+        let next = Some("20260716123000Z");
+        let algorithm = sequence(&[der(0x06, &[0x2a, 0x03])]);
+        let signature = der(0x03, &[0]);
+        let certs = der(0xa0, &sequence(&[sequence(&[der(0x02, &[1])])]));
+        let cacheable = |after: &[Vec<u8>]| {
+            let response = response_with("20260716114500Z", next, OID_OCSP_BASIC, after);
+            response_cache_expiry(&response, now, 86_400, 3_600).is_ok()
+        };
+        assert!(cacheable(&[algorithm.clone(), signature.clone()]));
+        assert!(cacheable(&[algorithm.clone(), signature.clone(), certs.clone()]));
+        assert!(!cacheable(&[]));
+        assert!(!cacheable(&[algorithm.clone()]));
+        assert!(!cacheable(&[algorithm.clone(), signature.clone(), certs, der(0x05, &[])]));
+        assert!(!cacheable(&[algorithm, signature, der(0xa0, &der(0x02, &[1]))]));
     }
 
     #[test]
