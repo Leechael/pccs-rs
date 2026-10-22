@@ -3,7 +3,7 @@
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::any;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const PCK_PEM: &str = include_str!("fixtures/pck-synthetic.pem");
+const PCK_PEM: &str = "-----BEGIN CERTIFICATE-----\nMOCKPCK\n-----END CERTIFICATE-----\n";
 const CRL_DER: &[u8] = include_bytes!("fixtures/crl-synthetic.der");
 
 const QEID: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -82,30 +82,6 @@ impl FakePcs {
     fn record(&self, kind: &str) {
         self.total.fetch_add(1, Ordering::SeqCst);
         *self.calls.lock().unwrap().entry(kind.to_string()).or_insert(0) += 1;
-    }
-}
-
-fn classify(path: &str) -> &'static str {
-    if path.contains("/pckcerts") {
-        "pckcerts"
-    } else if path.contains("/pckcert") {
-        "pckcert"
-    } else if path.contains("/pckcrl") {
-        "pckcrl"
-    } else if path.contains("/qve/identity") {
-        "qve"
-    } else if path.contains("/tdx/") && path.contains("/qe/identity") {
-        "tdqe"
-    } else if path.contains("/qe/identity") {
-        "qe"
-    } else if path.contains("/tdx/") && path.contains("/tcb") {
-        "tdx-tcb"
-    } else if path.contains("/tcb") {
-        "tcb"
-    } else if path.contains("rootcacrl") {
-        "rootcacrl"
-    } else {
-        "other"
     }
 }
 
@@ -171,33 +147,49 @@ fn json_chain(body: &'static str, chain_name: &'static str, chain: &'static str)
     resp
 }
 
+async fn fake_reply(fake: FakePcs, kind: &'static str) -> Response {
+    let delay = *fake.delay.lock().unwrap();
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    fake.record(kind);
+    let script = *fake.script.lock().unwrap();
+    match script {
+        Script::Empty200 => StatusCode::OK.into_response(),
+        Script::Status(code) => {
+            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR).into_response()
+        }
+        Script::Fixture => fixture_for(kind),
+    }
+}
+
 async fn spawn_fake(fake: FakePcs) -> String {
-    let app =
-        axum::Router::new().fallback(get(move |req: axum::http::Request<axum::body::Body>| {
-            let fake = fake.clone();
-            async move {
-                let path = req.uri().path().to_string();
-                let kind = classify(&path);
-                let delay = *fake.delay.lock().unwrap();
-                if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
-                }
-                fake.record(kind);
-                let script = *fake.script.lock().unwrap();
-                match script {
-                    Script::Empty200 => StatusCode::OK.into_response(),
-                    Script::Status(code) => StatusCode::from_u16(code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-                        .into_response(),
-                    Script::Fixture => fixture_for(kind),
-                }
-            }
-        }));
+    let pckcert = fake.clone();
+    let pckcrl = fake.clone();
+    let tcb = fake.clone();
+    let tdx_tcb = fake.clone();
+    let qe = fake.clone();
+    let qve = fake.clone();
+    let tdqe = fake.clone();
+    let root = fake.clone();
+    let app = axum::Router::new()
+        .route("/sgx/certification/v4/pckcert", any(move || fake_reply(pckcert.clone(), "pckcert")))
+        .route("/sgx/certification/v4/pckcrl", any(move || fake_reply(pckcrl.clone(), "pckcrl")))
+        .route("/sgx/certification/v4/tcb", any(move || fake_reply(tcb.clone(), "tcb")))
+        .route("/tdx/certification/v4/tcb", any(move || fake_reply(tdx_tcb.clone(), "tdx-tcb")))
+        .route("/sgx/certification/v4/qe/identity", any(move || fake_reply(qe.clone(), "qe")))
+        .route("/sgx/certification/v4/qve/identity", any(move || fake_reply(qve.clone(), "qve")))
+        .route("/tdx/certification/v4/qe/identity", any(move || fake_reply(tdqe.clone(), "tdqe")))
+        .route(
+            "/sgx/certification/v4/rootcacrl",
+            any(move || fake_reply(root.clone(), "rootcacrl")),
+        );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
+    wait_for_port(addr).await;
     format!("http://{addr}/sgx/certification/v4/")
 }
 
@@ -286,7 +278,7 @@ async fn http(
     (status, headers, body)
 }
 
-async fn get(h: &Harness, path: &str) -> (StatusCode, HeaderMap, Bytes) {
+async fn http_get(h: &Harness, path: &str) -> (StatusCode, HeaderMap, Bytes) {
     http(&h.base, "GET", path, &[], None).await
 }
 
@@ -403,8 +395,16 @@ async fn public_collateral_routes_status_headers_body_and_cache_hit() {
     let h = start_harness().await;
     for case in collateral_cases() {
         let before = h.fake.count(case.kind);
-        let (status, headers, body) = get(&h, &case.path).await;
-        assert_eq!(status, StatusCode::OK, "{} {}", case.path, String::from_utf8_lossy(&body));
+        let (status, headers, body) = http_get(&h, &case.path).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{} {} upstream={} total={}",
+            case.path,
+            String::from_utf8_lossy(&body),
+            h.fake.count(case.kind),
+            h.fake.total()
+        );
         assert!(headers.get(headers::REQUEST_ID).is_some(), "{}", case.path);
         assert_eq!(
             headers.get(axum::http::header::CONTENT_TYPE).map(|v| v.as_bytes()),
@@ -431,7 +431,7 @@ async fn public_collateral_routes_status_headers_body_and_cache_hit() {
         }
         assert_eq!(h.fake.count(case.kind), before + 1, "first {} must hit upstream", case.kind);
 
-        let (status, _, _) = get(&h, &case.path).await;
+        let (status, _, _) = http_get(&h, &case.path).await;
         assert_eq!(status, StatusCode::OK, "second {}", case.path);
         assert_eq!(h.fake.count(case.kind), before + 1, "second {} must be a cache hit", case.kind);
     }
@@ -521,7 +521,7 @@ async fn configured_request_timeout_is_408_on_a_stalled_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refresh_same_target_coalesces_to_one_upstream_run() {
     let h = start_harness().await;
-    let (status, _, _) = get(&h, &format!("/sgx/certification/v4/tcb?fmspc={FMSPC}")).await;
+    let (status, _, _) = http_get(&h, &format!("/sgx/certification/v4/tcb?fmspc={FMSPC}")).await;
     assert_eq!(status, StatusCode::OK);
     h.fake.set_delay(Duration::from_millis(200));
     let before = h.fake.total();
@@ -579,30 +579,48 @@ async fn empty_200_from_upstream_is_not_cached_on_json_and_crl() {
         "/sgx/certification/v4/rootcacrl".to_string(),
     ] {
         let before = h.fake.total();
-        let (status, _, body) = get(&h, &path).await;
+        let (status, _, body) = http_get(&h, &path).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{path}");
         assert_eq!(body.as_ref(), b"Unable to retrieve the collateral from the Intel SGX PCS.");
         let after_first = h.fake.total();
         assert!(after_first > before, "{path} must hit upstream");
 
-        let (status, _, _) = get(&h, &path).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "second {path}");
-        assert!(h.fake.total() > after_first, "{path} must not be cached");
+        // A remembered miss only suppresses retries for one second; that is
+        // stampede control, not a stored body. After it expires, a fixture
+        // response must fill the store (so the empty 200 was not persisted).
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        h.fake.set_script(Script::Fixture);
+        let (status, _, body) = http_get(&h, &path).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "after an empty 200, a later fixture fill must succeed for {path}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        h.fake.set_script(Script::Empty200);
     }
 }
 
 #[tokio::test]
 async fn fake_upstream_status_modes_are_not_cached() {
     let h = start_harness().await;
-    for code in [404u16, 410, 429, 503] {
+    for (i, code) in [404u16, 410, 429, 503].into_iter().enumerate() {
         h.fake.set_script(Script::Status(code));
-        let path = format!("/sgx/certification/v4/tcb?fmspc={FMSPC}");
+        let fmspc = format!("00A06711000{i}");
+        let path = format!("/sgx/certification/v4/tcb?fmspc={fmspc}");
         let before = h.fake.count("tcb");
-        let (status, _, _) = get(&h, &path).await;
+        let (status, _, _) = http_get(&h, &path).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "upstream {code}");
-        let (status, _, _) = get(&h, &path).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "second upstream {code}");
-        assert!(h.fake.count("tcb") >= before + 2, "status {code} must not cache");
+        assert!(h.fake.count("tcb") > before, "status {code} must hit upstream");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        h.fake.set_script(Script::Fixture);
+        let (status, _, body) = http_get(&h, &path).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upstream {code} must not persist a body: {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 }
 

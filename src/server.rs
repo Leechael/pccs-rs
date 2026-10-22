@@ -76,7 +76,8 @@ pub async fn serve_http(
                     .into_owned();
                 let conn = graceful.watch(conn);
                 tokio::spawn(async move {
-                    if let Err(e) = conn.await {
+                    let result = conn.await;
+                    if let Err(e) = result {
                         tracing::debug!("connection: {e}");
                     }
                 });
@@ -205,12 +206,10 @@ async fn drain_and_close(mut stream: tokio::net::TcpStream, grace: Duration) {
     let drain = async {
         let mut buf = [0u8; 8192];
         loop {
-            let n = match stream.read(&mut buf).await {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            if n == 0 {
-                break;
+            let read = stream.read(&mut buf).await;
+            match read {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
             }
         }
     };

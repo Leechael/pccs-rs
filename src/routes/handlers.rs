@@ -425,22 +425,21 @@ pub async fn not_found() -> Response {
 /// Paths that consume a request body. Everything else — every GET, `/refresh`,
 /// and unmatched routes — must not carry one.
 fn route_expects_body(method: &Method, path: &str) -> bool {
-    match (method, path) {
-        (&Method::POST, "/sgx/certification/v3/platforms" | "/sgx/certification/v4/platforms") => {
-            true
-        }
-        (
-            &Method::PUT,
-            "/sgx/certification/v3/platformcollateral" | "/sgx/certification/v4/platformcollateral",
-        ) => true,
-        (
-            &Method::PUT,
-            "/sgx/certification/v3/appraisalpolicy" | "/sgx/certification/v4/appraisalpolicy",
-        ) => true,
-        (&Method::POST, "/ocsp") => true,
-        (&Method::POST, "/nvidia/nras/attest/gpu") => true,
-        _ => false,
-    }
+    matches!(
+        (method, path),
+        (&Method::POST, "/sgx/certification/v3/platforms" | "/sgx/certification/v4/platforms")
+            | (
+                &Method::PUT,
+                "/sgx/certification/v3/platformcollateral"
+                    | "/sgx/certification/v4/platformcollateral"
+            )
+            | (
+                &Method::PUT,
+                "/sgx/certification/v3/appraisalpolicy" | "/sgx/certification/v4/appraisalpolicy"
+            )
+            | (&Method::POST, "/ocsp")
+            | (&Method::POST, "/nvidia/nras/attest/gpu")
+    )
 }
 
 /// A client advertised a body: non-zero Content-Length, or a chunked body.
@@ -468,14 +467,16 @@ pub async fn reject_unexpected_body(req: Request, next: Next) -> Response {
     if has_body && !route_expects_body(&method, &path) {
         return error::CONTENT_TOO_LARGE.into_response();
     }
-    next.run(req).await
+    let response = next.run(req).await;
+    response
 }
 
 /// `/pckcrl/` and the like must not match `/pckcrl`. A trailing slash is 404.
 pub async fn reject_trailing_slash(req: Request, next: Next) -> Response {
     let path = req.uri().path();
     if path.len() > 1 && path.ends_with('/') {
-        return not_found().await;
+        return StatusCode::NOT_FOUND.into_response();
     }
-    next.run(req).await
+    let response = next.run(req).await;
+    response
 }

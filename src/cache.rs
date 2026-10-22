@@ -72,13 +72,15 @@ pub struct Cache {
     refresh_lock: Mutex<()>,
     /// In-flight admin `/refresh` results, keyed by target (`collateral` or
     /// `certs:<FMSPC>`). Waiters clone the receiver and share that run.
-    refresh_inflight: Mutex<HashMap<String, watch::Receiver<Option<Result<(), PccsError>>>>>,
+    refresh_inflight: Mutex<HashMap<String, RefreshWatch>>,
     /// Recent upstream failures / non-200 responses per key; see `key_lock`.
     failures: Mutex<HashMap<String, (std::time::Instant, RecentOutcome)>>,
     /// Last attempted pool re-fetch per platform, success or failure. In
     /// memory only: losing it on restart just allows one extra fetch.
     refetch_marks: Mutex<HashMap<String, std::time::Instant>>,
 }
+
+type RefreshWatch = watch::Receiver<Option<Result<(), PccsError>>>;
 
 /// How long a failed upstream fetch suppresses a retry by the requests already
 /// queued behind it. Short on purpose — this is stampede control, not caching.
@@ -127,9 +129,7 @@ impl From<AmdKdsRecord> for AmdKdsResponse {
     }
 }
 
-async fn wait_refresh_result(
-    mut rx: watch::Receiver<Option<Result<(), PccsError>>>,
-) -> Option<Result<(), PccsError>> {
+async fn wait_refresh_result(mut rx: RefreshWatch) -> Option<Result<(), PccsError>> {
     loop {
         let current = rx.borrow().clone();
         if let Some(result) = current {
