@@ -26,6 +26,14 @@ pub const CRL: &str = "crl/";
 pub const AMD_KDS: &str = "amd-kds/";
 pub const NVIDIA_RIM: &str = "nvidia-rim/";
 pub const NVIDIA_OCSP: &str = "nvidia-ocsp/";
+/// Insertion-order index of the bounded read-through kinds:
+/// `fifo/{kind}` + big-endian write time (µs) + entry key, empty value.
+pub const FIFO_ORDER: &str = "fifo/";
+/// Reverse lookup `fifo-pos/{entry key}` -> big-endian write time, so a
+/// rewrite finds and replaces its own index row.
+pub const FIFO_POS: &str = "fifo-pos/";
+/// `fifo-count/{kind}` -> big-endian entry count.
+pub const FIFO_COUNT: &str = "fifo-count/";
 pub const APPRAISAL: &str = "appraisal/";
 pub const PREG: &str = "preg/";
 /// Per-platform PCK cert pool + known raw TCBs (Intel `platforms` +

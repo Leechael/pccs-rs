@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PckCertRecord {
@@ -203,6 +203,36 @@ pub struct Store {
     reg_lock: Mutex<()>,
     platform_lock: Mutex<()>,
     appraisal_lock: Mutex<()>,
+    /// Serialises the bound-and-evict step of the read-through kinds. Holds
+    /// the last index timestamp handed out, so write times never repeat.
+    fifo_lock: Mutex<u64>,
+    readthrough_max_entries: usize,
+}
+
+/// Read-through kinds bounded by `readthrough_max_entries_per_kind`.
+const BOUNDED_KINDS: [&str; 3] = [keys::AMD_KDS, keys::NVIDIA_RIM, keys::NVIDIA_OCSP];
+
+fn fifo_order_prefix(kind: &str) -> Vec<u8> {
+    format!("{}{kind}", keys::FIFO_ORDER).into_bytes()
+}
+
+fn fifo_order_key(kind: &str, written_at: u64, entry_key: &[u8]) -> Vec<u8> {
+    let mut key = fifo_order_prefix(kind);
+    key.extend_from_slice(&written_at.to_be_bytes());
+    key.extend_from_slice(entry_key);
+    key
+}
+
+fn fifo_pos_key(entry_key: &[u8]) -> Vec<u8> {
+    [keys::FIFO_POS.as_bytes(), entry_key].concat()
+}
+
+fn fifo_count_key(kind: &str) -> String {
+    format!("{}{kind}", keys::FIFO_COUNT)
+}
+
+fn be_u64(bytes: &[u8]) -> Option<u64> {
+    <[u8; 8]>::try_from(bytes).ok().map(u64::from_be_bytes)
 }
 
 impl Store {
@@ -219,7 +249,7 @@ impl Store {
         );
         let db =
             DB::open(&opts, path).map_err(|e| format!("rocksdb open {}: {e}", path.display()))?;
-        Ok(Self {
+        let store = Self {
             db,
             cache_mode,
             hits: AtomicU64::new(0),
@@ -228,7 +258,139 @@ impl Store {
             reg_lock: Mutex::new(()),
             platform_lock: Mutex::new(()),
             appraisal_lock: Mutex::new(()),
-        })
+            fifo_lock: Mutex::new(0),
+            readthrough_max_entries: crate::config::DEFAULT_READTHROUGH_MAX_ENTRIES_PER_KIND
+                as usize,
+        };
+        store.index_unindexed_entries()?;
+        Ok(store)
+    }
+
+    /// Entries per read-through kind; below 1 is raised to 1.
+    pub fn set_readthrough_max_entries(&mut self, max: usize) {
+        self.readthrough_max_entries = max.max(1);
+    }
+
+    /// Number of indexed entries of one read-through kind.
+    pub fn readthrough_count(&self, kind: &str) -> u64 {
+        self.db
+            .get_pinned(fifo_count_key(kind))
+            .ok()
+            .flatten()
+            .and_then(|v| be_u64(&v))
+            .unwrap_or(0)
+    }
+
+    fn lock_fifo(&self) -> MutexGuard<'_, u64> {
+        self.fifo_lock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A kind without a count row predates the index: index what is on disk,
+    /// oldest `fetched_at` first. A kind with nothing on disk stays unwritten.
+    fn index_unindexed_entries(&self) -> Result<(), String> {
+        #[derive(Deserialize)]
+        struct Stamp {
+            #[serde(default)]
+            fetched_at: u64,
+        }
+        for kind in BOUNDED_KINDS {
+            let has_count = self.db.get_pinned(fifo_count_key(kind)).map_err(|e| e.to_string())?;
+            if has_count.is_some() {
+                continue;
+            }
+            let mut entries: Vec<(u64, Vec<u8>)> = Vec::new();
+            for (key, value) in self.scan_prefix(kind) {
+                let fetched_at =
+                    serde_json::from_slice::<Stamp>(&value).map_or(0, |s| s.fetched_at);
+                entries.push((fetched_at, key.into_bytes()));
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            entries.sort();
+            let mut batch = WriteBatch::default();
+            for (i, (fetched_at, key)) in entries.iter().enumerate() {
+                let written_at = fetched_at.saturating_mul(1_000_000).saturating_add(i as u64);
+                batch.put(fifo_order_key(kind, written_at, key), []);
+                batch.put(fifo_pos_key(key), written_at.to_be_bytes());
+            }
+            batch.put(fifo_count_key(kind), (entries.len() as u64).to_be_bytes());
+            self.db.write(batch).map_err(|e| format!("index {kind} entries: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Write one read-through record and keep its kind within the cap. The
+    /// insert, the index rows, the count and any evictions of the oldest-written
+    /// entries are one atomic batch taken under `fifo_lock`, so concurrent
+    /// inserts of different keys cannot make the count drift or evict an entry
+    /// newer than the one being written. Rewriting a key replaces its index row.
+    fn put_bounded<T: Serialize>(
+        &self,
+        kind: &'static str,
+        entry_key: &str,
+        val: &T,
+    ) -> Result<(), PccsError> {
+        let bytes = serde_json::to_vec(val).map_err(|_| error::INTERNAL_ERROR)?;
+        let mut last = self.lock_fifo();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+        let written_at = now.max(last.saturating_add(1));
+        *last = written_at;
+
+        let entry = entry_key.as_bytes();
+        let pos_key = fifo_pos_key(entry);
+        let mut count = self.readthrough_count(kind);
+        let mut batch = WriteBatch::default();
+        match self.db.get_pinned(&pos_key).map_err(|_| error::INTERNAL_ERROR)? {
+            Some(old) => {
+                if let Some(old) = be_u64(&old) {
+                    batch.delete(fifo_order_key(kind, old, entry));
+                }
+            }
+            None => count += 1,
+        }
+        batch.put(entry, bytes);
+        batch.put(&pos_key, written_at.to_be_bytes());
+        batch.put(fifo_order_key(kind, written_at, entry), []);
+
+        let max = self.readthrough_max_entries as u64;
+        if count > max {
+            let mut excess = count - max;
+            let prefix = fifo_order_prefix(kind);
+            let iter = self.db.iterator(IteratorMode::From(&prefix, Direction::Forward));
+            for item in iter {
+                let (order_key, _) = item.map_err(|_| error::INTERNAL_ERROR)?;
+                if excess == 0 || !order_key.starts_with(&prefix) {
+                    break;
+                }
+                let Some(victim) = order_key.get(prefix.len() + 8..) else { continue };
+                // The superseded row of the key being rewritten is already in
+                // the batch; this write is the newest and never a victim.
+                if victim == entry {
+                    continue;
+                }
+                batch.delete(victim);
+                batch.delete(fifo_pos_key(victim));
+                batch.delete(&order_key);
+                excess -= 1;
+                count -= 1;
+            }
+        }
+        batch.put(fifo_count_key(kind), count.to_be_bytes());
+        self.write_batch(batch)
+    }
+
+    /// Queue the removal of `entry_key`'s index rows. Returns whether it had any.
+    fn unindex(&self, batch: &mut WriteBatch, kind: &str, entry_key: &[u8]) -> bool {
+        let pos_key = fifo_pos_key(entry_key);
+        let Ok(Some(pos)) = self.db.get_pinned(&pos_key) else { return false };
+        if let Some(written_at) = be_u64(&pos) {
+            batch.delete(fifo_order_key(kind, written_at, entry_key));
+        }
+        batch.delete(pos_key);
+        true
     }
 
     pub fn record_hit(&self) {
@@ -822,11 +984,21 @@ impl Store {
     }
 
     pub fn put_amd_kds(&self, rec: &AmdKdsRecord) -> Result<(), PccsError> {
-        self.put_json(&keys::amd_kds(&rec.url), rec)
+        self.put_bounded(keys::AMD_KDS, &keys::amd_kds(&rec.url), rec)
     }
 
     pub fn delete_key(&self, key: &str) -> Result<(), PccsError> {
-        self.db.delete(key.as_bytes()).map_err(|_| error::INTERNAL_ERROR)
+        let Some(kind) = BOUNDED_KINDS.into_iter().find(|kind| key.starts_with(kind)) else {
+            return self.db.delete(key.as_bytes()).map_err(|_| error::INTERNAL_ERROR);
+        };
+        let _guard = self.lock_fifo();
+        let mut batch = WriteBatch::default();
+        batch.delete(key.as_bytes());
+        if self.unindex(&mut batch, kind, key.as_bytes()) {
+            let count = self.readthrough_count(kind).saturating_sub(1);
+            batch.put(fifo_count_key(kind), count.to_be_bytes());
+        }
+        self.write_batch(batch)
     }
 
     /// Delete every record under `prefix` that `expired` flags, in one batch.
@@ -836,8 +1008,12 @@ impl Store {
         prefix: &str,
         expired: impl Fn(&T) -> bool,
     ) -> Result<usize, PccsError> {
+        // A bounded kind keeps its index and count in step with the deletes.
+        let kind = BOUNDED_KINDS.into_iter().find(|kind| *kind == prefix);
+        let _guard = kind.map(|_| self.lock_fifo());
         let mut batch = WriteBatch::default();
         let mut swept = 0;
+        let mut unindexed = 0;
         let iter = self.db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward));
         for item in iter {
             let (k, v) = item.map_err(|_| error::INTERNAL_ERROR)?;
@@ -846,10 +1022,17 @@ impl Store {
             }
             if serde_json::from_slice::<T>(&v).is_ok_and(|rec| expired(&rec)) {
                 batch.delete(&k);
+                if kind.is_some_and(|kind| self.unindex(&mut batch, kind, &k)) {
+                    unindexed += 1;
+                }
                 swept += 1;
             }
         }
         if swept > 0 {
+            if let Some(kind) = kind.filter(|_| unindexed > 0) {
+                let count = self.readthrough_count(kind).saturating_sub(unindexed);
+                batch.put(fifo_count_key(kind), count.to_be_bytes());
+            }
             self.write_batch(batch)?;
         }
         Ok(swept)
@@ -865,7 +1048,7 @@ impl Store {
     }
 
     pub fn put_nvidia_rim(&self, rec: &AmdKdsRecord) -> Result<(), PccsError> {
-        self.put_json(&keys::nvidia_rim(&rec.url), rec)
+        self.put_bounded(keys::NVIDIA_RIM, &keys::nvidia_rim(&rec.url), rec)
     }
 
     pub fn get_nvidia_ocsp(&self, cache_key: &str) -> Option<NvidiaOcspRecord> {
@@ -878,7 +1061,7 @@ impl Store {
     }
 
     pub fn put_nvidia_ocsp(&self, rec: &NvidiaOcspRecord) -> Result<(), PccsError> {
-        self.put_json(&keys::nvidia_ocsp(&rec.cache_key), rec)
+        self.put_bounded(keys::NVIDIA_OCSP, &keys::nvidia_ocsp(&rec.cache_key), rec)
     }
 
     // ---------- registration queue ----------
@@ -1628,6 +1811,186 @@ mod tests {
         assert_ne!(default.write_buffer_bytes(), tiny.write_buffer_bytes());
         assert_ne!(default.max_write_buffers, tiny.max_write_buffers);
         assert_ne!(default.max_open_files, tiny.max_open_files);
+    }
+
+    fn kds_rec(url: &str, fetched_at: u64) -> AmdKdsRecord {
+        AmdKdsRecord {
+            url: url.into(),
+            body: b"body".to_vec(),
+            content_type: None,
+            content_disposition: None,
+            fetched_at,
+        }
+    }
+
+    fn ocsp_rec(cache_key: &str) -> NvidiaOcspRecord {
+        NvidiaOcspRecord {
+            cache_key: cache_key.into(),
+            body: b"ocsp".to_vec(),
+            content_type: None,
+            fetched_at: 1,
+            expires_at: u64::MAX,
+        }
+    }
+
+    fn bounded_store(max: usize) -> (TestDir, Store) {
+        let (dir, mut store) = temp_store();
+        store.set_readthrough_max_entries(max);
+        (dir, store)
+    }
+
+    /// Entries, order-index rows and position rows of one kind, as stored.
+    fn fifo_rows(store: &Store, kind: &str) -> (usize, usize, usize) {
+        (
+            store.scan_prefix(kind).len(),
+            store.scan_prefix(&format!("fifo/{kind}")).len(),
+            store.scan_prefix(&format!("fifo-pos/{kind}")).len(),
+        )
+    }
+
+    #[test]
+    fn readthrough_cap_evicts_the_oldest_written_entries() {
+        let (_dir, store) = bounded_store(3);
+        for i in 0..5 {
+            store.put_amd_kds(&kds_rec(&format!("u{i}"), 1)).unwrap();
+        }
+        assert!(store.get_amd_kds("u0").is_none());
+        assert!(store.get_amd_kds("u1").is_none());
+        for i in 2..5 {
+            assert!(store.get_amd_kds(&format!("u{i}")).is_some(), "u{i} must remain");
+        }
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 3);
+        assert_eq!(fifo_rows(&store, keys::AMD_KDS), (3, 3, 3));
+    }
+
+    #[test]
+    fn readthrough_cap_applies_to_rim_and_ocsp_and_is_per_kind() {
+        let (_dir, store) = bounded_store(2);
+        for i in 0..3 {
+            store.put_nvidia_rim(&kds_rec(&format!("r{i}"), 1)).unwrap();
+            store.put_nvidia_ocsp(&ocsp_rec(&format!("o{i}"))).unwrap();
+        }
+        store.put_amd_kds(&kds_rec("a0", 1)).unwrap();
+        assert!(store.get_nvidia_rim("r0").is_none());
+        assert!(store.get_nvidia_rim("r2").is_some());
+        assert!(store.get_nvidia_ocsp("o0").is_none());
+        assert!(store.get_nvidia_ocsp("o2").is_some());
+        // Another kind filling up never evicts this one.
+        assert!(store.get_amd_kds("a0").is_some());
+        for kind in [keys::NVIDIA_RIM, keys::NVIDIA_OCSP] {
+            assert_eq!(store.readthrough_count(kind), 2);
+            assert_eq!(fifo_rows(&store, kind), (2, 2, 2));
+        }
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 1);
+    }
+
+    #[test]
+    fn rewriting_a_key_does_not_add_an_index_entry_and_refreshes_its_age() {
+        let (_dir, store) = bounded_store(3);
+        store.put_amd_kds(&kds_rec("u0", 1)).unwrap();
+        store.put_amd_kds(&kds_rec("u1", 1)).unwrap();
+        store.put_amd_kds(&kds_rec("u0", 2)).unwrap();
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 2);
+        assert_eq!(fifo_rows(&store, keys::AMD_KDS), (2, 2, 2));
+        // u0 was rewritten after u1, so u1 is now the oldest.
+        store.put_amd_kds(&kds_rec("u2", 1)).unwrap();
+        store.put_amd_kds(&kds_rec("u3", 1)).unwrap();
+        assert!(store.get_amd_kds("u1").is_none());
+        assert!(store.get_amd_kds("u0").is_some());
+        assert_eq!(fifo_rows(&store, keys::AMD_KDS), (3, 3, 3));
+    }
+
+    #[test]
+    fn readthrough_count_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-store-{}", uuid::Uuid::new_v4()));
+        let _cleanup = TestDir(dir.clone());
+        let open = || {
+            let mut store =
+                Store::open(&dir, CacheMode::Lazy, &RocksDbOpts::default()).expect("open");
+            store.set_readthrough_max_entries(3);
+            store
+        };
+        let store = open();
+        store.put_amd_kds(&kds_rec("u0", 1)).unwrap();
+        store.put_amd_kds(&kds_rec("u1", 1)).unwrap();
+        drop(store);
+
+        let store = open();
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 2);
+        store.put_amd_kds(&kds_rec("u2", 1)).unwrap();
+        store.put_amd_kds(&kds_rec("u3", 1)).unwrap();
+        // The oldest entry was written before the restart.
+        assert!(store.get_amd_kds("u0").is_none());
+        assert!(store.get_amd_kds("u1").is_some());
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 3);
+        assert_eq!(fifo_rows(&store, keys::AMD_KDS), (3, 3, 3));
+    }
+
+    #[test]
+    fn expiry_delete_and_sweep_keep_the_count_consistent() {
+        let (_dir, store) = bounded_store(3);
+        for i in 0..3 {
+            store.put_amd_kds(&kds_rec(&format!("u{i}"), i)).unwrap();
+        }
+        store.delete_key(&keys::amd_kds("u1")).unwrap();
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 2);
+        // Deleting a key that is not there changes nothing.
+        store.delete_key(&keys::amd_kds("missing")).unwrap();
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 2);
+        let swept = store.sweep_prefix(keys::AMD_KDS, |r: &AmdKdsRecord| r.fetched_at == 0);
+        assert_eq!(swept.unwrap(), 1);
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 1);
+        assert_eq!(fifo_rows(&store, keys::AMD_KDS), (1, 1, 1));
+        // No drift: the cap still admits exactly three entries.
+        for i in 10..14 {
+            store.put_amd_kds(&kds_rec(&format!("u{i}"), 1)).unwrap();
+        }
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 3);
+        assert_eq!(fifo_rows(&store, keys::AMD_KDS), (3, 3, 3));
+    }
+
+    #[test]
+    fn concurrent_inserts_keep_the_cap_and_the_count_exact() {
+        let (_dir, store) = bounded_store(10);
+        let store = std::sync::Arc::new(store);
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        store.put_nvidia_ocsp(&ocsp_rec(&format!("t{t}-{i}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(store.readthrough_count(keys::NVIDIA_OCSP), 10);
+        assert_eq!(fifo_rows(&store, keys::NVIDIA_OCSP), (10, 10, 10));
+    }
+
+    #[test]
+    fn entries_written_before_the_index_existed_are_indexed_on_open() {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-store-{}", uuid::Uuid::new_v4()));
+        let _cleanup = TestDir(dir.clone());
+        let store = Store::open(&dir, CacheMode::Lazy, &RocksDbOpts::default()).unwrap();
+        for (url, fetched_at) in [("u30", 30), ("u10", 10), ("u40", 40), ("u20", 20)] {
+            store.put_json(&keys::amd_kds(url), &kds_rec(url, fetched_at)).unwrap();
+        }
+        drop(store);
+
+        let mut store = Store::open(&dir, CacheMode::Lazy, &RocksDbOpts::default()).unwrap();
+        store.set_readthrough_max_entries(3);
+        assert_eq!(store.readthrough_count(keys::AMD_KDS), 4);
+        store.put_amd_kds(&kds_rec("new", 50)).unwrap();
+        // Oldest by fetched_at go first.
+        assert!(store.get_amd_kds("u10").is_none());
+        assert!(store.get_amd_kds("u20").is_none());
+        for url in ["u30", "u40", "new"] {
+            assert!(store.get_amd_kds(url).is_some(), "{url} must remain");
+        }
+        assert_eq!(fifo_rows(&store, keys::AMD_KDS), (3, 3, 3));
     }
 
     #[test]

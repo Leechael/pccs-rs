@@ -127,6 +127,7 @@ db_path = "/var/lib/pccs-rs"
 # nvidia_ocsp_uri = "https://ocsp.ndis.nvidia.com"
 # nvidia_ocsp_max_ttl_seconds = 86400 # 24 hours
 # nvidia_ocsp_default_ttl_seconds = 3600 # 1 hour
+# readthrough_max_entries_per_kind = 10000 # AMD KDS, NVIDIA RIM and NVIDIA OCSP each
 # proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
 # user_token_hash = ""
@@ -180,6 +181,13 @@ db_path = "/var/lib/pccs-rs"
   `unknown` certificate status (in any of its SingleResponses) is relayed but
   not stored; `good` and `revoked` are cached. This is the missing piece
   for using pccs-rs as a dstack `nvidia_attestation_proxy_url`.
+- Each read-through kind (AMD KDS, NVIDIA RIM, NVIDIA OCSP) keeps at most
+  `readthrough_max_entries_per_kind` entries (default 10000; CLI
+  `--readthrough-max-entries-per-kind`, env
+  `PCCS_READTHROUGH_MAX_ENTRIES_PER_KIND`; a value below 1 is treated as 1).
+  When a kind is full, writing a new entry evicts the oldest-written one
+  (FIFO); refreshing an existing entry renews its age. Expiry and the daily
+  sweep still remove entries earlier.
 - The NVIDIA NRAS host defaults to `https://nras.attestation.nvidia.com`.
   `POST /nvidia/nras/attest/gpu` is a **stateless CORS proxy** to
   `{host}/v3/attest/gpu`. Responses are nonce-bound and are **not** stored in

@@ -247,7 +247,10 @@ fn canonicalize_nvidia_rim(path_and_query: &str) -> Result<String, PccsError> {
 }
 
 impl Cache {
-    pub fn new(store: Store, pcs: PcsClient, cfg: &Config) -> Self {
+    pub fn new(mut store: Store, pcs: PcsClient, cfg: &Config) -> Self {
+        store.set_readthrough_max_entries(
+            usize::try_from(cfg.readthrough_max_entries_per_kind).unwrap_or(usize::MAX),
+        );
         Self {
             mode: cfg.cache_mode,
             pcs_version: cfg.pcs_version(),
@@ -516,7 +519,9 @@ impl Cache {
                 return Ok(resp);
             }
         };
-        // deferred: hard size bound for the OCSP cache | impact: /ocsp is unauthenticated, so distinct CertIDs the responder answers with 200 can fill disk until their nextUpdate (at most nvidia_ocsp_max_ttl_secs) and the next scheduled sweep | trigger: auth or a quota on /ocsp is decided
+        // The store caps this kind at `readthrough_max_entries_per_kind` and
+        // evicts the oldest-written entry, so unauthenticated /ocsp traffic
+        // cannot grow the cache without bound.
         let rec = NvidiaOcspRecord {
             cache_key,
             body: resp.body.clone(),

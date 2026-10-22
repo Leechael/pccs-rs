@@ -3096,6 +3096,30 @@ async fn amd_kds_does_not_forward_the_intel_api_key() {
     let _ = std::fs::remove_dir_all(db_path);
 }
 
+#[tokio::test]
+async fn readthrough_cap_comes_from_the_config() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (mut cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-cap");
+    cfg.readthrough_max_entries_per_kind = 2;
+    let app = create_app_from_config(cfg);
+
+    for path in ["/vcek/v1/x/pckcerts", "/vcek/v1/y/pckcerts", "/vcek/v1/z/pckcerts"] {
+        let (status, _, _) = send(app.clone(), get(path)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    // The newest two are still cached; the oldest was evicted.
+    for path in ["/vcek/v1/z/pckcerts", "/vcek/v1/y/pckcerts"] {
+        send(app.clone(), get(path)).await;
+    }
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    send(app.clone(), get("/vcek/v1/x/pckcerts")).await;
+    assert_eq!(seen.lock().unwrap().len(), 4);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
 fn nras_post(body: impl Into<Body>) -> Request<Body> {
     Request::builder()
         .method("POST")

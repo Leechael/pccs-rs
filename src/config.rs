@@ -25,6 +25,8 @@ pub const DEFAULT_NVIDIA_NRAS_URI: &str = "https://nras.attestation.nvidia.com";
 pub const DEFAULT_NVIDIA_OCSP_URI: &str = "https://ocsp.ndis.nvidia.com";
 pub const DEFAULT_NVIDIA_OCSP_MAX_TTL_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_NVIDIA_OCSP_DEFAULT_TTL_SECS: u64 = 60 * 60;
+/// Entry cap for each read-through kind (AMD KDS, NVIDIA RIM, NVIDIA OCSP).
+pub const DEFAULT_READTHROUGH_MAX_ENTRIES_PER_KIND: u64 = 10_000;
 pub const DEFAULT_REFRESH: &str = "0 0 1 * * *";
 
 /// Packaged default path. systemd always passes `--config` pointing here.
@@ -235,6 +237,11 @@ pub struct ServeArgs {
     #[arg(long, env = "PCCS_NVIDIA_OCSP_DEFAULT_TTL_SECONDS")]
     pub nvidia_ocsp_default_ttl_seconds: Option<u64>,
 
+    /// Maximum entries kept per read-through kind (AMD KDS, NVIDIA RIM,
+    /// NVIDIA OCSP); the oldest-written entry is evicted when a kind is full.
+    #[arg(long, env = "PCCS_READTHROUGH_MAX_ENTRIES_PER_KIND")]
+    pub readthrough_max_entries_per_kind: Option<u64>,
+
     #[arg(long, env = "PCCS_PROXY")]
     pub proxy: Option<String>,
 
@@ -373,6 +380,7 @@ struct TomlConfig {
     nvidia_ocsp_uri: Option<String>,
     nvidia_ocsp_max_ttl_seconds: Option<u64>,
     nvidia_ocsp_default_ttl_seconds: Option<u64>,
+    readthrough_max_entries_per_kind: Option<u64>,
     proxy: Option<String>,
     refresh_schedule: Option<String>,
     db_path: Option<PathBuf>,
@@ -414,6 +422,7 @@ pub struct Config {
     pub nvidia_ocsp_uri: String,
     pub nvidia_ocsp_max_ttl_secs: u64,
     pub nvidia_ocsp_default_ttl_secs: u64,
+    pub readthrough_max_entries_per_kind: u64,
     pub proxy: String,
     pub refresh_schedule: String,
     pub db_path: PathBuf,
@@ -469,6 +478,7 @@ impl Default for Config {
             nvidia_ocsp_uri: DEFAULT_NVIDIA_OCSP_URI.into(),
             nvidia_ocsp_max_ttl_secs: DEFAULT_NVIDIA_OCSP_MAX_TTL_SECS,
             nvidia_ocsp_default_ttl_secs: DEFAULT_NVIDIA_OCSP_DEFAULT_TTL_SECS,
+            readthrough_max_entries_per_kind: DEFAULT_READTHROUGH_MAX_ENTRIES_PER_KIND,
             proxy: String::new(),
             refresh_schedule: DEFAULT_REFRESH.into(),
             db_path: PathBuf::from("pccs-db"),
@@ -696,6 +706,9 @@ fn apply_toml(cfg: &mut Config, file: TomlConfig) {
     if let Some(n) = file.nvidia_ocsp_default_ttl_seconds {
         cfg.nvidia_ocsp_default_ttl_secs = n;
     }
+    if let Some(n) = file.readthrough_max_entries_per_kind {
+        cfg.readthrough_max_entries_per_kind = n;
+    }
     if let Some(p) = file.proxy {
         cfg.proxy = p;
     }
@@ -821,6 +834,9 @@ fn apply_cli(cfg: &mut Config, c: ServeArgs) {
     }
     if let Some(n) = c.nvidia_ocsp_default_ttl_seconds {
         cfg.nvidia_ocsp_default_ttl_secs = n;
+    }
+    if let Some(n) = c.readthrough_max_entries_per_kind {
+        cfg.readthrough_max_entries_per_kind = n;
     }
     if let Some(p) = c.proxy {
         cfg.proxy = p;
@@ -1074,6 +1090,7 @@ mod tests {
         assert_eq!(cfg.nvidia_rim_uri, DEFAULT_NVIDIA_RIM_URI);
         assert_eq!(cfg.nvidia_nras_uri, DEFAULT_NVIDIA_NRAS_URI);
         assert_eq!(cfg.nvidia_ocsp_uri, DEFAULT_NVIDIA_OCSP_URI);
+        assert_eq!(cfg.readthrough_max_entries_per_kind, DEFAULT_READTHROUGH_MAX_ENTRIES_PER_KIND);
         assert!(is_sha512_hex(DEFAULT_USER_TOKEN_HASH));
         let test = Config::test_default();
         assert!(is_sha512_hex(test.admin_token_hash.as_str()));
@@ -1164,6 +1181,7 @@ mod tests {
                 nvidia_ocsp_uri = "https://ocsp-file.example"
                 nvidia_ocsp_max_ttl_seconds = 3600
                 nvidia_ocsp_default_ttl_seconds = 600
+                readthrough_max_entries_per_kind = 77
                 proxy = "http://proxy.example:8080"
                 refresh_schedule = "0 0 2 * * *"
                 user_token_hash = "file-user-hash"
@@ -1199,6 +1217,7 @@ mod tests {
         assert_eq!(cfg.nvidia_ocsp_uri, "https://ocsp-file.example");
         assert_eq!(cfg.nvidia_ocsp_max_ttl_secs, 3600);
         assert_eq!(cfg.nvidia_ocsp_default_ttl_secs, 600);
+        assert_eq!(cfg.readthrough_max_entries_per_kind, 77);
         assert_eq!(cfg.proxy, "http://proxy.example:8080");
         assert_eq!(cfg.refresh_schedule, "0 0 2 * * *");
         assert_eq!(cfg.user_token_hash, "file-user-hash");
@@ -1253,6 +1272,8 @@ mod tests {
             "120",
             "--nvidia-ocsp-default-ttl-seconds",
             "30",
+            "--readthrough-max-entries-per-kind",
+            "88",
             "--proxy",
             "http://cli-proxy:1",
             "--refresh-schedule",
@@ -1299,6 +1320,7 @@ mod tests {
         assert_eq!(cfg.nvidia_ocsp_uri, "https://ocsp-cli.example");
         assert_eq!(cfg.nvidia_ocsp_max_ttl_secs, 120);
         assert_eq!(cfg.nvidia_ocsp_default_ttl_secs, 30);
+        assert_eq!(cfg.readthrough_max_entries_per_kind, 88);
         assert_eq!(cfg.proxy, "http://cli-proxy:1");
         assert_eq!(cfg.refresh_schedule, "0 0 3 * * *");
         assert_eq!(cfg.db_path, PathBuf::from("/tmp/cli-db"));
