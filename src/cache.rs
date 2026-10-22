@@ -476,6 +476,10 @@ impl Cache {
                     retry_after: None,
                 });
             }
+            // LAZY drops it under the key lock instead.
+            if self.mode != CacheMode::Lazy {
+                self.drop_expired(&store_key);
+            }
         }
         self.store.record_miss();
         tracing::info!("cache miss nvidia ocsp key={cache_key}");
@@ -498,6 +502,7 @@ impl Cache {
                     retry_after: None,
                 });
             }
+            self.drop_expired(&store_key);
         }
 
         self.store.record_upstream();
@@ -521,6 +526,7 @@ impl Cache {
                 return Ok(resp);
             }
         };
+        // deferred: hard size bound for the OCSP cache | impact: /ocsp is unauthenticated, so distinct CertIDs the responder answers with 200 can fill disk until their nextUpdate (at most nvidia_ocsp_max_ttl_secs) and the next scheduled sweep | trigger: auth or a quota on /ocsp is decided
         let rec = NvidiaOcspRecord {
             cache_key,
             body: resp.body.clone(),
@@ -644,12 +650,10 @@ impl Cache {
             (keys::NVIDIA_RIM, self.nvidia_rim_cache_ttl_secs),
         ] {
             let expired = |rec: &AmdKdsRecord| now.saturating_sub(rec.fetched_at) >= ttl;
-            match self.store.sweep_prefix(prefix, expired) {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("swept {n} expired {prefix} records"),
-                Err(e) => tracing::warn!("{prefix} sweep: {e}"),
-            }
+            log_sweep(prefix, self.store.sweep_prefix(prefix, expired));
         }
+        let expired = |rec: &NvidiaOcspRecord| rec.expires_at <= now;
+        log_sweep(keys::NVIDIA_OCSP, self.store.sweep_prefix(keys::NVIDIA_OCSP, expired));
     }
 
     // ---------------- pckcert ----------------
@@ -1734,6 +1738,14 @@ impl Cache {
     }
 }
 
+fn log_sweep(prefix: &str, result: Result<usize, PccsError>) {
+    match result {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("swept {n} expired {prefix} records"),
+        Err(e) => tracing::warn!("{prefix} sweep: {e}"),
+    }
+}
+
 /// Upper-cased `qe_id:pce_id`: the key for both the per-platform re-fetch lock
 /// and the in-memory throttle marks.
 fn platform_key(qeid: &str, pceid: &str) -> String {
@@ -2094,6 +2106,65 @@ mod tests {
         cache.remember("large", response(RECENT_BODY_MAX + 1)).await;
         assert!(cache.recent_non200("small").await.is_some());
         assert!(cache.recent_non200("large").await.is_none());
+    }
+
+    fn ocsp_cache(nvidia_ocsp_uri: &str, mode: CacheMode) -> (TestDir, Arc<Cache>) {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-cache-{}", uuid::Uuid::new_v4()));
+        let cfg = Config {
+            uri: String::new(),
+            nvidia_ocsp_uri: nvidia_ocsp_uri.into(),
+            cache_mode: mode,
+            db_path: dir.clone(),
+            upstream_max_attempts: 1,
+            ..Config::default()
+        };
+        let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
+        let pcs = PcsClient::new(&cfg).unwrap();
+        (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
+    }
+
+    /// Minimal DER OCSPRequest for one synthetic CertID.
+    fn ocsp_request() -> Vec<u8> {
+        fn der(tag: u8, value: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag, value.len() as u8];
+            out.extend_from_slice(value);
+            out
+        }
+        let algorithm = der(0x30, &der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a]));
+        let cert_id = der(
+            0x30,
+            &[algorithm, der(0x04, &[1; 20]), der(0x04, &[2; 20]), der(0x02, &[3])].concat(),
+        );
+        let list = der(0x30, &der(0x30, &cert_id));
+        der(0x30, &der(0x30, &list))
+    }
+
+    fn ocsp_record(cache_key: &str, expires_at: u64) -> NvidiaOcspRecord {
+        NvidiaOcspRecord {
+            cache_key: cache_key.into(),
+            body: b"ocsp".to_vec(),
+            content_type: None,
+            fetched_at: 0,
+            expires_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_nvidia_ocsp_records_are_deleted_on_lookup_and_swept() {
+        let request = ocsp_request();
+        let looked_up = crate::ocsp::parse_request(&request).unwrap().cache_key;
+        for mode in [CacheMode::Offline, CacheMode::Lazy] {
+            let (_dir, cache) = ocsp_cache("http://127.0.0.1:0", mode);
+            for (key, at) in [(looked_up.as_str(), 1), ("stale", 1), ("fresh", unix_time() + 3600)]
+            {
+                cache.store.put_nvidia_ocsp(&ocsp_record(key, at)).unwrap();
+            }
+            assert!(cache.get_nvidia_ocsp(&request).await.is_err());
+            assert!(cache.store.get_nvidia_ocsp(&looked_up).is_none(), "{mode:?} lookup kept it");
+            let _ = cache.scheduled_refresh().await;
+            assert!(cache.store.get_nvidia_ocsp("stale").is_none(), "{mode:?} sweep kept it");
+            assert!(cache.store.get_nvidia_ocsp("fresh").is_some(), "{mode:?} swept a fresh one");
+        }
     }
 
     async fn spawn(app: axum::Router) -> String {
