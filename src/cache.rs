@@ -150,7 +150,7 @@ impl Cache {
             amd_kds_cache_ttl_secs: cfg.amd_kds_cache_ttl_secs,
             nvidia_rim_uri: normalize_nvidia_rim_host(&cfg.nvidia_rim_uri),
             nvidia_rim_cache_ttl_secs: cfg.nvidia_rim_cache_ttl_secs,
-            nvidia_nras_uri: cfg.nvidia_nras_uri.trim_end_matches('/').to_string(),
+            nvidia_nras_uri: cfg.nvidia_nras_uri.trim().trim_end_matches('/').to_string(),
             store,
             pcs,
             pool_refetch_on_new_tcb: cfg.pool_refetch_on_new_tcb,

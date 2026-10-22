@@ -3223,6 +3223,27 @@ async fn nvidia_nras_transport_failure_is_a_bad_gateway_with_cors() {
 }
 
 #[tokio::test]
+async fn nvidia_nras_host_with_surrounding_whitespace_still_proxies() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-trim-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: format!("  {upstream}/  "),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, _, _) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
 async fn nvidia_nras_offline_never_calls_upstream() {
     let calls = Arc::new(AtomicU64::new(0));
     let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
