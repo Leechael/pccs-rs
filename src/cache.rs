@@ -75,7 +75,7 @@ pub struct Cache {
 
 /// How long a failed upstream fetch suppresses a retry by the requests already
 /// queued behind it. Short on purpose — this is stampede control, not caching.
-const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+pub const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Hard cap on remembered outcomes. Callers choose the keys, so a burst of
 /// distinct keys inside one `FAILURE_TTL` must not grow the map without bound;

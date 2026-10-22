@@ -2751,7 +2751,8 @@ async fn amd_kds_error_response_is_relayed_and_not_cached() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(headers.get("retry-after").unwrap(), "10");
     assert_eq!(body, "slow down");
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // Outlive the memoised non-200 answer so the second request goes upstream.
+    tokio::time::sleep(pccs_rs::cache::FAILURE_TTL + std::time::Duration::from_millis(100)).await;
     let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(headers.get("retry-after").unwrap(), "10");
@@ -3014,7 +3015,8 @@ async fn nvidia_rim_error_response_is_relayed_and_not_cached() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(headers.get("retry-after").unwrap(), "10");
     assert_eq!(body, "slow down");
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // Outlive the memoised non-200 answer so the second request goes upstream.
+    tokio::time::sleep(pccs_rs::cache::FAILURE_TTL + std::time::Duration::from_millis(100)).await;
     let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(headers.get("retry-after").unwrap(), "10");
