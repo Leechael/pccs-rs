@@ -77,6 +77,14 @@ pub struct Cache {
 /// queued behind it. Short on purpose — this is stampede control, not caching.
 const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Hard cap on remembered outcomes. Callers choose the keys, so a burst of
+/// distinct keys inside one `FAILURE_TTL` must not grow the map without bound;
+/// past the cap a new outcome is simply not remembered.
+const RECENT_OUTCOMES_MAX: usize = 1024;
+
+/// Largest non-200 body kept for replay. Larger ones are relayed, not memoised.
+const RECENT_BODY_MAX: usize = 64 * 1024;
+
 /// Upper bound on the synchronous pool re-fetch a `/pckcert` GET may run.
 /// DCAP clients cache the PCK cert, so a stale first answer sticks: answer
 /// inside a request-sized budget instead of the full upstream retry budget.
@@ -331,9 +339,16 @@ impl Cache {
     }
 
     async fn remember(&self, key: &str, outcome: RecentOutcome) {
+        if matches!(&outcome, RecentOutcome::Response(r) if r.body.len() > RECENT_BODY_MAX) {
+            return;
+        }
         let mut map = self.failures.lock().await;
-        if map.len() > 1024 {
+        if map.len() >= RECENT_OUTCOMES_MAX && !map.contains_key(key) {
             map.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
+            if map.len() >= RECENT_OUTCOMES_MAX {
+                tracing::debug!("recent outcome map is full; not remembering {key}");
+                return;
+            }
         }
         map.insert(key.to_string(), (std::time::Instant::now(), outcome));
     }
@@ -1928,6 +1943,30 @@ mod tests {
             assert!(cache.store.get_nvidia_rim(&stale).is_none(), "{mode:?} sweep kept it");
             assert!(cache.store.get_nvidia_rim(&fresh).is_some(), "{mode:?} swept a fresh one");
         }
+    }
+
+    #[tokio::test]
+    async fn recent_outcomes_are_bounded_in_count_and_body_size() {
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
+        let response = |len: usize| {
+            RecentOutcome::Response(AmdKdsResponse {
+                status: 429,
+                body: vec![0; len],
+                content_type: None,
+                content_disposition: None,
+                retry_after: None,
+            })
+        };
+        for i in 0..RECENT_OUTCOMES_MAX + 16 {
+            cache.remember(&format!("key-{i}"), response(1)).await;
+        }
+        assert!(cache.failures.lock().await.len() <= RECENT_OUTCOMES_MAX);
+
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
+        cache.remember("small", response(RECENT_BODY_MAX)).await;
+        cache.remember("large", response(RECENT_BODY_MAX + 1)).await;
+        assert!(cache.recent_non200("small").await.is_some());
+        assert!(cache.recent_non200("large").await.is_none());
     }
 
     async fn spawn(app: axum::Router) -> String {
