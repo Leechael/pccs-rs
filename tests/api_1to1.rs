@@ -2568,7 +2568,7 @@ async fn amd_kds_transport_failure_is_a_bad_gateway() {
         std::env::temp_dir().join(format!("pccs-rs-amd-transport-{}", uuid::Uuid::new_v4()));
     let cfg = Config {
         uri: String::new(),
-        amd_kds_uri: "http://127.0.0.1:9".into(),
+        amd_kds_uri: "http://127.0.0.1:0".into(),
         db_path: db_path.clone(),
         upstream_max_attempts: 1,
         ..Config::test_default()
