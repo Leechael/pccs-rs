@@ -302,7 +302,44 @@ jobs:
           tags: |
             type=semver,pattern={{version}},value=${{ needs.create-tag.outputs.version }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.create-tag.outputs.version }}
+      # The base images come from public.ecr.aws anonymously, which can return
+      # 429. Retry the build twice with backoff; the last attempt fails the job.
       - uses: docker/build-push-action@v7
+        id: build1
+        continue-on-error: true
+        with:
+          context: .
+          push: true
+          provenance: false
+          sbom: false
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Wait before retry
+        if: steps.build1.outcome == 'failure'
+        run: sleep 60
+      - uses: docker/build-push-action@v7
+        id: build2
+        if: steps.build1.outcome == 'failure'
+        continue-on-error: true
+        with:
+          context: .
+          push: true
+          provenance: false
+          sbom: false
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Wait before retry
+        if: steps.build2.outcome == 'failure'
+        run: sleep 180
+      - uses: docker/build-push-action@v7
+        id: build3
+        if: steps.build2.outcome == 'failure'
         with:
           context: .
           push: true
