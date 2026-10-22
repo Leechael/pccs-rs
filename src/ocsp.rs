@@ -27,6 +27,9 @@ struct Tlv<'a> {
 /// id-pkix-ocsp-nonce, 1.3.6.1.5.5.7.48.1.2.
 const OID_OCSP_NONCE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
 
+/// id-pkix-ocsp-basic, 1.3.6.1.5.5.7.48.1.1.
+const OID_OCSP_BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
+
 pub struct OcspRequest {
     /// Hex SHA-256 of the DER requestList.
     pub cache_key: String,
@@ -142,7 +145,10 @@ fn response_validity(response: &[u8]) -> Result<Vec<ResponseValidity>, PccsError
     let response_bytes = take_expected(&mut fields, 0xa0)?;
     let response_bytes = parse_single(response_bytes.value, 0x30)?;
     let mut fields = response_bytes.value;
-    take_expected(&mut fields, 0x06)?;
+    let response_type = take_expected(&mut fields, 0x06)?;
+    if response_type.value != OID_OCSP_BASIC {
+        return Err(error::INVALID_REQ);
+    }
     let basic_der = take_expected(&mut fields, 0x04)?;
 
     let basic = parse_single(basic_der.value, 0x30)?;
@@ -320,6 +326,17 @@ mod tests {
     }
 
     fn response(this_update: &str, next_update: Option<&str>) -> Vec<u8> {
+        let signature = vec![sequence(&[der(0x06, &[0x2a, 0x03])]), der(0x03, &[0])];
+        response_with(this_update, next_update, OID_OCSP_BASIC, &signature)
+    }
+
+    /// `after_data` is everything BasicOCSPResponse holds after ResponseData.
+    fn response_with(
+        this_update: &str,
+        next_update: Option<&str>,
+        response_type: &[u8],
+        after_data: &[Vec<u8>],
+    ) -> Vec<u8> {
         let cert_id = sequence(&[der(0x02, &[1])]);
         let mut single = vec![cert_id, der(0x80, &[]), der(0x18, this_update.as_bytes())];
         if let Some(next_update) = next_update {
@@ -328,12 +345,10 @@ mod tests {
         let responses = sequence(&[sequence(&single)]);
         let response_data =
             sequence(&[der(0x82, &[7; 20]), der(0x18, b"20260716120000Z"), responses]);
-        let basic =
-            sequence(&[response_data, sequence(&[der(0x06, &[0x2a, 0x03])]), der(0x03, &[0])]);
-        let response_bytes = sequence(&[
-            der(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01]),
-            der(0x04, &basic),
-        ]);
+        let mut basic = vec![response_data];
+        basic.extend_from_slice(after_data);
+        let basic = sequence(&basic);
+        let response_bytes = sequence(&[der(0x06, response_type), der(0x04, &basic)]);
         sequence(&[der(0x0a, &[0]), der(0xa0, &response_bytes)])
     }
 
@@ -392,6 +407,19 @@ mod tests {
         let now = 1_784_202_600;
         let response = response("20260716114500Z", None);
         assert_eq!(response_cache_expiry(&response, now, 86_400, 3_600).unwrap(), 1_784_205_900);
+    }
+
+    #[test]
+    fn only_basic_ocsp_responses_are_cacheable() {
+        let now = 1_784_202_600;
+        let signature = vec![sequence(&[der(0x06, &[0x2a, 0x03])]), der(0x03, &[0])];
+        let next = Some("20260716123000Z");
+        let basic = response_with("20260716114500Z", next, OID_OCSP_BASIC, &signature);
+        assert!(response_cache_expiry(&basic, now, 86_400, 3_600).is_ok());
+        // id-pkix-ocsp-nonce in place of id-pkix-ocsp-basic.
+        let other_oid = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
+        let other = response_with("20260716114500Z", next, &other_oid, &signature);
+        assert!(response_cache_expiry(&other, now, 86_400, 3_600).is_err());
     }
 
     #[test]
