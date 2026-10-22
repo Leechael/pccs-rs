@@ -1,10 +1,10 @@
 //! NVIDIA OCSP request/response helpers for the collateral cache.
 //!
 //! Cache keys hash the DER `requestList`; `requestExtensions` are not part of
-//! the key. A request carrying an OCSP nonce is never cached at all: the
-//! responder echoes the nonce in its signed response, so a stored copy would
-//! fail the next client's nonce check. Expiry follows
-//! the signed `nextUpdate` (capped by a configured max TTL); responses without
+//! the key, so requests with different OCSP nonces share one entry. This
+//! matches NVIDIA's Trust Outpost relying-party policy, which accepts a cached
+//! response whose responder nonce differs; freshness is proven by the GPU
+//! attestation evidence nonce. Expiry follows the signed `nextUpdate` (capped by a configured max TTL); responses without
 //! `nextUpdate` use `thisUpdate + default_ttl`, matching the NVIDIA verifier.
 
 use crate::error::{self, PccsError};
@@ -24,17 +24,12 @@ struct Tlv<'a> {
     raw: &'a [u8],
 }
 
-/// id-pkix-ocsp-nonce, 1.3.6.1.5.5.7.48.1.2.
-const OID_OCSP_NONCE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
-
 /// id-pkix-ocsp-basic, 1.3.6.1.5.5.7.48.1.1.
 const OID_OCSP_BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
 
 pub struct OcspRequest {
     /// Hex SHA-256 of the DER requestList.
     pub cache_key: String,
-    /// The request carries an id-pkix-ocsp-nonce request extension.
-    pub has_nonce: bool,
 }
 
 pub fn parse_request(request: &[u8]) -> Result<OcspRequest, PccsError> {
@@ -52,16 +47,15 @@ pub fn parse_request(request: &[u8]) -> Result<OcspRequest, PccsError> {
             0x30 => {
                 validate_request_list(field.value)?;
                 // Only the optional requestExtensions [2] may follow.
-                let mut has_nonce = false;
                 if !tbs_fields.is_empty() {
                     let extensions = take_expected(&mut tbs_fields, 0xa2)?;
-                    has_nonce = has_nonce_extension(parse_single(extensions.value, 0x30)?.value)?;
+                    validate_extensions(parse_single(extensions.value, 0x30)?.value)?;
                 }
                 if !tbs_fields.is_empty() {
                     return Err(error::INVALID_REQ);
                 }
                 let cache_key = hex::encode(Sha256::digest(field.raw));
-                return Ok(OcspRequest { cache_key, has_nonce });
+                return Ok(OcspRequest { cache_key });
             }
             _ => return Err(error::INVALID_REQ),
         }
@@ -97,13 +91,12 @@ pub fn response_cache_expiry(
 }
 
 /// Walk `Extensions` (SEQUENCE OF Extension { extnID, critical?, extnValue })
-/// and report whether one of them is the OCSP nonce.
-fn has_nonce_extension(mut extensions: &[u8]) -> Result<bool, PccsError> {
-    let mut found = false;
+/// and reject a malformed list. The extensions are not part of the cache key.
+fn validate_extensions(mut extensions: &[u8]) -> Result<(), PccsError> {
     while !extensions.is_empty() {
         let extension = take_expected(&mut extensions, 0x30)?;
         let mut fields = extension.value;
-        let oid = take_expected(&mut fields, 0x06)?;
+        take_expected(&mut fields, 0x06)?;
         if peek_tag(fields) == Some(0x01) {
             take_expected(&mut fields, 0x01)?;
         }
@@ -111,9 +104,8 @@ fn has_nonce_extension(mut extensions: &[u8]) -> Result<bool, PccsError> {
         if !fields.is_empty() {
             return Err(error::INVALID_REQ);
         }
-        found |= oid.value == OID_OCSP_NONCE;
     }
-    Ok(found)
+    Ok(())
 }
 
 fn validate_request_list(mut request_list: &[u8]) -> Result<(), PccsError> {
@@ -295,6 +287,9 @@ fn take_tlv<'a>(input: &mut &'a [u8]) -> Result<Tlv<'a>, PccsError> {
 mod tests {
     use super::*;
 
+    /// id-pkix-ocsp-nonce, 1.3.6.1.5.5.7.48.1.2.
+    const OID_OCSP_NONCE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
+
     fn der(tag: u8, value: &[u8]) -> Vec<u8> {
         let mut result = vec![tag];
         if value.len() < 128 {
@@ -363,16 +358,16 @@ mod tests {
     }
 
     #[test]
-    fn nonce_extension_is_detected() {
+    fn request_extensions_are_not_part_of_the_key() {
         let plain = parse_request(&request_with(&[])).unwrap();
-        assert!(!plain.has_nonce);
         let nonced = parse_request(&request_with(&[nonce_extension(1)])).unwrap();
-        assert!(nonced.has_nonce);
         assert_eq!(nonced.cache_key, plain.cache_key);
-        // id-pkix-ocsp-response (acceptable responses) is not a nonce.
+        let other = parse_request(&request_with(&[nonce_extension(2)])).unwrap();
+        assert_eq!(other.cache_key, plain.cache_key);
+        // id-pkix-ocsp-response (acceptable responses) alongside a nonce.
         let acceptable = extension(&[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x04], &[]);
-        assert!(!parse_request(&request_with(&[acceptable.clone()])).unwrap().has_nonce);
-        assert!(parse_request(&request_with(&[acceptable, nonce_extension(2)])).unwrap().has_nonce);
+        let both = parse_request(&request_with(&[acceptable, nonce_extension(2)])).unwrap();
+        assert_eq!(both.cache_key, plain.cache_key);
         // An Extension without extnValue is malformed.
         let broken = sequence(&[der(0x06, OID_OCSP_NONCE)]);
         assert!(parse_request(&request_with(&[broken])).is_err());

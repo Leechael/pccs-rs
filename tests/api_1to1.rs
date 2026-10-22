@@ -3681,24 +3681,25 @@ async fn nvidia_ocsp_without_nonce_is_cached_by_cert_id() {
     let _ = std::fs::remove_dir_all(db_path);
 }
 
-/// The responder echoes the request nonce in its signed response, so a cached
-/// answer would fail another client's nonce check.
+/// The nonce is not part of the key. Consumers behind a caching proxy verify
+/// with NVIDIA's Trust Outpost relying-party policy, which accepts a cached
+/// responder nonce; freshness comes from the GPU attestation evidence nonce.
 #[tokio::test]
-async fn nvidia_ocsp_with_nonce_bypasses_the_cache() {
+async fn nvidia_ocsp_nonce_requests_share_the_cert_id_entry() {
     let calls = Arc::new(AtomicU64::new(0));
     let (cfg, db_path) = ocsp_cfg(spawn_ocsp(calls.clone()).await, "pccs-rs-ocsp-nonce");
     let app = create_app_from_config(cfg);
 
-    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(Some(1)))).await;
+    let (status, _, first) = send(app.clone(), ocsp_post(sample_ocsp_request(Some(1)))).await;
     assert_eq!(status, StatusCode::OK);
-    // Not written: the same CertID without a nonce still misses.
+    let (status, _, second) = send(app.clone(), ocsp_post(sample_ocsp_request(Some(2)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first, second);
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "different nonces must share one entry");
+    // The same CertID without a nonce reads the entry the nonce request wrote.
     let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(None))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(calls.load(Ordering::Relaxed), 2, "a nonce response must not be cached");
-    // Not read: the cached entry is never served to a nonce-bearing request.
-    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(Some(2)))).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(calls.load(Ordering::Relaxed), 3, "a nonce request must reach the responder");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
 
     drop(app);
     let _ = std::fs::remove_dir_all(db_path);
