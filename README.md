@@ -338,7 +338,8 @@ REQ / OFFLINE answer `461` for those platforms until refilled.
 - All 30 default v4 routes (SGX v3 + v4 + TDX v4), mounted at
   `/sgx/certification/v3`, `/sgx/certification/v4`, and `/tdx/certification/v4`
 - AMD KDS-compatible `GET /vcek/{*path}` and `GET /vlek/{*path}` (VCEK, VLEK,
-  `cert_chain`, and `crl`), forwarding path and query to `kdsintf.amd.com`
+  `cert_chain`, and `crl`), forwarding path and query to the configured AMD KDS
+  host (`amd_kds_uri`, default `https://kdsintf.amd.com`)
 - Auth, Request-ID (always freshly generated), v3 Warning, Intel headers,
   `text/html` error bodies, body limit (413 `Content too large.`),
   `x-powered-by` not set
