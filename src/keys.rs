@@ -1,4 +1,6 @@
 //! RocksDB keys: plaintext type prefix + CityHash128(canonical fields) hex.
+//! One exception: `nvidia-ocsp/` keys carry the SHA-256 hex of the request's
+//! DER `requestList` as computed by `crate::ocsp::parse_request`.
 //!
 //! Canonical fields are lowercase. A cache-hit GET is one `DB::get`.
 //! Digest is `crate::hash::hash128` (Google CityHash128, portable).
