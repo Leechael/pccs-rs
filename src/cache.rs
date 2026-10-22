@@ -279,11 +279,11 @@ impl Cache {
         &self,
         body: &serde_json::Value,
     ) -> Result<AmdKdsResponse, PccsError> {
-        if self.nvidia_nras_uri.is_empty() {
-            return Err(error::NVIDIA_NRAS_ACCESS_FAILURE);
-        }
         if self.mode == CacheMode::Offline {
             return Err(error::SERVICE_UNAVAILABLE);
+        }
+        if self.nvidia_nras_uri.is_empty() {
+            return Err(error::NVIDIA_NRAS_ACCESS_FAILURE);
         }
         let url = format!("{}/v3/attest/gpu", self.nvidia_nras_uri);
         let payload = serde_json::to_vec(body).map_err(|_| error::INVALID_REQ)?;

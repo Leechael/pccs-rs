@@ -3244,6 +3244,20 @@ async fn nvidia_nras_host_with_surrounding_whitespace_still_proxies() {
 }
 
 #[tokio::test]
+async fn nvidia_nras_offline_without_a_host_is_503() {
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: String::new(),
+        cache_mode: CacheMode::Offline,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, _) = send(app, nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_nras_cors(&headers);
+}
+
+#[tokio::test]
 async fn nvidia_nras_offline_never_calls_upstream() {
     let calls = Arc::new(AtomicU64::new(0));
     let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
