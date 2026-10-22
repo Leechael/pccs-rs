@@ -449,9 +449,6 @@ impl Cache {
     /// that is never cached: the responder echoes the nonce in its signed
     /// response, so a stored copy would fail another client's nonce check.
     pub async fn get_nvidia_ocsp(&self, body: &[u8]) -> Result<AmdKdsResponse, PccsError> {
-        if self.nvidia_ocsp_uri.is_empty() {
-            return Err(error::NVIDIA_OCSP_ACCESS_FAILURE);
-        }
         let request = crate::ocsp::parse_request(body)?;
         if request.has_nonce {
             self.store.record_miss();
@@ -538,9 +535,12 @@ impl Cache {
         Ok(AmdKdsResponse { retry_after: None, ..resp })
     }
 
-    /// One POST to the OCSP responder. 1xx/3xx count as an access failure;
-    /// every other status is relayed.
+    /// One POST to the OCSP responder. No configured host, 1xx and 3xx count
+    /// as an access failure; every other status is relayed.
     async fn post_nvidia_ocsp(&self, body: &[u8]) -> Result<AmdKdsResponse, PccsError> {
+        if self.nvidia_ocsp_uri.is_empty() {
+            return Err(error::NVIDIA_OCSP_ACCESS_FAILURE);
+        }
         let (status, headers, body) = self
             .pcs
             .post_bytes_once(&self.nvidia_ocsp_uri, "application/ocsp-request", body)
@@ -2146,6 +2146,25 @@ mod tests {
             content_type: None,
             fetched_at: 0,
             expires_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn nvidia_ocsp_without_a_host_still_serves_the_cache() {
+        let request = ocsp_request();
+        let key = crate::ocsp::parse_request(&request).unwrap().cache_key;
+        for mode in [CacheMode::Offline, CacheMode::Req, CacheMode::Lazy] {
+            let (_dir, cache) = ocsp_cache("", mode);
+            let miss = cache.get_nvidia_ocsp(&request).await.err().unwrap();
+            let want = if mode == CacheMode::Lazy {
+                error::NVIDIA_OCSP_ACCESS_FAILURE
+            } else {
+                error::NO_CACHE_DATA
+            };
+            assert_err(&miss, &want);
+            cache.store.put_nvidia_ocsp(&ocsp_record(&key, unix_time() + 3600)).unwrap();
+            let hit = cache.get_nvidia_ocsp(&request).await.unwrap();
+            assert_eq!((hit.status, hit.body), (200, b"ocsp".to_vec()), "{mode:?}");
         }
     }
 
