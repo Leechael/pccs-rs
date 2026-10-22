@@ -5,8 +5,8 @@ use crate::error::{self, PccsError};
 use crate::keys;
 use crate::pcs::{PckCertsResponse, PcsClient};
 use crate::store::{
-    IdentityRecord, PckCertRecord, PckCrlRecord, PlatformCert, PlatformCredentials, PlatformPool,
-    PlatformPublication, RegisteredPlatform, Store, TcbRecord,
+    AmdKdsRecord, IdentityRecord, NvidiaOcspRecord, PckCertRecord, PckCrlRecord, PlatformCert,
+    PlatformCredentials, PlatformPool, PlatformPublication, RegisteredPlatform, Store, TcbRecord,
 };
 use crate::validate::UpdateType;
 use std::collections::HashMap;
@@ -56,13 +56,21 @@ pub struct Cache {
     pub refetch_timeout: std::time::Duration,
     /// Bounded concurrency for the scheduled pool refresh.
     pub refresh_concurrency: usize,
+    amd_kds_uri: String,
+    amd_kds_cache_ttl_secs: u64,
+    nvidia_rim_uri: String,
+    nvidia_rim_cache_ttl_secs: u64,
+    nvidia_nras_uri: String,
+    nvidia_ocsp_uri: String,
+    nvidia_ocsp_max_ttl_secs: u64,
+    nvidia_ocsp_default_ttl_secs: u64,
     /// Per-key locks so N concurrent misses on the same key produce one
     /// upstream request; the losers re-read the store after acquiring.
     inflight: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// Only one refresh at a time; a second admin call waits for the first.
     refresh_lock: Mutex<()>,
-    /// Recent upstream failures per key; see `key_lock`.
-    failures: Mutex<HashMap<String, (std::time::Instant, PccsError)>>,
+    /// Recent upstream failures / non-200 responses per key; see `key_lock`.
+    failures: Mutex<HashMap<String, (std::time::Instant, RecentOutcome)>>,
     /// Last attempted pool re-fetch per platform, success or failure. In
     /// memory only: losing it on restart just allows one extra fetch.
     refetch_marks: Mutex<HashMap<String, std::time::Instant>>,
@@ -70,7 +78,15 @@ pub struct Cache {
 
 /// How long a failed upstream fetch suppresses a retry by the requests already
 /// queued behind it. Short on purpose — this is stampede control, not caching.
-const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+pub const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Hard cap on remembered outcomes. Callers choose the keys, so a burst of
+/// distinct keys inside one `FAILURE_TTL` must not grow the map without bound;
+/// past the cap a new outcome is simply not remembered.
+const RECENT_OUTCOMES_MAX: usize = 1024;
+
+/// Largest non-200 body kept for replay. Larger ones are relayed, not memoised.
+const RECENT_BODY_MAX: usize = 64 * 1024;
 
 /// Upper bound on the synchronous pool re-fetch a `/pckcert` GET may run.
 /// DCAP clients cache the PCK cert, so a stale first answer sticks: answer
@@ -80,6 +96,155 @@ const POOL_REFETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Platforms refreshed at once by the scheduled run. The upstream client bounds
 /// the requests themselves; this only bounds the tasks.
 const POOL_REFRESH_CONCURRENCY: usize = 8;
+#[derive(Clone)]
+enum RecentOutcome {
+    Err(PccsError),
+    Response(AmdKdsResponse),
+}
+
+#[derive(Clone)]
+pub struct AmdKdsResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub content_disposition: Option<String>,
+    pub retry_after: Option<String>,
+}
+
+impl From<AmdKdsRecord> for AmdKdsResponse {
+    fn from(rec: AmdKdsRecord) -> Self {
+        Self {
+            status: 200,
+            body: rec.body,
+            content_type: rec.content_type,
+            content_disposition: rec.content_disposition,
+            retry_after: None,
+        }
+    }
+}
+
+fn unix_time() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// AMD KDS host. A legacy `.../vcek/v1` or `.../vlek/v1` suffix is stripped so
+/// `/vcek/` and `/vlek/` request paths can be appended without doubling.
+fn normalize_amd_kds_host(uri: &str) -> String {
+    let mut host = uri.trim().trim_end_matches('/').to_string();
+    for suffix in ["/vcek/v1", "/vlek/v1"] {
+        if let Some(stripped) = host.strip_suffix(suffix) {
+            host = stripped.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+    host
+}
+
+/// NVIDIA RIM host. A legacy `.../v1/rim` suffix is stripped so `/v1/rim/`
+/// request paths can be appended without doubling.
+fn normalize_nvidia_rim_host(uri: &str) -> String {
+    let host = uri.trim().trim_end_matches('/').to_string();
+    host.strip_suffix("/v1/rim")
+        .map(|stripped| stripped.trim_end_matches('/').to_string())
+        .unwrap_or(host)
+}
+
+fn join_host_path(host: &str, path_and_query: &str) -> String {
+    let path_and_query = if path_and_query.starts_with('/') {
+        path_and_query.to_string()
+    } else {
+        format!("/{path_and_query}")
+    };
+    format!("{host}{path_and_query}")
+}
+
+fn split_path_query(path_and_query: &str) -> (&str, Option<&str>) {
+    match path_and_query.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path_and_query, None),
+    }
+}
+
+fn is_alnum_segment(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+const AMD_HWID_QUERY_PARAMS: &[&str] = &["blSPL", "fmcSPL", "snpSPL", "teeSPL", "ucodeSPL"];
+
+fn is_spl_value(value: &str) -> bool {
+    (1..=3).contains(&value.len())
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u8>().is_ok()
+}
+
+fn canonicalize_query(query: Option<&str>, allowed: &[&str]) -> Result<String, PccsError> {
+    let Some(query) = query.filter(|q| !q.is_empty()) else {
+        return Ok(String::new());
+    };
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key.is_empty() {
+            return Err(error::INVALID_REQ);
+        }
+        if !allowed.iter().any(|allowed| *allowed == key) {
+            return Err(error::INVALID_REQ);
+        }
+        if !is_spl_value(value) {
+            return Err(error::INVALID_REQ);
+        }
+        if seen.iter().any(|(k, _)| k == key) {
+            return Err(error::INVALID_REQ);
+        }
+        seen.push((key.to_string(), value.to_string()));
+    }
+    if seen.is_empty() {
+        return Ok(String::new());
+    }
+    seen.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let encoded = seen.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+    Ok(format!("?{encoded}"))
+}
+
+fn canonicalize_amd_kds(path_and_query: &str) -> Result<String, PccsError> {
+    let (path, query) = split_path_query(path_and_query);
+    let (prefix, rest) = if let Some(rest) = path.strip_prefix("/vcek/") {
+        ("/vcek/", rest)
+    } else if let Some(rest) = path.strip_prefix("/vlek/") {
+        ("/vlek/", rest)
+    } else {
+        return Err(error::INVALID_REQ);
+    };
+    let segs: Vec<&str> = rest.split('/').collect();
+    if segs.len() != 3 || segs[0] != "v1" || !is_alnum_segment(segs[1]) {
+        return Err(error::INVALID_REQ);
+    }
+    let product = segs[1];
+    let last = segs[2];
+    let query = match last {
+        "cert_chain" | "crl" => canonicalize_query(query, &[])?,
+        hwid if is_alnum_segment(hwid) => canonicalize_query(query, AMD_HWID_QUERY_PARAMS)?,
+        _ => return Err(error::INVALID_REQ),
+    };
+    Ok(format!("{prefix}v1/{product}/{last}{query}"))
+}
+
+fn is_rim_id(s: &str) -> bool {
+    if s.is_empty() || s == "." || s == ".." {
+        return false;
+    }
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+fn canonicalize_nvidia_rim(path_and_query: &str) -> Result<String, PccsError> {
+    let (path, query) = split_path_query(path_and_query);
+    let rest = path.strip_prefix("/v1/rim/").ok_or(error::INVALID_REQ)?;
+    if rest.contains('/') || !is_rim_id(rest) {
+        return Err(error::INVALID_REQ);
+    }
+    let query = canonicalize_query(query, &[])?;
+    Ok(format!("/v1/rim/{rest}{query}"))
+}
 
 impl Cache {
     pub fn new(store: Store, pcs: PcsClient, cfg: &Config) -> Self {
@@ -87,6 +252,14 @@ impl Cache {
             mode: cfg.cache_mode,
             pcs_version: cfg.pcs_version(),
             is_intel: cfg.is_intel_upstream(),
+            amd_kds_uri: normalize_amd_kds_host(&cfg.amd_kds_uri),
+            amd_kds_cache_ttl_secs: cfg.amd_kds_cache_ttl_secs,
+            nvidia_rim_uri: normalize_nvidia_rim_host(&cfg.nvidia_rim_uri),
+            nvidia_rim_cache_ttl_secs: cfg.nvidia_rim_cache_ttl_secs,
+            nvidia_nras_uri: cfg.nvidia_nras_uri.trim().trim_end_matches('/').to_string(),
+            nvidia_ocsp_uri: cfg.nvidia_ocsp_uri.trim().trim_end_matches('/').to_string(),
+            nvidia_ocsp_max_ttl_secs: cfg.nvidia_ocsp_max_ttl_secs,
+            nvidia_ocsp_default_ttl_secs: cfg.nvidia_ocsp_default_ttl_secs,
             store,
             pcs,
             pool_refetch_on_new_tcb: cfg.pool_refetch_on_new_tcb,
@@ -143,9 +316,23 @@ impl Cache {
 
     /// The error a sibling just got for this key, if it is still fresh.
     async fn recent_failure(&self, key: &str) -> Option<PccsError> {
+        match self.recent_outcome(key).await {
+            Some(RecentOutcome::Err(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    async fn recent_non200(&self, key: &str) -> Option<AmdKdsResponse> {
+        match self.recent_outcome(key).await {
+            Some(RecentOutcome::Response(r)) => Some(r),
+            _ => None,
+        }
+    }
+
+    async fn recent_outcome(&self, key: &str) -> Option<RecentOutcome> {
         let mut map = self.failures.lock().await;
         match map.get(key) {
-            Some((at, e)) if at.elapsed() < FAILURE_TTL => Some(e.clone()),
+            Some((at, outcome)) if at.elapsed() < FAILURE_TTL => Some(outcome.clone()),
             Some(_) => {
                 map.remove(key);
                 None
@@ -154,16 +341,27 @@ impl Cache {
         }
     }
 
+    async fn remember(&self, key: &str, outcome: RecentOutcome) {
+        if matches!(&outcome, RecentOutcome::Response(r) if r.body.len() > RECENT_BODY_MAX) {
+            return;
+        }
+        let mut map = self.failures.lock().await;
+        if map.len() >= RECENT_OUTCOMES_MAX && !map.contains_key(key) {
+            map.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
+            if map.len() >= RECENT_OUTCOMES_MAX {
+                tracing::debug!("recent outcome map is full; not remembering {key}");
+                return;
+            }
+        }
+        map.insert(key.to_string(), (std::time::Instant::now(), outcome));
+    }
+
     /// Pass a fetch result through, remembering an upstream failure briefly so
     /// the waiters behind us do not each repeat it. Used as
     /// `self.note(&key, fetch().await)?`.
     async fn note<T>(&self, key: &str, result: Result<T, PccsError>) -> Result<T, PccsError> {
         if let Err(e) = &result {
-            let mut map = self.failures.lock().await;
-            if map.len() > 1024 {
-                map.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
-            }
-            map.insert(key.to_string(), (std::time::Instant::now(), e.clone()));
+            self.remember(key, RecentOutcome::Err(e.clone())).await;
         }
         result
     }
@@ -179,6 +377,283 @@ impl Cache {
             return false;
         }
         true
+    }
+
+    pub async fn get_amd_kds(&self, path_and_query: &str) -> Result<AmdKdsResponse, PccsError> {
+        let path_and_query = canonicalize_amd_kds(path_and_query)?;
+        let url = join_host_path(&self.amd_kds_uri, &path_and_query);
+        self.get_cached_url(
+            url,
+            self.amd_kds_cache_ttl_secs,
+            "amd kds",
+            keys::amd_kds,
+            error::AMD_KDS_ACCESS_FAILURE,
+            Store::get_amd_kds,
+            Store::put_amd_kds,
+        )
+        .await
+    }
+
+    pub async fn get_nvidia_rim(&self, path_and_query: &str) -> Result<AmdKdsResponse, PccsError> {
+        let path_and_query = canonicalize_nvidia_rim(path_and_query)?;
+        let url = join_host_path(&self.nvidia_rim_uri, &path_and_query);
+        self.get_cached_url(
+            url,
+            self.nvidia_rim_cache_ttl_secs,
+            "nvidia rim",
+            keys::nvidia_rim,
+            error::NVIDIA_RIM_ACCESS_FAILURE,
+            Store::get_nvidia_rim,
+            Store::put_nvidia_rim,
+        )
+        .await
+    }
+
+    /// Stateless NVIDIA NRAS GPU attestation proxy. Not cached: the result is
+    /// nonce-bound. OFFLINE never calls upstream. LAZY and REQ both proxy.
+    pub async fn get_nvidia_nras(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<AmdKdsResponse, PccsError> {
+        if self.mode == CacheMode::Offline {
+            return Err(error::SERVICE_UNAVAILABLE);
+        }
+        if self.nvidia_nras_uri.is_empty() {
+            return Err(error::NVIDIA_NRAS_ACCESS_FAILURE);
+        }
+        let url = format!("{}/v3/attest/gpu", self.nvidia_nras_uri);
+        let payload = serde_json::to_vec(body).map_err(|_| error::INVALID_REQ)?;
+        self.store.record_upstream();
+        let (status, hdrs, body) = self
+            .pcs
+            .post_json_once(&url, &payload)
+            .await
+            .map_err(|_| error::NVIDIA_NRAS_ACCESS_FAILURE)?;
+        Ok(AmdKdsResponse {
+            status,
+            body,
+            content_type: hdrs
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string()),
+            content_disposition: None,
+            retry_after: hdrs
+                .get(hyper::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string()),
+        })
+    }
+    /// Cached NVIDIA OCSP proxy. Cache key hashes the DER requestList.
+    /// Expired entries are never served. OFFLINE never calls upstream;
+    /// non-LAZY misses return NO_CACHE_DATA. A nonce-bearing request is a miss
+    /// that is never cached: the responder echoes the nonce in its signed
+    /// response, so a stored copy would fail another client's nonce check.
+    pub async fn get_nvidia_ocsp(&self, body: &[u8]) -> Result<AmdKdsResponse, PccsError> {
+        let request = crate::ocsp::parse_request(body)?;
+        if request.has_nonce {
+            self.store.record_miss();
+            if self.mode != CacheMode::Lazy {
+                return Err(error::NO_CACHE_DATA);
+            }
+            self.store.record_upstream();
+            return self.post_nvidia_ocsp(body).await;
+        }
+        let cache_key = request.cache_key;
+        let store_key = keys::nvidia_ocsp(&cache_key);
+        let now = unix_time();
+        if let Some(rec) = self.store.get_nvidia_ocsp(&cache_key) {
+            if rec.expires_at > now {
+                self.store.record_hit();
+                tracing::debug!("cache hit nvidia ocsp");
+                return Ok(AmdKdsResponse {
+                    status: 200,
+                    body: rec.body,
+                    content_type: rec.content_type,
+                    content_disposition: None,
+                    retry_after: None,
+                });
+            }
+            // LAZY drops it under the key lock instead.
+            if self.mode != CacheMode::Lazy {
+                self.drop_expired(&store_key);
+            }
+        }
+        self.store.record_miss();
+        tracing::info!("cache miss nvidia ocsp key={cache_key}");
+        if self.mode != CacheMode::Lazy {
+            return Err(error::NO_CACHE_DATA);
+        }
+
+        let _guard = self.key_lock(&store_key).await?;
+        if let Some(rec) = self.recent_non200(&store_key).await {
+            return Ok(rec);
+        }
+        let now = unix_time();
+        if let Some(rec) = self.store.get_nvidia_ocsp(&cache_key) {
+            if rec.expires_at > now {
+                return Ok(AmdKdsResponse {
+                    status: 200,
+                    body: rec.body,
+                    content_type: rec.content_type,
+                    content_disposition: None,
+                    retry_after: None,
+                });
+            }
+            self.drop_expired(&store_key);
+        }
+
+        self.store.record_upstream();
+        let resp = self.note(&store_key, self.post_nvidia_ocsp(body).await).await?;
+        if resp.status != 200 {
+            self.remember(&store_key, RecentOutcome::Response(resp.clone())).await;
+            return Ok(resp);
+        }
+
+        let now_i64 = i64::try_from(unix_time()).map_err(|_| error::INTERNAL_ERROR)?;
+        let expires_at = match crate::ocsp::response_cache_expiry(
+            &resp.body,
+            now_i64,
+            self.nvidia_ocsp_max_ttl_secs,
+            self.nvidia_ocsp_default_ttl_secs,
+        ) {
+            Ok(expires_at) => expires_at,
+            Err(err) => {
+                tracing::warn!("nvidia ocsp response not cacheable: {err}");
+                // Still relay a successful upstream answer; just do not persist it.
+                return Ok(resp);
+            }
+        };
+        // deferred: hard size bound for the OCSP cache | impact: /ocsp is unauthenticated, so distinct CertIDs the responder answers with 200 can fill disk until their nextUpdate (at most nvidia_ocsp_max_ttl_secs) and the next scheduled sweep | trigger: auth or a quota on /ocsp is decided
+        let rec = NvidiaOcspRecord {
+            cache_key,
+            body: resp.body.clone(),
+            content_type: resp.content_type.clone(),
+            fetched_at: unix_time(),
+            expires_at,
+        };
+        self.store.put_nvidia_ocsp(&rec)?;
+        Ok(AmdKdsResponse { retry_after: None, ..resp })
+    }
+
+    /// One POST to the OCSP responder. No configured host, 1xx and 3xx count
+    /// as an access failure; every other status is relayed.
+    async fn post_nvidia_ocsp(&self, body: &[u8]) -> Result<AmdKdsResponse, PccsError> {
+        if self.nvidia_ocsp_uri.is_empty() {
+            return Err(error::NVIDIA_OCSP_ACCESS_FAILURE);
+        }
+        let (status, headers, body) = self
+            .pcs
+            .post_bytes_once(&self.nvidia_ocsp_uri, "application/ocsp-request", body)
+            .await
+            .map_err(|_| error::NVIDIA_OCSP_ACCESS_FAILURE)?;
+        if (100..200).contains(&status) || (300..400).contains(&status) {
+            return Err(error::NVIDIA_OCSP_ACCESS_FAILURE);
+        }
+        let header = |name| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+        Ok(AmdKdsResponse {
+            status,
+            body,
+            content_type: header(axum::http::header::CONTENT_TYPE)
+                .or_else(|| Some("application/ocsp-response".into())),
+            content_disposition: None,
+            retry_after: header(axum::http::header::RETRY_AFTER),
+        })
+    }
+
+    async fn get_cached_url(
+        &self,
+        url: String,
+        ttl: u64,
+        kind: &'static str,
+        key_for: fn(&str) -> String,
+        access_failure: PccsError,
+        load: fn(&Store, &str) -> Option<AmdKdsRecord>,
+        save: fn(&Store, &AmdKdsRecord) -> Result<(), PccsError>,
+    ) -> Result<AmdKdsResponse, PccsError> {
+        let key = key_for(&url);
+        let now = unix_time();
+        if let Some(rec) = load(&self.store, &url) {
+            // deferred: stale-if-error for AMD/NVIDIA | impact: after TTL expiry a throttled upstream turns every request into 502 while a copy exists on disk | trigger: user decision
+            if now.saturating_sub(rec.fetched_at) < ttl {
+                self.store.record_hit();
+                tracing::debug!("cache hit {kind}");
+                return Ok(rec.into());
+            }
+            // LAZY drops it under the key lock instead, so a concurrent fill
+            // that just replaced it is never deleted.
+            if self.mode != CacheMode::Lazy {
+                self.drop_expired(&key);
+            }
+        }
+        self.store.record_miss();
+        tracing::info!("cache miss {kind} url={url}");
+        if self.mode != CacheMode::Lazy {
+            return Err(error::NO_CACHE_DATA);
+        }
+
+        let _guard = self.key_lock(&key).await?;
+        if let Some(rec) = self.recent_non200(&key).await {
+            return Ok(rec);
+        }
+        let now = unix_time();
+        if let Some(rec) = load(&self.store, &url) {
+            // deferred: stale-if-error for AMD/NVIDIA | impact: after TTL expiry a throttled upstream turns every request into 502 while a copy exists on disk | trigger: user decision
+            if now.saturating_sub(rec.fetched_at) < ttl {
+                return Ok(rec.into());
+            }
+            self.drop_expired(&key);
+        }
+
+        self.store.record_upstream();
+        let fetched = self.pcs.get_url(&url).await.map_err(|_| access_failure.clone());
+        let (status, headers, body) = self.note(&key, fetched).await?;
+        let content_type = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let content_disposition = headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let retry_after = headers
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if (100..200).contains(&status) || (300..400).contains(&status) {
+            return self.note(&key, Err(access_failure)).await;
+        }
+        if status != 200 {
+            let rec =
+                AmdKdsResponse { status, body, content_type, content_disposition, retry_after };
+            self.remember(&key, RecentOutcome::Response(rec.clone())).await;
+            return Ok(rec);
+        }
+        let rec =
+            AmdKdsRecord { url, body, content_type, content_disposition, fetched_at: unix_time() };
+        save(&self.store, &rec)?;
+        Ok(rec.into())
+    }
+
+    /// Read-through records are only replaced when the same URL is requested
+    /// again, so an expired one is deleted as soon as a lookup sees it.
+    fn drop_expired(&self, key: &str) {
+        if let Err(e) = self.store.delete_key(key) {
+            tracing::warn!("failed to delete expired {key}: {e}");
+        }
+    }
+
+    /// Delete the expired read-through records no request came back for.
+    fn sweep_expired(&self) {
+        let now = unix_time();
+        for (prefix, ttl) in [
+            (keys::AMD_KDS, self.amd_kds_cache_ttl_secs),
+            (keys::NVIDIA_RIM, self.nvidia_rim_cache_ttl_secs),
+        ] {
+            let expired = |rec: &AmdKdsRecord| now.saturating_sub(rec.fetched_at) >= ttl;
+            log_sweep(prefix, self.store.sweep_prefix(prefix, expired));
+        }
+        let expired = |rec: &NvidiaOcspRecord| rec.expires_at <= now;
+        log_sweep(keys::NVIDIA_OCSP, self.store.sweep_prefix(keys::NVIDIA_OCSP, expired));
     }
 
     // ---------------- pckcert ----------------
@@ -1174,6 +1649,10 @@ impl Cache {
     /// pool sweep still runs (the collateral result is what this returns), and
     /// a per-platform pool failure never affects the collateral result.
     pub async fn scheduled_refresh(self: &Arc<Self>) -> Result<(), PccsError> {
+        // Local only, so it runs in every mode, OFFLINE included.
+        if let Err(e) = self.blocking(Cache::sweep_expired).await {
+            tracing::warn!("expired record sweep: {e}");
+        }
         if self.mode == CacheMode::Offline {
             return Err(error::SERVICE_UNAVAILABLE);
         }
@@ -1259,6 +1738,14 @@ impl Cache {
     }
 }
 
+fn log_sweep(prefix: &str, result: Result<usize, PccsError>) {
+    match result {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("swept {n} expired {prefix} records"),
+        Err(e) => tracing::warn!("{prefix} sweep: {e}"),
+    }
+}
+
 /// Upper-cased `qe_id:pce_id`: the key for both the per-platform re-fetch lock
 /// and the in-memory throttle marks.
 fn platform_key(qeid: &str, pceid: &str) -> String {
@@ -1296,6 +1783,136 @@ pub fn build_cache(cfg: &Config) -> Result<Arc<Cache>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amd_kds_host_strips_legacy_vcek_and_vlek_suffixes() {
+        assert_eq!(
+            normalize_amd_kds_host("https://kdsintf.amd.com/vcek/v1"),
+            "https://kdsintf.amd.com"
+        );
+        assert_eq!(
+            normalize_amd_kds_host("https://kdsintf.amd.com/vlek/v1/"),
+            "https://kdsintf.amd.com"
+        );
+        assert_eq!(normalize_amd_kds_host(" https://kdsintf.amd.com "), "https://kdsintf.amd.com");
+        assert_eq!(
+            normalize_amd_kds_host("https://mirror.example/amd-kds/vcek/v1"),
+            "https://mirror.example/amd-kds"
+        );
+    }
+
+    #[test]
+    fn nvidia_rim_host_strips_legacy_v1_rim_suffix() {
+        assert_eq!(
+            normalize_nvidia_rim_host("https://rim.attestation.nvidia.com/v1/rim"),
+            "https://rim.attestation.nvidia.com"
+        );
+        assert_eq!(
+            normalize_nvidia_rim_host(" https://rim.attestation.nvidia.com/v1/rim/ "),
+            "https://rim.attestation.nvidia.com"
+        );
+        assert_eq!(
+            normalize_nvidia_rim_host("https://rim.attestation.nvidia.com"),
+            "https://rim.attestation.nvidia.com"
+        );
+    }
+
+    #[test]
+    fn amd_kds_path_is_whitelisted_and_query_is_sorted() {
+        assert_eq!(
+            canonicalize_amd_kds("/vcek/v1/Genoa/cert_chain").unwrap(),
+            "/vcek/v1/Genoa/cert_chain"
+        );
+        assert_eq!(
+            canonicalize_amd_kds("/vcek/v1/Genoa/abcd?teeSPL=2&blSPL=1").unwrap(),
+            "/vcek/v1/Genoa/abcd?blSPL=1&teeSPL=2"
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v1/Genoa/cert_chain?junk=1").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(&canonicalize_amd_kds("/vcek/v1/../../x").unwrap_err(), &error::INVALID_REQ);
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v3/Genoa/cert_chain").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_eq!(
+            canonicalize_amd_kds("/vcek/v1/Genoa/abcd?blSPL=255").unwrap(),
+            "/vcek/v1/Genoa/abcd?blSPL=255"
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v1/Genoa/abcd?blSPL=256").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v1/Genoa/abcd?blSPL=Nzzz").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(
+            &canonicalize_amd_kds("/vcek/v1/Genoa/abcd?blSPL=1&blSPL=2").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+    }
+
+    #[test]
+    fn amd_kds_turin_kms_query_with_fmc_spl_is_sorted() {
+        // sev-snp-qvl: Turin uses chip_id[..8] (16 hex) and adds fmcSPL.
+        let turin = "0123456789abcdef";
+        assert_eq!(
+            canonicalize_amd_kds(&format!(
+                "/vcek/v1/Turin/{turin}?fmcSPL=1&blSPL=2&teeSPL=3&snpSPL=4&ucodeSPL=5"
+            ))
+            .unwrap(),
+            format!("/vcek/v1/Turin/{turin}?blSPL=2&fmcSPL=1&snpSPL=4&teeSPL=3&ucodeSPL=5")
+        );
+        assert_err(
+            &canonicalize_amd_kds(&format!("/vcek/v1/Turin/{turin}?fmcSPL=256")).unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(
+            &canonicalize_amd_kds(&format!("/vcek/v1/Turin/{turin}?fmcSPL=1&fmcSPL=1"))
+                .unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        // Milan/Genoa: full 64-byte chip_id (128 hex), no fmcSPL.
+        let genoa = "ab".repeat(64);
+        assert_eq!(
+            canonicalize_amd_kds(&format!(
+                "/vcek/v1/Genoa/{genoa}?blSPL=2&teeSPL=3&snpSPL=4&ucodeSPL=5"
+            ))
+            .unwrap(),
+            format!("/vcek/v1/Genoa/{genoa}?blSPL=2&snpSPL=4&teeSPL=3&ucodeSPL=5")
+        );
+    }
+
+    #[test]
+    fn empty_query_pairs_and_keys_are_rejected() {
+        for path in [
+            "/vcek/v1/Milan/cert_chain?&",
+            "/vcek/v1/Milan/ABCD?blSPL=1&&snpSPL=2",
+            "/vcek/v1/Milan/ABCD?blSPL=1&",
+            "/vcek/v1/Milan/ABCD?=3",
+            "/vlek/v1/Genoa/crl?=",
+        ] {
+            assert_err(&canonicalize_amd_kds(path).unwrap_err(), &error::INVALID_REQ);
+        }
+        assert_err(&canonicalize_nvidia_rim("/v1/rim/some-id?&").unwrap_err(), &error::INVALID_REQ);
+    }
+
+    #[test]
+    fn nvidia_rim_path_is_whitelisted() {
+        assert_eq!(canonicalize_nvidia_rim("/v1/rim/some-id").unwrap(), "/v1/rim/some-id");
+        assert_eq!(
+            canonicalize_nvidia_rim("/v1/rim/NV_GPU_DRIVER_GH100_535.129.03").unwrap(),
+            "/v1/rim/NV_GPU_DRIVER_GH100_535.129.03"
+        );
+        assert_eq!(canonicalize_nvidia_rim("/v1/rim/ids").unwrap(), "/v1/rim/ids");
+        assert_err(
+            &canonicalize_nvidia_rim("/v1/rim/some-id?junk=1").unwrap_err(),
+            &error::INVALID_REQ,
+        );
+        assert_err(&canonicalize_nvidia_rim("/v1/rim/../x").unwrap_err(), &error::INVALID_REQ);
+    }
 
     #[test]
     fn raw_cpusvn_matches_node_int_to_hex() {
@@ -1379,6 +1996,194 @@ mod tests {
         let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
         let pcs = PcsClient::new(&cfg).unwrap();
         (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
+    }
+
+    fn amd_cache(amd_kds_uri: &str, mode: CacheMode) -> (TestDir, Arc<Cache>) {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-cache-{}", uuid::Uuid::new_v4()));
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: amd_kds_uri.into(),
+            cache_mode: mode,
+            db_path: dir.clone(),
+            upstream_max_attempts: 1,
+            ..Config::default()
+        };
+        let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
+        let pcs = PcsClient::new(&cfg).unwrap();
+        (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
+    }
+
+    fn amd_record(url: &str, fetched_at: u64) -> AmdKdsRecord {
+        AmdKdsRecord {
+            url: url.into(),
+            body: b"cert".to_vec(),
+            content_type: None,
+            content_disposition: None,
+            fetched_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_amd_kds_record_is_deleted_when_a_lookup_finds_it() {
+        let host = "http://127.0.0.1:0";
+        let url = format!("{host}/vcek/v1/Milan/cert_chain");
+        for mode in [CacheMode::Offline, CacheMode::Req, CacheMode::Lazy] {
+            let (_dir, cache) = amd_cache(host, mode);
+            cache.store.put_amd_kds(&amd_record(&url, 0)).unwrap();
+            assert!(cache.get_amd_kds("/vcek/v1/Milan/cert_chain").await.is_err());
+            assert!(cache.store.get_amd_kds(&url).is_none(), "{mode:?} kept an expired record");
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_refresh_sweeps_expired_amd_kds_records() {
+        let host = "http://127.0.0.1:0";
+        let stale = format!("{host}/vcek/v1/Milan/cert_chain");
+        let fresh = format!("{host}/vcek/v1/Genoa/cert_chain");
+        for mode in [CacheMode::Lazy, CacheMode::Offline] {
+            let (_dir, cache) = amd_cache(host, mode);
+            cache.store.put_amd_kds(&amd_record(&stale, 0)).unwrap();
+            cache.store.put_amd_kds(&amd_record(&fresh, unix_time())).unwrap();
+            let _ = cache.scheduled_refresh().await;
+            assert!(cache.store.get_amd_kds(&stale).is_none(), "{mode:?} kept an expired record");
+            assert!(cache.store.get_amd_kds(&fresh).is_some(), "{mode:?} swept a fresh record");
+        }
+    }
+
+    fn rim_cache(nvidia_rim_uri: &str, mode: CacheMode) -> (TestDir, Arc<Cache>) {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-cache-{}", uuid::Uuid::new_v4()));
+        let cfg = Config {
+            uri: String::new(),
+            nvidia_rim_uri: nvidia_rim_uri.into(),
+            cache_mode: mode,
+            db_path: dir.clone(),
+            upstream_max_attempts: 1,
+            ..Config::default()
+        };
+        let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
+        let pcs = PcsClient::new(&cfg).unwrap();
+        (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
+    }
+
+    #[tokio::test]
+    async fn expired_nvidia_rim_records_are_deleted_on_lookup_and_swept() {
+        let host = "http://127.0.0.1:0";
+        let looked_up = format!("{host}/v1/rim/looked-up");
+        let stale = format!("{host}/v1/rim/stale");
+        let fresh = format!("{host}/v1/rim/fresh");
+        for mode in [CacheMode::Offline, CacheMode::Lazy] {
+            let (_dir, cache) = rim_cache(host, mode);
+            for (url, at) in [(&looked_up, 0), (&stale, 0), (&fresh, unix_time())] {
+                cache.store.put_nvidia_rim(&amd_record(url, at)).unwrap();
+            }
+            assert!(cache.get_nvidia_rim("/v1/rim/looked-up").await.is_err());
+            assert!(cache.store.get_nvidia_rim(&looked_up).is_none(), "{mode:?} lookup kept it");
+            let _ = cache.scheduled_refresh().await;
+            assert!(cache.store.get_nvidia_rim(&stale).is_none(), "{mode:?} sweep kept it");
+            assert!(cache.store.get_nvidia_rim(&fresh).is_some(), "{mode:?} swept a fresh one");
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_outcomes_are_bounded_in_count_and_body_size() {
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
+        let response = |len: usize| {
+            RecentOutcome::Response(AmdKdsResponse {
+                status: 429,
+                body: vec![0; len],
+                content_type: None,
+                content_disposition: None,
+                retry_after: None,
+            })
+        };
+        for i in 0..RECENT_OUTCOMES_MAX + 16 {
+            cache.remember(&format!("key-{i}"), response(1)).await;
+        }
+        assert!(cache.failures.lock().await.len() <= RECENT_OUTCOMES_MAX);
+
+        let (_dir, cache) = cache_with("", CacheMode::Lazy);
+        cache.remember("small", response(RECENT_BODY_MAX)).await;
+        cache.remember("large", response(RECENT_BODY_MAX + 1)).await;
+        assert!(cache.recent_non200("small").await.is_some());
+        assert!(cache.recent_non200("large").await.is_none());
+    }
+
+    fn ocsp_cache(nvidia_ocsp_uri: &str, mode: CacheMode) -> (TestDir, Arc<Cache>) {
+        let dir = std::env::temp_dir().join(format!("pccs-rs-cache-{}", uuid::Uuid::new_v4()));
+        let cfg = Config {
+            uri: String::new(),
+            nvidia_ocsp_uri: nvidia_ocsp_uri.into(),
+            cache_mode: mode,
+            db_path: dir.clone(),
+            upstream_max_attempts: 1,
+            ..Config::default()
+        };
+        let store = Store::open(&dir, mode, &crate::config::RocksDbOpts::default()).unwrap();
+        let pcs = PcsClient::new(&cfg).unwrap();
+        (TestDir(dir), Arc::new(Cache::new(store, pcs, &cfg)))
+    }
+
+    /// Minimal DER OCSPRequest for one synthetic CertID.
+    fn ocsp_request() -> Vec<u8> {
+        fn der(tag: u8, value: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag, value.len() as u8];
+            out.extend_from_slice(value);
+            out
+        }
+        let algorithm = der(0x30, &der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a]));
+        let cert_id = der(
+            0x30,
+            &[algorithm, der(0x04, &[1; 20]), der(0x04, &[2; 20]), der(0x02, &[3])].concat(),
+        );
+        let list = der(0x30, &der(0x30, &cert_id));
+        der(0x30, &der(0x30, &list))
+    }
+
+    fn ocsp_record(cache_key: &str, expires_at: u64) -> NvidiaOcspRecord {
+        NvidiaOcspRecord {
+            cache_key: cache_key.into(),
+            body: b"ocsp".to_vec(),
+            content_type: None,
+            fetched_at: 0,
+            expires_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn nvidia_ocsp_without_a_host_still_serves_the_cache() {
+        let request = ocsp_request();
+        let key = crate::ocsp::parse_request(&request).unwrap().cache_key;
+        for mode in [CacheMode::Offline, CacheMode::Req, CacheMode::Lazy] {
+            let (_dir, cache) = ocsp_cache("", mode);
+            let miss = cache.get_nvidia_ocsp(&request).await.err().unwrap();
+            let want = if mode == CacheMode::Lazy {
+                error::NVIDIA_OCSP_ACCESS_FAILURE
+            } else {
+                error::NO_CACHE_DATA
+            };
+            assert_err(&miss, &want);
+            cache.store.put_nvidia_ocsp(&ocsp_record(&key, unix_time() + 3600)).unwrap();
+            let hit = cache.get_nvidia_ocsp(&request).await.unwrap();
+            assert_eq!((hit.status, hit.body), (200, b"ocsp".to_vec()), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_nvidia_ocsp_records_are_deleted_on_lookup_and_swept() {
+        let request = ocsp_request();
+        let looked_up = crate::ocsp::parse_request(&request).unwrap().cache_key;
+        for mode in [CacheMode::Offline, CacheMode::Lazy] {
+            let (_dir, cache) = ocsp_cache("http://127.0.0.1:0", mode);
+            for (key, at) in [(looked_up.as_str(), 1), ("stale", 1), ("fresh", unix_time() + 3600)]
+            {
+                cache.store.put_nvidia_ocsp(&ocsp_record(key, at)).unwrap();
+            }
+            assert!(cache.get_nvidia_ocsp(&request).await.is_err());
+            assert!(cache.store.get_nvidia_ocsp(&looked_up).is_none(), "{mode:?} lookup kept it");
+            let _ = cache.scheduled_refresh().await;
+            assert!(cache.store.get_nvidia_ocsp("stale").is_none(), "{mode:?} sweep kept it");
+            assert!(cache.store.get_nvidia_ocsp("fresh").is_some(), "{mode:?} swept a fresh one");
+        }
     }
 
     async fn spawn(app: axum::Router) -> String {

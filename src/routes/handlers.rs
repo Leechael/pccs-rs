@@ -1,13 +1,14 @@
 //! HTTP handlers — 1:1 with Node controllers (query names, headers, status, bodies).
 
 use crate::auth::AppState;
-use crate::error::{self, PccsError, PccsJson};
+use crate::error::{self, PccsBytes, PccsError, PccsJson};
 use crate::headers;
 use crate::store::RegisteredPlatform;
 use crate::validate::{self, PlatformsSource};
-use axum::extract::{FromRequestParts, OriginalUri, State};
+use axum::extract::{FromRequestParts, OriginalUri, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -56,6 +57,101 @@ fn json_value(status: StatusCode, headers: HeaderMap, value: &Value, raw_body: &
         raw_body.as_bytes().to_vec()
     };
     (status, h, body).into_response()
+}
+
+// --------------- AMD KDS ---------------
+
+fn amd_response(rec: crate::cache::AmdKdsResponse) -> Response {
+    let status = StatusCode::from_u16(rec.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut headers = HeaderMap::new();
+    if let Some(value) = rec.content_type.as_deref() {
+        insert(&mut headers, "content-type", value);
+    }
+    if let Some(value) = rec.content_disposition.as_deref() {
+        insert(&mut headers, "content-disposition", value);
+    }
+    if let Some(value) = rec.retry_after.as_deref() {
+        insert(&mut headers, "retry-after", value);
+    }
+    bytes(status, headers, rec.body)
+}
+
+fn original_path_and_query(uri: &Uri) -> String {
+    match uri.query() {
+        Some(query) => format!("{}?{query}", uri.path()),
+        None => uri.path().to_string(),
+    }
+}
+
+pub async fn get_amd_kds(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, PccsError> {
+    Ok(amd_response(state.cache.get_amd_kds(&original_path_and_query(&uri)).await?))
+}
+
+pub async fn get_nvidia_rim(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, PccsError> {
+    Ok(amd_response(state.cache.get_nvidia_rim(&original_path_and_query(&uri)).await?))
+}
+
+// --------------- NVIDIA OCSP ---------------
+
+pub async fn post_nvidia_ocsp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    PccsBytes(body): PccsBytes,
+) -> Result<Response, PccsError> {
+    let content_type =
+        headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let media = content_type.split(';').next().unwrap_or("").trim();
+    if !media.eq_ignore_ascii_case("application/ocsp-request") {
+        return Err(error::INVALID_REQ);
+    }
+    if body.is_empty() {
+        return Err(error::INVALID_REQ);
+    }
+    Ok(amd_response(state.cache.get_nvidia_ocsp(&body).await?))
+}
+
+// --------------- NVIDIA NRAS (GPU attestation) ---------------
+
+fn insert_nras_cors(headers: &mut HeaderMap) {
+    insert(headers, "access-control-allow-origin", "*");
+    insert(headers, "access-control-allow-methods", "POST, OPTIONS");
+    insert(headers, "access-control-allow-headers", "Content-Type");
+    insert(headers, "access-control-expose-headers", "Retry-After");
+    insert(headers, "cache-control", "no-store");
+}
+
+fn is_nras_path(path: &str) -> bool {
+    path == "/nvidia/nras" || path.starts_with("/nvidia/nras/")
+}
+
+/// Path-scoped CORS for `/nvidia/nras`. Wraps `DefaultBodyLimit` so 413 still
+/// gets ACAO, but sits inside `add_request_id`. OPTIONS is answered here so
+/// preflight does not depend on a matching POST route.
+pub async fn nras_cors(req: Request, next: Next) -> Response {
+    let nras = is_nras_path(req.uri().path());
+    if nras && req.method() == Method::OPTIONS {
+        let mut headers = HeaderMap::new();
+        insert_nras_cors(&mut headers);
+        return (StatusCode::NO_CONTENT, headers).into_response();
+    }
+    let mut response = next.run(req).await;
+    if nras {
+        insert_nras_cors(response.headers_mut());
+    }
+    response
+}
+
+pub async fn post_nvidia_nras_attest_gpu(
+    State(state): State<AppState>,
+    PccsJson(body): PccsJson<Value>,
+) -> Result<Response, PccsError> {
+    Ok(amd_response(state.cache.get_nvidia_nras(&body).await?))
 }
 
 // --------------- pckcert ---------------

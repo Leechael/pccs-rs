@@ -65,6 +65,24 @@ pub struct CrlRecord {
     pub crl: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmdKdsRecord {
+    pub url: String,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub content_disposition: Option<String>,
+    pub fetched_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NvidiaOcspRecord {
+    pub cache_key: String,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub fetched_at: u64,
+    pub expires_at: u64,
+}
+
 /// `GET /platforms?source=[fmspc]` row. Node's SQL selects exactly these six
 /// columns — `fmspc` and `ca` are filter/join columns and are not returned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -792,6 +810,75 @@ impl Store {
             .into_iter()
             .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
             .collect()
+    }
+
+    pub fn get_amd_kds(&self, url: &str) -> Option<AmdKdsRecord> {
+        let rec: AmdKdsRecord = self.get_json(&keys::amd_kds(url))?;
+        if rec.url != url {
+            tracing::warn!("amd kds record does not match its key; treating as a miss");
+            return None;
+        }
+        Some(rec)
+    }
+
+    pub fn put_amd_kds(&self, rec: &AmdKdsRecord) -> Result<(), PccsError> {
+        self.put_json(&keys::amd_kds(&rec.url), rec)
+    }
+
+    pub fn delete_key(&self, key: &str) -> Result<(), PccsError> {
+        self.db.delete(key.as_bytes()).map_err(|_| error::INTERNAL_ERROR)
+    }
+
+    /// Delete every record under `prefix` that `expired` flags, in one batch.
+    /// Only the expired keys are held in memory, never the scanned values.
+    pub fn sweep_prefix<T: for<'de> Deserialize<'de>>(
+        &self,
+        prefix: &str,
+        expired: impl Fn(&T) -> bool,
+    ) -> Result<usize, PccsError> {
+        let mut batch = WriteBatch::default();
+        let mut swept = 0;
+        let iter = self.db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        for item in iter {
+            let (k, v) = item.map_err(|_| error::INTERNAL_ERROR)?;
+            if !k.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if serde_json::from_slice::<T>(&v).is_ok_and(|rec| expired(&rec)) {
+                batch.delete(&k);
+                swept += 1;
+            }
+        }
+        if swept > 0 {
+            self.write_batch(batch)?;
+        }
+        Ok(swept)
+    }
+
+    pub fn get_nvidia_rim(&self, url: &str) -> Option<AmdKdsRecord> {
+        let rec: AmdKdsRecord = self.get_json(&keys::nvidia_rim(url))?;
+        if rec.url != url {
+            tracing::warn!("nvidia rim record does not match its key; treating as a miss");
+            return None;
+        }
+        Some(rec)
+    }
+
+    pub fn put_nvidia_rim(&self, rec: &AmdKdsRecord) -> Result<(), PccsError> {
+        self.put_json(&keys::nvidia_rim(&rec.url), rec)
+    }
+
+    pub fn get_nvidia_ocsp(&self, cache_key: &str) -> Option<NvidiaOcspRecord> {
+        let rec: NvidiaOcspRecord = self.get_json(&keys::nvidia_ocsp(cache_key))?;
+        if rec.cache_key != cache_key {
+            tracing::warn!("nvidia ocsp record does not match its key; treating as a miss");
+            return None;
+        }
+        Some(rec)
+    }
+
+    pub fn put_nvidia_ocsp(&self, rec: &NvidiaOcspRecord) -> Result<(), PccsError> {
+        self.put_json(&keys::nvidia_ocsp(&rec.cache_key), rec)
     }
 
     // ---------- registration queue ----------

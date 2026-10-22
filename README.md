@@ -3,14 +3,15 @@
 Rust + Tokio replacement for
 [Intel PCCS](https://github.com/intel/confidential-computing.tee.dcap.pccs)
 (Provisioning Certificate Caching Service). HTTP API is 1:1 with Node PCCS
-(SGX v3 + v4, TDX v4). The cache is RocksDB and survives restart.
+(SGX v3 + v4, TDX v4) and also provides read-through caches for AMD KDS (`/vcek/`, `/vlek/`), NVIDIA RIM (`/v1/rim/`), and NVIDIA OCSP (`POST /ocsp`), plus a CORS proxy for NVIDIA NRAS GPU attestation (`POST /nvidia/nras/attest/gpu`).
+The cache is RocksDB and survives restart.
 
 Sit it behind Caddy or nginx. This repo does not ship a reverse-proxy config.
 
 ## 5-minute kickoff
 
-You need an Intel PCS API key (`Ocp-Apim-Subscription-Key`). Everything else
-has a built-in default.
+Intel collateral requires an Intel PCS API key (`Ocp-Apim-Subscription-Key`).
+AMD KDS caching needs no API key. Everything else has a built-in default.
 
 ### Debian / Ubuntu
 
@@ -118,6 +119,14 @@ db_path = "/var/lib/pccs-rs"
 # key = "certs/private.pem"
 # cache_mode = "lazy" # lazy | offline | req
 # uri = "https://api.trustedservices.intel.com/sgx/certification/v4/"
+# amd_kds_uri = "https://kdsintf.amd.com"
+# amd_kds_cache_ttl_seconds = 2592000 # 30 days
+# nvidia_rim_uri = "https://rim.attestation.nvidia.com"
+# nvidia_rim_cache_ttl_seconds = 2592000 # 30 days
+# nvidia_nras_uri = "https://nras.attestation.nvidia.com"
+# nvidia_ocsp_uri = "https://ocsp.ndis.nvidia.com"
+# nvidia_ocsp_max_ttl_seconds = 86400 # 24 hours
+# nvidia_ocsp_default_ttl_seconds = 3600 # 1 hour
 # proxy is not supported; a non-empty value refuses to start.
 # refresh_schedule = "0 0 1 * * *"
 # user_token_hash = ""
@@ -143,7 +152,35 @@ db_path = "/var/lib/pccs-rs"
 # rocksdb_max_open_files = -1
 ```
 
-- Default upstream is Intel PCS.
+- Default Intel upstream is Intel PCS. The AMD KDS host defaults to
+  `https://kdsintf.amd.com`. Request paths under `/vcek/` and `/vlek/` are
+  forwarded unchanged. A legacy `.../vcek/v1` or `.../vlek/v1` suffix on the
+  configured host is stripped.
+- AMD KDS and NVIDIA RIM responses are cached for 30 days by default. Only
+  successful `200` responses are stored; the full upstream URL, including the
+  query string, is the cache key.
+- The NVIDIA RIM host defaults to `https://rim.attestation.nvidia.com`.
+  Request paths under `/v1/rim/` are forwarded unchanged. A legacy `.../v1/rim`
+  suffix on the configured host is stripped.
+- The NVIDIA OCSP host defaults to `https://ocsp.ndis.nvidia.com`.
+  `POST /ocsp` with `Content-Type: application/ocsp-request` is a read-through
+  cache. The cache key is the SHA-256 of the full DER `requestList` (every
+  CertID plus any `singleRequestExtensions`); `requestExtensions` are not part
+  of the key. A request carrying an OCSP nonce is relayed and never cached:
+  the responder echoes the nonce in its signed response. Entries expire at the
+  signed `nextUpdate` (capped by `nvidia_ocsp_max_ttl_seconds`); responses
+  without `nextUpdate` expire `nvidia_ocsp_default_ttl_seconds` (default one
+  hour) after `thisUpdate`. Expired OCSP is never served. This is the missing piece
+  for using pccs-rs as a dstack `nvidia_attestation_proxy_url`.
+- The NVIDIA NRAS host defaults to `https://nras.attestation.nvidia.com`.
+  `POST /nvidia/nras/attest/gpu` is a **stateless CORS proxy** to
+  `{host}/v3/attest/gpu`. Responses are nonce-bound and are **not** stored in
+  RocksDB. `Cache-Control: no-store`. CORS (`Access-Control-Allow-Origin: *`,
+  `Allow-Methods: POST, OPTIONS`, `Allow-Headers: Content-Type`,
+  `Expose-Headers: Retry-After`) is applied to every `/nvidia/nras` response,
+  including extractor errors and `413`.
+  Example:
+  `curl -sS -X POST http://127.0.0.1:8081/nvidia/nras/attest/gpu -H 'Content-Type: application/json' -d '{"nonce":"…","evidence_list":[…]}'`
 - `api_key` is sent where Node sends it: on `pckcerts`, and on every request
   to `https://validation.api.trustedservices.intel.com/`. Never on CRL
   downloads.
@@ -197,11 +234,11 @@ Upstream requests: 120s total, 10s connect, 16 MiB response cap,
 
 ### Caching modes
 
-| Mode | GET miss | POST /platforms | Refresh |
-|------|----------|-----------------|---------|
-| **LAZY** | Fetch upstream, store, return. v3 miss → 410. | Fill if unknown; a failed fill fails the POST | Allowed |
-| **REQ** | `/pckcert` → 461 if unknown; other GETs → 404 | Queue, fill, drop this platform's row | Allowed |
-| **OFFLINE** | Same as REQ. Never calls upstream. | Queue only | 503 |
+| Mode | GET miss | POST /platforms | Refresh | NRAS `POST /nvidia/nras/attest/gpu` |
+|------|----------|-----------------|---------|--------------------------------------|
+| **LAZY** | Fetch upstream, store, return. v3 miss → 410. | Fill if unknown; a failed fill fails the POST | Allowed | Proxy online, not cached |
+| **REQ** | `/pckcert` → 461 if unknown; other GETs → 404 | Queue, fill, drop this platform's row | Allowed | Proxy online, not cached |
+| **OFFLINE** | Same as REQ. Never calls upstream. | Queue only | 503 | `503`, zero network |
 
 A `/pckcert` miss for a *known* platform first runs PCK cert selection
 against the cached pool. Concurrent misses on the same key are de-duplicated.
@@ -310,6 +347,9 @@ JSON.
 | `pckcrl/` | ca | CRL bytes + issuer chain |
 | `rootcacrl` | (literal) | CRL bytes |
 | `crl/` | uri | CRL bytes |
+| `amd-kds/` | complete upstream URL | response bytes, content headers, fetch time |
+| `nvidia-rim/` | complete upstream URL | response bytes, content headers, fetch time |
+| `nvidia-ocsp/` | SHA-256 hex of the DER `requestList` (not CityHash) | response bytes, content type, fetch time, expiry |
 | `appraisal/` | fmspc | policy list (GET joins defaults) |
 | `preg/` | qeid / pceid / cpusvn / pcesvn | registration queue |
 
@@ -327,6 +367,15 @@ REQ / OFFLINE answer `461` for those platforms until refilled.
 
 - All 30 default v4 routes (SGX v3 + v4 + TDX v4), mounted at
   `/sgx/certification/v3`, `/sgx/certification/v4`, and `/tdx/certification/v4`
+- AMD KDS-compatible `GET /vcek/{*path}` and `GET /vlek/{*path}` (VCEK, VLEK,
+  `cert_chain`, and `crl`), forwarding path and query to the configured AMD KDS
+  host (`amd_kds_uri`, default `https://kdsintf.amd.com`)
+- NVIDIA RIM-compatible `GET /v1/rim/{*path}`, forwarding path and query to
+  `rim.attestation.nvidia.com`
+- NVIDIA OCSP cache `POST /ocsp` → `ocsp.ndis.nvidia.com` (nonce requests relayed uncached;
+  expires at `nextUpdate`; non-LAZY miss is 404)
+- NVIDIA NRAS CORS proxy `POST /nvidia/nras/attest/gpu` →
+  `nras.attestation.nvidia.com/v3/attest/gpu` (no persistence; OFFLINE is 503)
 - Auth, Request-ID (always freshly generated), v3 Warning, Intel headers,
   `text/html` error bodies, body limit (413 `Content too large.`),
   `x-powered-by` not set

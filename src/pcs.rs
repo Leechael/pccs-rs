@@ -130,7 +130,21 @@ impl PcsClient {
             // result); the one POST (`pckcerts` with a platform manifest) is
             // already replayed by the retry loop in `send`.
             .retry_canceled_requests(true);
-        let https = cfg.uri.starts_with("https://") || cfg.uri.is_empty();
+        let uri = cfg.uri.trim();
+        let amd_kds_uri = cfg.amd_kds_uri.trim();
+        let nvidia_rim_uri = cfg.nvidia_rim_uri.trim();
+        let nvidia_nras_uri = cfg.nvidia_nras_uri.trim();
+        let nvidia_ocsp_uri = cfg.nvidia_ocsp_uri.trim();
+        let https = uri.starts_with("https://")
+            || amd_kds_uri.starts_with("https://")
+            || nvidia_rim_uri.starts_with("https://")
+            || nvidia_nras_uri.starts_with("https://")
+            || nvidia_ocsp_uri.starts_with("https://")
+            || (uri.is_empty()
+                && amd_kds_uri.is_empty()
+                && nvidia_rim_uri.is_empty()
+                && nvidia_nras_uri.is_empty()
+                && nvidia_ocsp_uri.is_empty());
         let client = if https {
             http_conn.enforce_http(false);
             let https_conn = hyper_rustls::HttpsConnectorBuilder::new()
@@ -184,22 +198,94 @@ impl PcsClient {
     /// twice so a PCS-side storm is not amplified by every cache miss. A
     /// `Retry-After` header wins over the exponential backoff, capped at 30s.
     async fn get(&self, url: &str) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
-        self.send(url, None).await
+        if !self.enabled() {
+            return Err(error::NO_CACHE_DATA);
+        }
+        self.send(url, None, true).await
+    }
+
+    /// AMD KDS / NVIDIA RIM fetch. Never attaches the Intel API key and never
+    /// applies the Intel `/v3/` EOL check — those belong to Intel paths only.
+    pub async fn get_url(&self, url: &str) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
+        self.send(url, None, false).await
+    }
+
+    /// One JSON POST through the pooled client. No Intel `/v3/` gate, no API
+    /// key, no 429/503 retry — NRAS attestation is not Intel collateral.
+    pub async fn post_json_once(
+        &self,
+        url: &str,
+        body: &[u8],
+    ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let uri: Uri = url.parse().map_err(|_| error::INTERNAL_ERROR)?;
+        let req = Request::post(uri)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::copy_from_slice(body)))
+            .map_err(|_| error::INTERNAL_ERROR)?;
+        let _permit = match self.permits.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return Err(error::INTERNAL_ERROR),
+        };
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.attempt(req)).await {
+            Err(_) => {
+                tracing::warn!("upstream request {} timed out", redact_url(url));
+                Err(error::PCS_ACCESS_FAILURE)
+            }
+            Ok(Err(e)) => Err(e),
+            Ok(Ok(v)) => {
+                tracing::info!("upstream request {} -> {}", redact_url(url), v.0);
+                Ok(v)
+            }
+        }
+    }
+
+    /// One binary POST through the pooled client. Used by NVIDIA OCSP: no Intel
+    /// `/v3/` gate, no API key, no 429/503 retry.
+    pub async fn post_bytes_once(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let uri: Uri = url.parse().map_err(|_| error::INTERNAL_ERROR)?;
+        let req = Request::post(uri)
+            .header(hyper::header::CONTENT_TYPE, content_type)
+            .body(Full::new(Bytes::copy_from_slice(body)))
+            .map_err(|_| error::INTERNAL_ERROR)?;
+        let _permit = match self.permits.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return Err(error::INTERNAL_ERROR),
+        };
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.attempt(req)).await {
+            Err(_) => {
+                tracing::warn!("upstream request {} timed out", redact_url(url));
+                Err(error::PCS_ACCESS_FAILURE)
+            }
+            Ok(Err(e)) => Err(e),
+            Ok(Ok(v)) => {
+                tracing::info!("upstream request {} -> {}", redact_url(url), v.0);
+                Ok(v)
+            }
+        }
     }
 
     /// `body = Some(json)` issues a POST with `Content-Type: application/json`
     /// (Node `pcs_client.getCertsWithManifest`); `None` issues a GET.
+    /// `attach_key` is Intel-only: it also enables the `/v3/` EOL check and the
+    /// `pckcerts` / early-access subscription key. AMD/NVIDIA callers pass false.
     async fn send(
         &self,
         url: &str,
         body: Option<Vec<u8>>,
+        attach_key: bool,
     ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
-        Self::check_v3(url)?;
-        if !self.enabled() {
-            return Err(error::NO_CACHE_DATA);
+        if attach_key {
+            Self::check_v3(url)?;
         }
         self.calls.fetch_add(1, Ordering::Relaxed);
-        let send_key = Self::wants_api_key(url) && !self.api_key.is_empty();
+        let send_key = attach_key && Self::wants_api_key(url) && !self.api_key.is_empty();
         let mut last = error::PCS_ACCESS_FAILURE;
         let mut throttled = 0u32;
         let mut delay: Option<Duration> = None;
@@ -365,13 +451,16 @@ impl PcsClient {
         platform_manifest: &str,
         pceid: &str,
     ) -> Result<PckCertsResponse, PccsError> {
+        if !self.enabled() {
+            return Err(error::NO_CACHE_DATA);
+        }
         let url = format!("{}pckcerts", self.base);
         let payload = serde_json::json!({
             "platformManifest": platform_manifest,
             "pceid": pceid,
         })
         .to_string();
-        let (status, h, body) = self.send(&url, Some(payload.into_bytes())).await?;
+        let (status, h, body) = self.send(&url, Some(payload.into_bytes()), true).await?;
         Self::parse_pckcerts(status, &h, &body)
     }
 
@@ -853,6 +942,76 @@ mod tests {
             ..Config::default()
         };
         PcsClient::new(&cfg).unwrap()
+    }
+
+    #[test]
+    fn amd_kds_scheme_ignores_surrounding_whitespace() {
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: "  https://kds.example/vcek/v1  ".into(),
+            ..Config::default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        assert!(matches!(client.client, AnyClient::Https(_)));
+    }
+
+    #[test]
+    fn nvidia_rim_scheme_ignores_surrounding_whitespace() {
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: String::new(),
+            nvidia_rim_uri: "  https://rim.example/v1/rim  ".into(),
+            ..Config::default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        assert!(matches!(client.client, AnyClient::Https(_)));
+    }
+
+    #[test]
+    fn nvidia_nras_scheme_ignores_surrounding_whitespace() {
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: String::new(),
+            nvidia_rim_uri: String::new(),
+            nvidia_nras_uri: "  https://nras.example  ".into(),
+            ..Config::default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        assert!(matches!(client.client, AnyClient::Https(_)));
+    }
+
+    #[test]
+    fn nvidia_ocsp_scheme_ignores_surrounding_whitespace() {
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: String::new(),
+            nvidia_rim_uri: String::new(),
+            nvidia_nras_uri: String::new(),
+            nvidia_ocsp_uri: "  https://ocsp.example  ".into(),
+            ..Config::default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        assert!(matches!(client.client, AnyClient::Https(_)));
+    }
+
+    #[tokio::test]
+    async fn post_json_once_does_not_apply_intel_v3_eol() {
+        use axum::routing::post;
+        let app = axum::Router::new()
+            .route("/v3/attest/gpu", post(|| async { (StatusCode::OK, "token") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let client = client_for(&format!("http://{addr}/"));
+        let (status, _, body) = client
+            .post_json_once(&format!("http://{addr}/v3/attest/gpu"), br#"{"nonce":"aa"}"#)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"token");
+        assert_eq!(client.call_count(), 1);
     }
 
     async fn spawn(app: axum::Router) -> String {

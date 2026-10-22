@@ -9,7 +9,7 @@ use pccs_rs::config::{Config, DEFAULT_ADMIN_TOKEN, DEFAULT_USER_TOKEN};
 use pccs_rs::{create_app_from_config, headers};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
@@ -2473,6 +2473,1313 @@ const TCB: &str = "/sgx/certification/v4/tcb?fmspc=ABCDABCDABCD";
 const QE: &str = "/sgx/certification/v4/qe/identity";
 const PCKCRL: &str = "/sgx/certification/v4/pckcrl?ca=processor";
 
+async fn spawn_amd_kds(calls: Arc<AtomicU64>) -> String {
+    let app = axum::Router::new().route(
+        "/vcek/v1/Genoa/cert_chain",
+        axum::routing::get(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                ([("content-type", "application/octet-stream")], "amd-chain")
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn amd_kds_cert_chain_is_cached_by_its_full_url() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_amd_kds(calls.clone()).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-amd-api-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: upstream,
+        amd_kds_cache_ttl_secs: 30 * 24 * 60 * 60,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for _ in 0..2 {
+        let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "amd-chain");
+        assert_eq!(headers.get("content-type").unwrap(), "application/octet-stream");
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_forwards_vcek_vlek_and_crl_paths() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let calls = mock_calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            uri.path().to_string()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-amd-prefix-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: format!("http://{addr}/vcek/v1"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for path in [
+        "/vcek/v1/Genoa/cert_chain",
+        "/vcek/v1/Genoa/crl",
+        "/vlek/v1/Genoa/cert_chain",
+        "/vlek/v1/Milan/abcd",
+    ] {
+        let (status, _, body) = send(app.clone(), get(path)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(body, path, "{path}");
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_transport_failure_is_a_bad_gateway() {
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-amd-transport-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: "http://127.0.0.1:0".into(),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    let (status, _, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "Unable to retrieve the collateral from the AMD KDS.");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn concurrent_amd_kds_transport_failures_issue_one_upstream_fetch() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_calls = calls.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            mock_calls.fetch_add(1, Ordering::Relaxed);
+            drop(socket);
+        }
+    });
+
+    let db_path = std::env::temp_dir()
+        .join(format!("pccs-rs-amd-failed-concurrent-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: format!("http://{addr}"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let path = "/vcek/v1/Genoa/cert_chain";
+
+    let (one, two) = tokio::join!(send(app.clone(), get(path)), send(app.clone(), get(path)));
+    assert_eq!(one.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(two.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn concurrent_amd_kds_misses_issue_one_upstream_fetch() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/vcek/v1/Genoa/cert_chain",
+        axum::routing::get(move || {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                "amd-chain"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-amd-concurrent-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: format!("http://{addr}"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let path = "/vcek/v1/Genoa/cert_chain";
+
+    let (one, two) = tokio::join!(send(app.clone(), get(path)), send(app.clone(), get(path)));
+    assert_eq!(one.0, StatusCode::OK);
+    assert_eq!(two.0, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_cache_survives_restart() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_amd_kds(calls.clone()).await;
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-amd-restart-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+
+    let first = create_app_from_config(cfg.clone());
+    let (status, _, _) = send(first.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::OK);
+    drop(first);
+
+    let second = create_app_from_config(cfg);
+    let (status, _, body) = send(second.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "amd-chain");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(second);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn non_lazy_amd_kds_miss_never_calls_upstream() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_amd_kds(calls.clone()).await;
+
+    for mode in [CacheMode::Req, CacheMode::Offline] {
+        let db_path = std::env::temp_dir().join(format!(
+            "pccs-rs-amd-no-fill-{}-{}",
+            mode.as_str(),
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = Config {
+            uri: String::new(),
+            amd_kds_uri: upstream.clone(),
+            cache_mode: mode,
+            db_path: db_path.clone(),
+            upstream_max_attempts: 1,
+            ..Config::test_default()
+        };
+        let app = create_app_from_config(cfg);
+
+        let (status, _, _) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{}", mode.as_str());
+        drop(app);
+        let _ = std::fs::remove_dir_all(db_path);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn amd_kds_error_response_is_relayed_and_not_cached() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/vcek/v1/Genoa/cert_chain",
+        axum::routing::get(move || {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "10")], "slow down")
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-amd-error-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: format!("http://{addr}"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
+    // Outlive the memoised non-200 answer so the second request goes upstream.
+    tokio::time::sleep(pccs_rs::cache::FAILURE_TTL + std::time::Duration::from_millis(100)).await;
+    let (status, headers, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_ttl_starts_after_the_upstream_response() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/vcek/v1/Genoa/cert_chain",
+        axum::routing::get(move || {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                "amd-chain"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-amd-ttl-start-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: format!("http://{addr}"),
+        amd_kds_cache_ttl_secs: 1,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for _ in 0..2 {
+        let (status, _, _) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn expired_amd_kds_entry_is_refetched() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_amd_kds(calls.clone()).await;
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-amd-expired-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: upstream,
+        amd_kds_cache_ttl_secs: 0,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for _ in 0..2 {
+        let (status, _, _) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_vcek_cache_key_includes_the_complete_query() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/vcek/v1/Genoa/{hwid}",
+        axum::routing::get(move |uri: axum::http::Uri| {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                uri.query().unwrap_or_default().to_string()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-amd-vcek-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: format!("http://{addr}"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let hwid = "ab".repeat(64);
+    let one = format!("/vcek/v1/Genoa/{hwid}?blSPL=1&teeSPL=2&snpSPL=3&ucodeSPL=4");
+    let two = format!("/vcek/v1/Genoa/{hwid}?blSPL=1&teeSPL=2&snpSPL=3&ucodeSPL=5");
+
+    let (_, _, body_one) = send(app.clone(), get(&one)).await;
+    let (_, _, body_two) = send(app.clone(), get(&two)).await;
+    let (_, _, body_one_cached) = send(app.clone(), get(&one)).await;
+    assert_eq!(body_one, "blSPL=1&snpSPL=3&teeSPL=2&ucodeSPL=4");
+    assert_eq!(body_two, "blSPL=1&snpSPL=3&teeSPL=2&ucodeSPL=5");
+    assert_eq!(body_one_cached, body_one);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_rim_is_cached_by_its_full_url() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/v1/rim/{id}",
+        axum::routing::get(move |uri: axum::http::Uri| {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                ([("content-type", "application/json")], format!("rim {}", uri.path()))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nvidia-rim-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: format!("http://{addr}/v1/rim"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    for _ in 0..2 {
+        let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "rim /v1/rim/some-id");
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_rim_transport_failure_is_a_bad_gateway() {
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nvidia-transport-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: "http://127.0.0.1:9".into(),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    let (status, _, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "Unable to retrieve the collateral from the NVIDIA RIM service.");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn non_lazy_nvidia_rim_miss_never_calls_upstream() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().fallback(move || {
+        let calls = mock_calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            "rim"
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    for mode in [CacheMode::Req, CacheMode::Offline] {
+        let db_path = std::env::temp_dir().join(format!(
+            "pccs-rs-nvidia-no-fill-{}-{}",
+            mode.as_str(),
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = Config {
+            uri: String::new(),
+            nvidia_rim_uri: format!("http://{addr}"),
+            cache_mode: mode,
+            db_path: db_path.clone(),
+            upstream_max_attempts: 1,
+            ..Config::test_default()
+        };
+        let app = create_app_from_config(cfg);
+        let (status, _, _) = send(app.clone(), get("/v1/rim/some-id")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{}", mode.as_str());
+        drop(app);
+        let _ = std::fs::remove_dir_all(db_path);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn nvidia_rim_error_response_is_relayed_and_not_cached() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/v1/rim/some-id",
+        axum::routing::get(move || {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "10")], "slow down")
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nvidia-error-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: format!("http://{addr}"),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+
+    let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
+    // Outlive the memoised non-200 answer so the second request goes upstream.
+    tokio::time::sleep(pccs_rs::cache::FAILURE_TTL + std::time::Duration::from_millis(100)).await;
+    let (status, headers, body) = send(app.clone(), get("/v1/rim/some-id")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "10");
+    assert_eq!(body, "slow down");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+struct UpstreamHit {
+    path: String,
+    api_key: String,
+}
+
+async fn spawn_recording_upstream(
+    status: StatusCode,
+    extra_headers: &'static [(&'static str, &'static str)],
+    body: &'static str,
+) -> (String, Arc<Mutex<Vec<UpstreamHit>>>) {
+    let seen: Arc<Mutex<Vec<UpstreamHit>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let upstream_app =
+        axum::Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+            let seen = seen2.clone();
+            async move {
+                let api_key = req
+                    .headers()
+                    .get("ocp-apim-subscription-key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let path = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("").to_string();
+                seen.lock().unwrap().push(UpstreamHit { path, api_key });
+                let mut builder = axum::http::Response::builder().status(status);
+                for (name, value) in extra_headers {
+                    builder = builder.header(*name, *value);
+                }
+                builder.body(axum::body::Body::from(body)).unwrap()
+            }
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    (format!("http://{addr}"), seen)
+}
+
+fn amd_cfg(upstream: String, db_name: &str) -> (Config, std::path::PathBuf) {
+    let db_path = std::env::temp_dir().join(format!("{db_name}-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        amd_kds_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    (cfg, db_path)
+}
+
+#[tokio::test]
+async fn amd_kds_does_not_forward_the_intel_api_key() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (mut cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-no-key");
+    cfg.api_key = "secret-key".into();
+    let app = create_app_from_config(cfg);
+
+    let (status, _, _) = send(app.clone(), get("/vcek/v1/x/pckcerts")).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/vcek/v1/x/pckcerts");
+    assert_eq!(seen[0].api_key, "");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+fn nras_post(body: impl Into<Body>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "application/json")
+        .body(body.into())
+        .unwrap()
+}
+
+fn assert_nras_cors(headers: &axum::http::HeaderMap) {
+    assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+    let methods = headers.get("access-control-allow-methods").unwrap().to_str().unwrap();
+    assert!(methods.contains("POST"), "{methods}");
+    assert!(methods.contains("OPTIONS"), "{methods}");
+    assert_eq!(headers.get("access-control-allow-headers").unwrap(), "Content-Type");
+    assert_eq!(headers.get("access-control-expose-headers").unwrap(), "Retry-After");
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+}
+
+async fn spawn_nras(
+    calls: Arc<AtomicU64>,
+    status: StatusCode,
+    retry_after: Option<&'static str>,
+) -> String {
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/v3/attest/gpu",
+        axum::routing::post(move |body: bytes::Bytes| {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                if let Some(retry) = retry_after {
+                    headers.insert(
+                        axum::http::header::RETRY_AFTER,
+                        axum::http::HeaderValue::from_static(retry),
+                    );
+                }
+                (status, headers, body)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn nvidia_nras_proxies_json_and_is_not_cached() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-proxy-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let payload = json!({"nonce":"aa","evidence_list":[]});
+
+    for _ in 0..2 {
+        let (status, headers, body) = send(app.clone(), nras_post(payload.to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, payload.to_string().as_bytes());
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_nras_cors(&headers);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "must not persist NRAS results");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_options_preflight_is_cors() {
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/nvidia/nras/attest/gpu")
+            .header(headers::REQUEST_ID, "client-supplied-id")
+            .body(Body::empty())
+            .unwrap();
+        let (status, h, _) = send(app(), req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_nras_cors(&h);
+        let id = h.get(headers::REQUEST_ID).unwrap().to_str().unwrap().to_string();
+        assert_ne!(id, "client-supplied-id");
+        assert!(!id.is_empty());
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1], "each preflight gets a fresh Request-ID");
+}
+
+#[tokio::test]
+async fn nvidia_nras_prefix_does_not_match_nras_extra() {
+    let req =
+        Request::builder().method("OPTIONS").uri("/nvidia/nras-extra").body(Body::empty()).unwrap();
+    let (status, headers, _) = send(app(), req).await;
+    assert_ne!(status, StatusCode::NO_CONTENT);
+    assert!(headers.get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
+async fn nvidia_nras_extractor_errors_have_cors() {
+    let malformed = Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "application/json")
+        .body(Body::from("{not json"))
+        .unwrap();
+    let (status, headers, _) = send(app(), malformed).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_nras_cors(&headers);
+
+    let wrong_type = Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "text/plain")
+        .body(Body::from("x"))
+        .unwrap();
+    let (status, headers, _) = send(app(), wrong_type).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_nras_cors(&headers);
+}
+
+#[tokio::test]
+async fn nvidia_nras_forwards_retry_after() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::TOO_MANY_REQUESTS, Some("11")).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-429-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 6,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, body) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "11");
+    assert_eq!(body, "{}");
+    assert_nras_cors(&headers);
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "NRAS must not inherit Intel 429 retries");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_does_not_retry_upstream_503() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::SERVICE_UNAVAILABLE, Some("2")).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-503-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 6,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, _) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers.get("retry-after").unwrap(), "2");
+    assert_nras_cors(&headers);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_transport_failure_is_a_bad_gateway_with_cors() {
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nras-transport-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: "http://127.0.0.1:9".into(),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, body) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "Unable to retrieve the attestation result from the NVIDIA NRAS.");
+    assert_nras_cors(&headers);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_host_with_surrounding_whitespace_still_proxies() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-trim-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: format!("  {upstream}/  "),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, _, _) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_offline_without_a_host_is_503() {
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: String::new(),
+        cache_mode: CacheMode::Offline,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, _) = send(app, nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_nras_cors(&headers);
+}
+
+#[tokio::test]
+async fn nvidia_nras_offline_never_calls_upstream() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nras-offline-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        cache_mode: CacheMode::Offline,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, headers, _) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_nras_cors(&headers);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_nras_req_mode_still_proxies() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let upstream = spawn_nras(calls.clone(), StatusCode::OK, None).await;
+    let db_path = std::env::temp_dir().join(format!("pccs-rs-nras-req-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_nras_uri: upstream,
+        cache_mode: CacheMode::Req,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, _, _) = send(app.clone(), nras_post(json!({}).to_string())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn concurrent_amd_kds_throttled_responses_issue_one_upstream_fetch() {
+    let (upstream, seen) = spawn_recording_upstream(
+        StatusCode::TOO_MANY_REQUESTS,
+        &[("retry-after", "1")],
+        "slow down",
+    )
+    .await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-429-burst");
+    let app = create_app_from_config(cfg);
+    let path = "/vcek/v1/Genoa/cert_chain";
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move { send(app, get(path)).await }));
+    }
+    for h in handles {
+        let (status, _, _) = h.await.unwrap();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_unknown_query_is_rejected_and_known_params_are_canonicalised() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-canon");
+    let app = create_app_from_config(cfg);
+    let hwid = "ab".repeat(64);
+
+    let (status, _, body) =
+        send(app.clone(), get(&format!("/vcek/v1/Genoa/cert_chain?junk=1"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "Invalid request parameters.");
+    assert!(seen.lock().unwrap().is_empty());
+
+    let one = format!("/vcek/v1/Genoa/{hwid}?teeSPL=2&blSPL=1");
+    let two = format!("/vcek/v1/Genoa/{hwid}?blSPL=1&teeSPL=2");
+    let (status, _, _) = send(app.clone(), get(&one)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(app.clone(), get(&two)).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, format!("/vcek/v1/Genoa/{hwid}?blSPL=1&teeSPL=2"));
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_turin_vcek_kms_form_reaches_upstream_canonicalised() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-turin");
+    let app = create_app_from_config(cfg);
+    let turin = "0123456789abcdef";
+    let milan = "cd".repeat(64);
+
+    // The form sev-snp-qvl sends for Turin: 16-hex hwid, fmcSPL first.
+    let kms = format!("/vcek/v1/Turin/{turin}?fmcSPL=1&blSPL=2&teeSPL=3&snpSPL=4&ucodeSPL=5");
+    let (status, _, body) = send(app.clone(), get(&kms)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "ok");
+
+    let milan_req = format!("/vcek/v1/Milan/{milan}?blSPL=2&teeSPL=3&snpSPL=4&ucodeSPL=5");
+    let (status, _, _) = send(app.clone(), get(&milan_req)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[0].path,
+        format!("/vcek/v1/Turin/{turin}?blSPL=2&fmcSPL=1&snpSPL=4&teeSPL=3&ucodeSPL=5")
+    );
+    assert_eq!(
+        seen[1].path,
+        format!("/vcek/v1/Milan/{milan}?blSPL=2&snpSPL=4&teeSPL=3&ucodeSPL=5")
+    );
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_redirect_is_a_bad_gateway_and_client_errors_pass_through() {
+    let (upstream, seen) = spawn_recording_upstream(
+        StatusCode::FOUND,
+        &[("location", "https://example.test/elsewhere")],
+        "moved",
+    )
+    .await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-302");
+    let app = create_app_from_config(cfg);
+
+    let (status, _, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "Unable to retrieve the collateral from the AMD KDS.");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::NOT_FOUND, &[], "missing").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-404");
+    let app = create_app_from_config(cfg);
+    let (status, _, body) = send(app.clone(), get("/vcek/v1/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "missing");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_dot_segments_are_rejected_without_touching_upstream() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-dots");
+    let app = create_app_from_config(cfg);
+
+    let req = Request::builder().method("GET").uri("/vcek/v1/../../x").body(Body::empty()).unwrap();
+    let (status, _, body) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "Invalid request parameters.");
+    assert!(seen.lock().unwrap().is_empty());
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn amd_kds_v3_path_is_rejected_without_touching_upstream() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let (cfg, db_path) = amd_cfg(upstream, "pccs-rs-amd-v3");
+    let app = create_app_from_config(cfg);
+
+    let (status, _, body) = send(app.clone(), get("/vcek/v3/Genoa/cert_chain")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "Invalid request parameters.");
+    assert!(seen.lock().unwrap().is_empty());
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_rim_accepts_dotted_driver_ids() {
+    let (upstream, seen) = spawn_recording_upstream(StatusCode::OK, &[], "ok").await;
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-nvidia-dotted-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_rim_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let path = "/v1/rim/NV_GPU_DRIVER_GH100_535.129.03";
+
+    for _ in 0..2 {
+        let (status, _, body) = send(app.clone(), get(path)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ok");
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, path);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+fn ocsp_der(tag: u8, value: &[u8]) -> Vec<u8> {
+    let mut result = vec![tag];
+    if value.len() < 128 {
+        result.push(value.len() as u8);
+    } else {
+        let bytes = value.len().to_be_bytes();
+        let first = bytes.iter().position(|byte| *byte != 0).unwrap();
+        result.push(0x80 | (bytes.len() - first) as u8);
+        result.extend_from_slice(&bytes[first..]);
+    }
+    result.extend_from_slice(value);
+    result
+}
+
+fn ocsp_sequence(parts: &[Vec<u8>]) -> Vec<u8> {
+    ocsp_der(0x30, &parts.concat())
+}
+
+fn sample_ocsp_request(nonce: Option<u8>) -> Vec<u8> {
+    let algorithm = ocsp_sequence(&[ocsp_der(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a])]);
+    let cert_id = ocsp_sequence(&[
+        algorithm,
+        ocsp_der(0x04, &[1; 20]),
+        ocsp_der(0x04, &[2; 20]),
+        ocsp_der(0x02, &[3]),
+    ]);
+    let request = ocsp_sequence(&[cert_id]);
+    let list = ocsp_sequence(&[request]);
+    let Some(nonce) = nonce else {
+        return ocsp_sequence(&[ocsp_sequence(&[list])]);
+    };
+    // requestExtensions [2] holding one id-pkix-ocsp-nonce extension.
+    let nonce_extension = ocsp_sequence(&[
+        ocsp_der(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02]),
+        ocsp_der(0x04, &ocsp_der(0x04, &[nonce; 16])),
+    ]);
+    let extensions = ocsp_der(0xa2, &ocsp_sequence(&[nonce_extension]));
+    ocsp_sequence(&[ocsp_sequence(&[list, extensions])])
+}
+
+fn sample_ocsp_response(this_update: &str, next_update: Option<&str>) -> Vec<u8> {
+    let cert_id = ocsp_sequence(&[ocsp_der(0x02, &[1])]);
+    let mut single = vec![cert_id, ocsp_der(0x80, &[]), ocsp_der(0x18, this_update.as_bytes())];
+    if let Some(next_update) = next_update {
+        single.push(ocsp_der(0xa0, &ocsp_der(0x18, next_update.as_bytes())));
+    }
+    let responses = ocsp_sequence(&[ocsp_sequence(&single)]);
+    let response_data =
+        ocsp_sequence(&[ocsp_der(0x82, &[7; 20]), ocsp_der(0x18, b"20260716120000Z"), responses]);
+    let basic = ocsp_sequence(&[
+        response_data,
+        ocsp_sequence(&[ocsp_der(0x06, &[0x2a, 0x03])]),
+        ocsp_der(0x03, &[0]),
+    ]);
+    let response_bytes = ocsp_sequence(&[
+        ocsp_der(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01]),
+        ocsp_der(0x04, &basic),
+    ]);
+    ocsp_sequence(&[ocsp_der(0x0a, &[0]), ocsp_der(0xa0, &response_bytes)])
+}
+
+fn ocsp_post(body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/ocsp")
+        .header("content-type", "application/ocsp-request")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn spawn_ocsp(calls: Arc<AtomicU64>) -> String {
+    // Far-future nextUpdate so a cached entry stays fresh for the test.
+    let body = sample_ocsp_response("20200101120000Z", Some("20990102120000Z"));
+    let upstream_app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |req_body: bytes::Bytes| {
+            let calls = calls.clone();
+            let body = body.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert!(!req_body.is_empty());
+                (StatusCode::OK, [("content-type", "application/ocsp-response")], body)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
+fn ocsp_cfg(upstream: String, db_name: &str) -> (Config, std::path::PathBuf) {
+    let db_path = std::env::temp_dir().join(format!("{db_name}-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_ocsp_uri: upstream,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    (cfg, db_path)
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_without_nonce_is_cached_by_cert_id() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let (cfg, db_path) = ocsp_cfg(spawn_ocsp(calls.clone()).await, "pccs-rs-ocsp-cache");
+    let app = create_app_from_config(cfg);
+
+    let (status, headers, resp) = send(app.clone(), ocsp_post(sample_ocsp_request(None))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("content-type").unwrap(), "application/ocsp-response");
+    assert!(!resp.is_empty());
+
+    let (status, _, resp2) = send(app.clone(), ocsp_post(sample_ocsp_request(None))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp, resp2);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+/// The responder echoes the request nonce in its signed response, so a cached
+/// answer would fail another client's nonce check.
+#[tokio::test]
+async fn nvidia_ocsp_with_nonce_bypasses_the_cache() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let (cfg, db_path) = ocsp_cfg(spawn_ocsp(calls.clone()).await, "pccs-rs-ocsp-nonce");
+    let app = create_app_from_config(cfg);
+
+    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(Some(1)))).await;
+    assert_eq!(status, StatusCode::OK);
+    // Not written: the same CertID without a nonce still misses.
+    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(None))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "a nonce response must not be cached");
+    // Not read: the cached entry is never served to a nonce-bearing request.
+    let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(Some(2)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 3, "a nonce request must reach the responder");
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_rejects_wrong_content_type() {
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_ocsp_uri: "http://127.0.0.1:9".into(),
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ocsp")
+        .header("content-type", "application/json")
+        .body(Body::from(sample_ocsp_request(None)))
+        .unwrap();
+    let (status, _, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_transport_failure_is_a_bad_gateway() {
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-ocsp-transport-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_ocsp_uri: "http://127.0.0.1:9".into(),
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    let (status, _, body) = send(app.clone(), ocsp_post(sample_ocsp_request(None))).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body, "Unable to retrieve the OCSP response from the NVIDIA OCSP service.");
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_offline_never_calls_upstream() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let mock_calls = calls.clone();
+    let upstream_app = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |_: bytes::Bytes| {
+            let calls = mock_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    let db_path =
+        std::env::temp_dir().join(format!("pccs-rs-ocsp-offline-{}", uuid::Uuid::new_v4()));
+    let cfg = Config {
+        uri: String::new(),
+        nvidia_ocsp_uri: format!("http://{addr}"),
+        cache_mode: pccs_rs::config::CacheMode::Offline,
+        db_path: db_path.clone(),
+        upstream_max_attempts: 1,
+        ..Config::test_default()
+    };
+    let app = create_app_from_config(cfg);
+    for nonce in [None, Some(1)] {
+        let (status, _, _) = send(app.clone(), ocsp_post(sample_ocsp_request(nonce))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    drop(app);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
 #[tokio::test]
 async fn every_documented_route_is_registered() {
     let routes: &[(&str, &str)] = &[
@@ -2506,6 +3813,12 @@ async fn every_documented_route_is_registered() {
         ("GET", "/sgx/certification/v4/appraisalpolicy"),
         ("GET", "/tdx/certification/v4/tcb"),
         ("GET", "/tdx/certification/v4/qe/identity"),
+        ("GET", "/vcek/v1/Genoa/cert_chain"),
+        ("GET", "/vcek/v1/Genoa/crl"),
+        ("GET", "/vlek/v1/Genoa/cert_chain"),
+        ("GET", "/v1/rim/some-id"),
+        ("POST", "/ocsp"),
+        ("POST", "/nvidia/nras/attest/gpu"),
     ];
 
     for (method, path) in routes {
@@ -3987,4 +5300,71 @@ async fn stalled_request_body_is_408_with_request_id() {
         started.elapsed() < std::time::Duration::from_secs(10),
         "must time out at RequestTimeoutSeconds, not hang"
     );
+}
+
+#[tokio::test]
+async fn nvidia_nras_stalled_body_is_408_with_cors() {
+    let mut cfg = Config::test_default();
+    cfg.request_timeout_secs = 1;
+    let router = app_cfg(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "application/json")
+        .body(Body::new(StalledBody(Some(bytes::Bytes::from_static(b"{")))))
+        .unwrap();
+    let (status, headers, _) = send(router, req).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert_nras_cors(&headers);
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_stalled_body_is_408() {
+    let mut cfg = Config::test_default();
+    cfg.request_timeout_secs = 1;
+    let router = app_cfg(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ocsp")
+        .header("content-type", "application/ocsp-request")
+        .body(Body::new(StalledBody(Some(bytes::Bytes::from_static(&[0x30, 0x10])))))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (status, _, body) = send(router, req).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(body.as_ref(), b"Request Timeout");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn nvidia_ocsp_oversize_body_is_413() {
+    let mut cfg = Config::test_default();
+    cfg.max_body_size = 64;
+    let router = app_cfg(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ocsp")
+        .header("content-type", "application/ocsp-request")
+        .body(Body::from(vec![0u8; 256]))
+        .unwrap();
+    let (status, _, body) = send(router, req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body.as_ref(), b"Content too large.");
+}
+
+#[tokio::test]
+async fn nvidia_nras_oversize_body_is_413_with_cors() {
+    let mut cfg = Config::test_default();
+    cfg.max_body_size = 64;
+    let router = app_cfg(cfg);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/nvidia/nras/attest/gpu")
+        .header("content-type", "application/json")
+        .body(Body::from(format!("{{\"x\":\"{}\"}}", "a".repeat(256))))
+        .unwrap();
+    let (status, headers, body) = send(router, req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body.as_ref(), b"Content too large.");
+    assert_nras_cors(&headers);
 }

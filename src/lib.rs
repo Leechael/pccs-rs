@@ -1,6 +1,6 @@
-//! pccs-rs — production Rust replacement for Intel PCCS.
+//! pccs-rs — Rust collateral cache for Intel PCS and AMD KDS.
 //!
-//! HTTP API is 1:1 with Node. RocksDB is the source of truth.
+//! The Intel HTTP API is 1:1 with Node PCCS. RocksDB is the source of truth.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +13,7 @@ pub mod headers;
 pub mod health;
 pub mod intel_import;
 pub mod keys;
+pub mod ocsp;
 pub mod pcs;
 pub mod routes;
 pub mod selection;
@@ -48,7 +49,12 @@ pub fn create_app(state: AppState) -> Router {
         .fallback(routes::handlers::not_found)
         .layer(middleware::from_fn(auth::v3_eol_warning));
 
-    let mut app = Router::new().nest("/sgx/certification/v3", sgx_v3);
+    let mut app = Router::new()
+        .nest("/sgx/certification/v3", sgx_v3)
+        .merge(routes::amd_kds_router())
+        .merge(routes::nvidia_rim_router())
+        .merge(routes::nvidia_ocsp_router())
+        .nest("/nvidia/nras", routes::nvidia_nras_router());
     if pcs_ver == 4 {
         app = app
             .nest("/sgx/certification/v4", routes::sgx_router(state.clone()))
@@ -57,8 +63,11 @@ pub fn create_app(state: AppState) -> Router {
 
     app.nest("/healthz", routes::healthz_router())
         .fallback(routes::handlers::not_found)
-        .layer(middleware::from_fn(auth::add_request_id))
         .layer(DefaultBodyLimit::max(body_limit))
+        // CORS wraps the body-limit 413, but stays inside Request-ID so OPTIONS
+        // preflight (answered without calling next) still gets a fresh id.
+        .layer(middleware::from_fn(routes::handlers::nras_cors))
+        .layer(middleware::from_fn(auth::add_request_id))
         .with_state(state)
 }
 

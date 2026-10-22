@@ -17,6 +17,14 @@ pub const DEFAULT_ADMIN_TOKEN_HASH: &str =
 
 /// Intel PCS, same as Node `service/config/default.json`.
 pub const DEFAULT_URI: &str = "https://api.trustedservices.intel.com/sgx/certification/v4/";
+pub const DEFAULT_AMD_KDS_URI: &str = "https://kdsintf.amd.com";
+pub const DEFAULT_AMD_KDS_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+pub const DEFAULT_NVIDIA_RIM_URI: &str = "https://rim.attestation.nvidia.com";
+pub const DEFAULT_NVIDIA_RIM_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+pub const DEFAULT_NVIDIA_NRAS_URI: &str = "https://nras.attestation.nvidia.com";
+pub const DEFAULT_NVIDIA_OCSP_URI: &str = "https://ocsp.ndis.nvidia.com";
+pub const DEFAULT_NVIDIA_OCSP_MAX_TTL_SECS: u64 = 24 * 60 * 60;
+pub const DEFAULT_NVIDIA_OCSP_DEFAULT_TTL_SECS: u64 = 60 * 60;
 pub const DEFAULT_REFRESH: &str = "0 0 1 * * *";
 
 /// Packaged default path. systemd always passes `--config` pointing here.
@@ -103,7 +111,7 @@ impl CacheMode {
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "pccs-rs",
-    about = "Rust PCCS — Intel PCCS replacement (RocksDB, Caddy-friendly HTTP)"
+    about = "Rust collateral cache for Intel PCS and AMD KDS (RocksDB, Caddy-friendly HTTP)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -194,6 +202,38 @@ pub struct ServeArgs {
 
     #[arg(long, env = "PCCS_API_KEY")]
     pub api_key: Option<String>,
+
+    /// AMD KDS host. Request paths under `/vcek/` and `/vlek/` are appended.
+    #[arg(long, env = "PCCS_AMD_KDS_URI")]
+    pub amd_kds_uri: Option<String>,
+
+    /// Freshness lifetime for cached AMD VCEKs and certificate chains.
+    #[arg(long, env = "PCCS_AMD_KDS_CACHE_TTL_SECONDS")]
+    pub amd_kds_cache_ttl_seconds: Option<u64>,
+
+    /// NVIDIA RIM host. Request paths under `/v1/rim/` are appended.
+    #[arg(long, env = "PCCS_NVIDIA_RIM_URI")]
+    pub nvidia_rim_uri: Option<String>,
+
+    /// Freshness lifetime for cached NVIDIA RIM documents.
+    #[arg(long, env = "PCCS_NVIDIA_RIM_CACHE_TTL_SECONDS")]
+    pub nvidia_rim_cache_ttl_seconds: Option<u64>,
+
+    /// NVIDIA NRAS host. `POST /nvidia/nras/attest/gpu` is forwarded to `{host}/v3/attest/gpu`.
+    #[arg(long, env = "PCCS_NVIDIA_NRAS_URI")]
+    pub nvidia_nras_uri: Option<String>,
+
+    /// NVIDIA OCSP responder. `POST /ocsp` is forwarded to this host.
+    #[arg(long, env = "PCCS_NVIDIA_OCSP_URI")]
+    pub nvidia_ocsp_uri: Option<String>,
+
+    /// Hard cap on cached NVIDIA OCSP validity (seconds).
+    #[arg(long, env = "PCCS_NVIDIA_OCSP_MAX_TTL_SECONDS")]
+    pub nvidia_ocsp_max_ttl_seconds: Option<u64>,
+
+    /// Fallback OCSP TTL from thisUpdate when nextUpdate is absent (seconds).
+    #[arg(long, env = "PCCS_NVIDIA_OCSP_DEFAULT_TTL_SECONDS")]
+    pub nvidia_ocsp_default_ttl_seconds: Option<u64>,
 
     #[arg(long, env = "PCCS_PROXY")]
     pub proxy: Option<String>,
@@ -325,6 +365,14 @@ struct TomlConfig {
     admin_token_hash: Option<String>,
     uri: Option<String>,
     api_key: Option<String>,
+    amd_kds_uri: Option<String>,
+    amd_kds_cache_ttl_seconds: Option<u64>,
+    nvidia_rim_uri: Option<String>,
+    nvidia_rim_cache_ttl_seconds: Option<u64>,
+    nvidia_nras_uri: Option<String>,
+    nvidia_ocsp_uri: Option<String>,
+    nvidia_ocsp_max_ttl_seconds: Option<u64>,
+    nvidia_ocsp_default_ttl_seconds: Option<u64>,
     proxy: Option<String>,
     refresh_schedule: Option<String>,
     db_path: Option<PathBuf>,
@@ -358,6 +406,14 @@ pub struct Config {
     pub admin_token_hash: String,
     pub uri: String,
     pub api_key: String,
+    pub amd_kds_uri: String,
+    pub amd_kds_cache_ttl_secs: u64,
+    pub nvidia_rim_uri: String,
+    pub nvidia_rim_cache_ttl_secs: u64,
+    pub nvidia_nras_uri: String,
+    pub nvidia_ocsp_uri: String,
+    pub nvidia_ocsp_max_ttl_secs: u64,
+    pub nvidia_ocsp_default_ttl_secs: u64,
     pub proxy: String,
     pub refresh_schedule: String,
     pub db_path: PathBuf,
@@ -405,6 +461,14 @@ impl Default for Config {
             admin_token_hash: String::new(),
             uri: DEFAULT_URI.into(),
             api_key: String::new(),
+            amd_kds_uri: DEFAULT_AMD_KDS_URI.into(),
+            amd_kds_cache_ttl_secs: DEFAULT_AMD_KDS_CACHE_TTL_SECS,
+            nvidia_rim_uri: DEFAULT_NVIDIA_RIM_URI.into(),
+            nvidia_rim_cache_ttl_secs: DEFAULT_NVIDIA_RIM_CACHE_TTL_SECS,
+            nvidia_nras_uri: DEFAULT_NVIDIA_NRAS_URI.into(),
+            nvidia_ocsp_uri: DEFAULT_NVIDIA_OCSP_URI.into(),
+            nvidia_ocsp_max_ttl_secs: DEFAULT_NVIDIA_OCSP_MAX_TTL_SECS,
+            nvidia_ocsp_default_ttl_secs: DEFAULT_NVIDIA_OCSP_DEFAULT_TTL_SECS,
             proxy: String::new(),
             refresh_schedule: DEFAULT_REFRESH.into(),
             db_path: PathBuf::from("pccs-db"),
@@ -436,6 +500,10 @@ impl Config {
         let dir = std::env::temp_dir().join(format!("pccs-rs-test-{}", uuid::Uuid::new_v4()));
         Self {
             uri: String::new(),
+            amd_kds_uri: String::new(),
+            nvidia_rim_uri: String::new(),
+            nvidia_nras_uri: String::new(),
+            nvidia_ocsp_uri: String::new(),
             db_path: dir,
             seed: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/seed.json")),
             no_seed: false,
@@ -604,6 +672,30 @@ fn apply_toml(cfg: &mut Config, file: TomlConfig) {
     if let Some(k) = file.api_key {
         cfg.api_key = k;
     }
+    if let Some(u) = file.amd_kds_uri {
+        cfg.amd_kds_uri = u;
+    }
+    if let Some(n) = file.amd_kds_cache_ttl_seconds {
+        cfg.amd_kds_cache_ttl_secs = n;
+    }
+    if let Some(u) = file.nvidia_rim_uri {
+        cfg.nvidia_rim_uri = u;
+    }
+    if let Some(n) = file.nvidia_rim_cache_ttl_seconds {
+        cfg.nvidia_rim_cache_ttl_secs = n;
+    }
+    if let Some(u) = file.nvidia_nras_uri {
+        cfg.nvidia_nras_uri = u;
+    }
+    if let Some(u) = file.nvidia_ocsp_uri {
+        cfg.nvidia_ocsp_uri = u;
+    }
+    if let Some(n) = file.nvidia_ocsp_max_ttl_seconds {
+        cfg.nvidia_ocsp_max_ttl_secs = n;
+    }
+    if let Some(n) = file.nvidia_ocsp_default_ttl_seconds {
+        cfg.nvidia_ocsp_default_ttl_secs = n;
+    }
     if let Some(p) = file.proxy {
         cfg.proxy = p;
     }
@@ -705,6 +797,30 @@ fn apply_cli(cfg: &mut Config, c: ServeArgs) {
     }
     if let Some(k) = c.api_key {
         cfg.api_key = k;
+    }
+    if let Some(u) = c.amd_kds_uri {
+        cfg.amd_kds_uri = u;
+    }
+    if let Some(n) = c.amd_kds_cache_ttl_seconds {
+        cfg.amd_kds_cache_ttl_secs = n;
+    }
+    if let Some(u) = c.nvidia_rim_uri {
+        cfg.nvidia_rim_uri = u;
+    }
+    if let Some(n) = c.nvidia_rim_cache_ttl_seconds {
+        cfg.nvidia_rim_cache_ttl_secs = n;
+    }
+    if let Some(u) = c.nvidia_nras_uri {
+        cfg.nvidia_nras_uri = u;
+    }
+    if let Some(u) = c.nvidia_ocsp_uri {
+        cfg.nvidia_ocsp_uri = u;
+    }
+    if let Some(n) = c.nvidia_ocsp_max_ttl_seconds {
+        cfg.nvidia_ocsp_max_ttl_secs = n;
+    }
+    if let Some(n) = c.nvidia_ocsp_default_ttl_seconds {
+        cfg.nvidia_ocsp_default_ttl_secs = n;
     }
     if let Some(p) = c.proxy {
         cfg.proxy = p;
@@ -954,8 +1070,18 @@ mod tests {
         assert!(cfg.user_token_hash.is_empty());
         assert!(cfg.admin_token_hash.is_empty());
         assert_eq!(cfg.uri, DEFAULT_URI);
+        assert_eq!(cfg.amd_kds_uri, DEFAULT_AMD_KDS_URI);
+        assert_eq!(cfg.nvidia_rim_uri, DEFAULT_NVIDIA_RIM_URI);
+        assert_eq!(cfg.nvidia_nras_uri, DEFAULT_NVIDIA_NRAS_URI);
+        assert_eq!(cfg.nvidia_ocsp_uri, DEFAULT_NVIDIA_OCSP_URI);
         assert!(is_sha512_hex(DEFAULT_USER_TOKEN_HASH));
-        assert!(is_sha512_hex(Config::test_default().admin_token_hash.as_str()));
+        let test = Config::test_default();
+        assert!(is_sha512_hex(test.admin_token_hash.as_str()));
+        assert!(test.uri.is_empty());
+        assert!(test.amd_kds_uri.is_empty());
+        assert!(test.nvidia_rim_uri.is_empty());
+        assert!(test.nvidia_nras_uri.is_empty());
+        assert!(test.nvidia_ocsp_uri.is_empty());
     }
 
     #[test]
@@ -1030,6 +1156,14 @@ mod tests {
                 host = "0.0.0.0"
                 uri = "https://file.example/sgx/certification/v4/"
                 api_key = "file-key"
+                amd_kds_uri = "https://amd-file.example/vcek/v1"
+                amd_kds_cache_ttl_seconds = 123
+                nvidia_rim_uri = "https://nvidia-file.example/v1/rim"
+                nvidia_rim_cache_ttl_seconds = 321
+                nvidia_nras_uri = "https://nvidia-file.example/nras"
+                nvidia_ocsp_uri = "https://ocsp-file.example"
+                nvidia_ocsp_max_ttl_seconds = 3600
+                nvidia_ocsp_default_ttl_seconds = 600
                 proxy = "http://proxy.example:8080"
                 refresh_schedule = "0 0 2 * * *"
                 user_token_hash = "file-user-hash"
@@ -1057,6 +1191,14 @@ mod tests {
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.uri, "https://file.example/sgx/certification/v4/");
         assert_eq!(cfg.api_key, "file-key");
+        assert_eq!(cfg.amd_kds_uri, "https://amd-file.example/vcek/v1");
+        assert_eq!(cfg.amd_kds_cache_ttl_secs, 123);
+        assert_eq!(cfg.nvidia_rim_uri, "https://nvidia-file.example/v1/rim");
+        assert_eq!(cfg.nvidia_rim_cache_ttl_secs, 321);
+        assert_eq!(cfg.nvidia_nras_uri, "https://nvidia-file.example/nras");
+        assert_eq!(cfg.nvidia_ocsp_uri, "https://ocsp-file.example");
+        assert_eq!(cfg.nvidia_ocsp_max_ttl_secs, 3600);
+        assert_eq!(cfg.nvidia_ocsp_default_ttl_secs, 600);
         assert_eq!(cfg.proxy, "http://proxy.example:8080");
         assert_eq!(cfg.refresh_schedule, "0 0 2 * * *");
         assert_eq!(cfg.user_token_hash, "file-user-hash");
@@ -1095,6 +1237,22 @@ mod tests {
             "https://cli.example/",
             "--api-key",
             "cli-key",
+            "--amd-kds-uri",
+            "https://amd-cli.example/vcek/v1",
+            "--amd-kds-cache-ttl-seconds",
+            "456",
+            "--nvidia-rim-uri",
+            "https://nvidia-cli.example/v1/rim",
+            "--nvidia-rim-cache-ttl-seconds",
+            "654",
+            "--nvidia-nras-uri",
+            "https://nvidia-cli.example/nras",
+            "--nvidia-ocsp-uri",
+            "https://ocsp-cli.example",
+            "--nvidia-ocsp-max-ttl-seconds",
+            "120",
+            "--nvidia-ocsp-default-ttl-seconds",
+            "30",
             "--proxy",
             "http://cli-proxy:1",
             "--refresh-schedule",
@@ -1133,6 +1291,14 @@ mod tests {
         assert_eq!(cfg.admin_token_hash, "cli-admin");
         assert_eq!(cfg.uri, "https://cli.example/");
         assert_eq!(cfg.api_key, "cli-key");
+        assert_eq!(cfg.amd_kds_uri, "https://amd-cli.example/vcek/v1");
+        assert_eq!(cfg.amd_kds_cache_ttl_secs, 456);
+        assert_eq!(cfg.nvidia_rim_uri, "https://nvidia-cli.example/v1/rim");
+        assert_eq!(cfg.nvidia_rim_cache_ttl_secs, 654);
+        assert_eq!(cfg.nvidia_nras_uri, "https://nvidia-cli.example/nras");
+        assert_eq!(cfg.nvidia_ocsp_uri, "https://ocsp-cli.example");
+        assert_eq!(cfg.nvidia_ocsp_max_ttl_secs, 120);
+        assert_eq!(cfg.nvidia_ocsp_default_ttl_secs, 30);
         assert_eq!(cfg.proxy, "http://cli-proxy:1");
         assert_eq!(cfg.refresh_schedule, "0 0 3 * * *");
         assert_eq!(cfg.db_path, PathBuf::from("/tmp/cli-db"));
