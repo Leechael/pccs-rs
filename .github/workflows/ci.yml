@@ -31,23 +31,25 @@ jobs:
         run: cargo test --all-targets
 
   version-check:
-    name: binary --version matches Cargo.toml
+    name: Cargo.toml version is not behind latest tag
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build pccs-rs binary
-        run: cargo build --bin pccs-rs
-      - name: Verify --version matches Cargo.toml
+        with:
+          fetch-depth: 0
+      - name: Verify Cargo.toml >= latest v* tag
         shell: bash
         run: |
           set -euo pipefail
-          expected=$(grep '^version =' Cargo.toml | head -n1 | sed 's/.*"\([^"]*\)".*/\1/')
-          actual=$(./target/debug/pccs-rs --version | awk '{print $2}')
-          echo "Cargo.toml version: $expected"
-          echo "binary --version:   $actual"
-          if [ "$expected" != "$actual" ]; then
-            echo "ERROR: binary --version ($actual) does not match Cargo.toml ($expected)" >&2
+          latest=$(git tag -l 'v*' --sort=-v:refname | head -n1 | sed 's/^v//')
+          current=$(grep '^version =' Cargo.toml | head -n1 | sed 's/.*"\([^"]*\)".*/\1/')
+          echo "latest tag:    ${latest:-<none>}"
+          echo "Cargo.toml:    $current"
+          if [ -z "$latest" ]; then
+            echo "no existing v* tags; skipping comparison"
+            exit 0
+          fi
+          if [ "$(printf '%s\n%s\n' "$latest" "$current" | sort -V | head -n1)" != "$latest" ]; then
+            echo "ERROR: Cargo.toml version $current is behind latest tag v$latest" >&2
             exit 1
           fi
