@@ -1,6 +1,6 @@
 [package]
 name = "pccs-rs"
-version = "0.3.1"
+version = "0.4.2"
 edition = "2021"
 description = "Rust collateral cache for Intel PCS and AMD KDS, backed by RocksDB"
 license = "Apache-2.0"

@@ -4,7 +4,8 @@ name: Release
 # https://github.com/Phala-Network/phala-cloud-gin-starter/.github/workflows/release.yml
 # workflow_dispatch: pick patch/minor/major and an optional ref (default main).
 # issue_comment: on an open same-repo PR, a repo owner/member/collaborator can
-# comment `!release patch|minor|major` to tag that PR head and publish.
+# comment `!release patch|minor|major` to bump that PR branch, tag and publish.
+# Tags point to a version-bump commit, whose parent is the selected ref.
 on:
   workflow_dispatch:
     inputs:
@@ -17,7 +18,7 @@ on:
           - minor
           - major
       ref:
-        description: git ref/branch/sha to release from (optional)
+        description: branch, or ref/SHA at a unique branch tip (default main)
         required: false
         default: main
         type: string
@@ -39,6 +40,7 @@ jobs:
       should_release: ${{ steps.parse.outputs.should_release }}
       bump: ${{ steps.parse.outputs.bump }}
       target_sha: ${{ steps.parse.outputs.target_sha }}
+      branch: ${{ steps.parse.outputs.branch }}
       source: ${{ steps.parse.outputs.source }}
       repo_lower: ${{ steps.parse.outputs.repo_lower }}
     steps:
@@ -51,12 +53,26 @@ jobs:
             let shouldRelease = false
             let bump = ''
             let targetSha = ''
+            let branch = ''
             let source = eventName
 
             if (eventName === 'workflow_dispatch') {
               shouldRelease = true
               bump = (context.payload.inputs?.bump || '').toLowerCase()
-              targetSha = context.payload.inputs?.ref || context.ref.replace('refs/heads/', '')
+              const ref = context.payload.inputs?.ref || 'main'
+              targetSha = ref
+              try {
+                const result = await github.rest.repos.getBranch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  branch: ref.replace(/^refs\/heads\//, ''),
+                })
+                branch = result.data.name
+                targetSha = result.data.commit.sha
+              } catch (error) {
+                if (error.status !== 404) throw error
+                // A tag or SHA must resolve to exactly one branch tip at checkout.
+              }
             }
 
             if (eventName === 'issue_comment') {
@@ -88,6 +104,7 @@ jobs:
                   shouldRelease = true
                   bump = match[1].toLowerCase()
                   targetSha = pr.data.head.sha
+                  branch = pr.data.head.ref
                   source = `pr#${prNumber}`
                 }
               }
@@ -96,6 +113,7 @@ jobs:
             core.setOutput('should_release', shouldRelease ? 'true' : 'false')
             core.setOutput('bump', bump)
             core.setOutput('target_sha', targetSha)
+            core.setOutput('branch', branch)
             core.setOutput('source', source)
             core.setOutput('repo_lower', `${context.repo.owner.toLowerCase()}/${context.repo.repo.toLowerCase()}`)
 
@@ -124,6 +142,30 @@ jobs:
 
       - name: fetch tags
         run: git fetch --tags --force
+
+      # Resolve BEFORE creating the bump commit. A new commit is not contained
+      # in any remote branch yet. Refuse ambiguous SHA/tag inputs rather than
+      # choosing an arbitrary branch or creating a new one.
+      - name: resolve release branch
+        id: branch
+        shell: bash
+        env:
+          RELEASE_BRANCH: ${{ needs.prepare.outputs.branch }}
+        run: |
+          set -euo pipefail
+          branch="$RELEASE_BRANCH"
+          if [ -z "$branch" ]; then
+            mapfile -t candidates < <(git for-each-ref --points-at HEAD \
+              --format='%(refname:strip=3)' refs/remotes/origin | grep -v '^HEAD$')
+            if [ "${#candidates[@]}" -ne 1 ]; then
+              echo "ref/SHA must identify exactly one branch tip; supply a branch name" >&2
+              exit 1
+            fi
+            branch="${candidates[0]}"
+          fi
+          git check-ref-format "refs/heads/$branch"
+          git show-ref --verify "refs/remotes/origin/$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
       - name: compute next version
         id: version
@@ -187,13 +229,36 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # The released binaries read their version from CARGO_PKG_VERSION, which
+      # comes from Cargo.toml. Make the tagged commit carry the matching
+      # version so image, .deb and local builds all agree.
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: bump Cargo.toml version
+        shell: bash
+        env:
+          RELEASE_BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          semver="${version#v}"
+          sed -i "s/^version = \".*\"/version = \"$semver\"/" Cargo.toml
+          cargo update -p pccs-rs
+          cargo metadata --locked --format-version 1 >/dev/null
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): bump version to $version"
+          # An explicit destination works on detached HEAD. Never force-push:
+          # if the branch advanced, fail here and do not create/push the tag.
+          git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+
       - name: create and push tag
         shell: bash
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$version" -m "release $version"
           git push origin "$version"
 
@@ -237,6 +302,17 @@ jobs:
               . "$HOME/.cargo/env"
               cargo build --release --locked --bin pccs-rs --target x86_64-unknown-linux-gnu
             '
+      - name: Verify release binary version
+        run: |
+          set -euo pipefail
+          expected="${{ needs.create-tag.outputs.version }}"
+          expected="${expected#v}"
+          actual=$(./target/x86_64-unknown-linux-gnu/release/pccs-rs --version)
+          echo "expected=pccs-rs $expected actual=$actual"
+          if [ "pccs-rs $expected" != "$actual" ]; then
+            echo "ERROR: release binary --version ($actual) does not match tag ($expected)" >&2
+            exit 1
+          fi
       - name: Package tarball and deb
         run: |
           mkdir -p dist
@@ -250,6 +326,19 @@ jobs:
             --binary target/x86_64-unknown-linux-gnu/release/pccs-rs \
             --output dist
           (cd dist && sha256sum "pccs-rs_${VERSION}_amd64.deb" > "pccs-rs_${VERSION}_amd64.deb.sha256")
+      - name: Verify deb metadata and packaged binary version
+        run: |
+          set -euo pipefail
+          expected="${{ needs.create-tag.outputs.version }}"
+          expected="${expected#v}"
+          deb="dist/pccs-rs_${expected}_amd64.deb"
+          test "$(dpkg-deb --field "$deb" Version)" = "$expected"
+          extracted=$(mktemp -d)
+          trap 'rm -rf "$extracted"' EXIT
+          dpkg-deb --extract "$deb" "$extracted"
+          actual=$("$extracted/usr/bin/pccs-rs" --version)
+          echo "expected=pccs-rs $expected actual=$actual"
+          test "$actual" = "pccs-rs $expected"
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -351,3 +440,17 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Verify GHCR image version
+        if: steps.build1.outcome == 'success' || steps.build2.outcome == 'success' || steps.build3.outcome == 'success'
+        run: |
+          set -euo pipefail
+          expected="${{ needs.create-tag.outputs.version }}"
+          expected="${expected#v}"
+          image="ghcr.io/${{ needs.prepare.outputs.repo_lower }}:$expected"
+          docker pull "$image"
+          actual=$(docker run --rm --platform linux/amd64 "$image" --version)
+          echo "expected=pccs-rs $expected actual=$actual"
+          if [ "pccs-rs $expected" != "$actual" ]; then
+            echo "ERROR: image --version ($actual) does not match tag ($expected)" >&2
+            exit 1
+          fi

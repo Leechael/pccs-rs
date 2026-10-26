@@ -29,3 +29,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --all-targets
+
+  version-check:
+    name: Cargo.toml version is not behind latest tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify Cargo.toml >= latest v* tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest=$(git tag -l 'v*' --sort=-v:refname | head -n1 | sed 's/^v//')
+          current=$(grep '^version =' Cargo.toml | head -n1 | sed 's/.*"\([^"]*\)".*/\1/')
+          echo "latest tag:    ${latest:-<none>}"
+          echo "Cargo.toml:    $current"
+          if [ -z "$latest" ]; then
+            echo "no existing v* tags; skipping comparison"
+            exit 0
+          fi
+          if [ "$(printf '%s\n%s\n' "$latest" "$current" | sort -V | head -n1)" != "$latest" ]; then
+            echo "ERROR: Cargo.toml version $current is behind latest tag v$latest" >&2
+            exit 1
+          fi
