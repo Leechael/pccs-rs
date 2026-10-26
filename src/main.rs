@@ -88,6 +88,13 @@ async fn run(cfg: Config) {
     warn_on_self_upstream(&cfg, addr);
 
     let state = app_state(cfg.clone());
+    let metrics_listener =
+        start_metrics_listener(cfg.metrics_listen, state.cache.store.metrics.clone())
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("metrics listener: {e}");
+                std::process::exit(1);
+            });
     let scheduler = spawn_refresh_scheduler(state.cache.clone(), cfg.refresh_schedule.clone());
     // No handler-cancelling timeout layer here. Node's `server.requestTimeout`
     // bounds only *receiving* the request, never producing the response; a
@@ -144,7 +151,53 @@ async fn run(cfg: Config) {
 
     // Let RocksDB close before the process exits.
     scheduler.abort();
+    if let Some(listener) = metrics_listener {
+        listener.stop().await;
+    }
     drop(state);
+}
+
+struct MetricsListener {
+    addr: SocketAddr,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MetricsListener {
+    async fn stop(mut self) {
+        tracing::debug!("stopping metrics listener {}", self.addr);
+        let _ = self.shutdown.send(());
+        if tokio::time::timeout(SHUTDOWN_GRACE, &mut self.task).await.is_err() {
+            self.task.abort();
+        }
+    }
+}
+
+/// Bind before starting the task, so an invalid or occupied address is fatal
+/// rather than silently leaving an advertised metrics endpoint unavailable.
+async fn start_metrics_listener(
+    addr: Option<SocketAddr>,
+    metrics: Arc<pccs_rs::metrics::Metrics>,
+) -> std::io::Result<Option<MetricsListener>> {
+    let Some(addr) = addr else { return Ok(None) };
+    if !addr.ip().is_loopback() {
+        tracing::warn!("metrics listener {addr} is not loopback; metrics have no authentication");
+    }
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
+    tracing::info!("metrics listener running on http://{addr}/metrics");
+    let (shutdown, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, metrics.router())
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+        {
+            tracing::error!("metrics listener: {e}");
+        }
+    });
+    Ok(Some(MetricsListener { addr, shutdown, task }))
 }
 
 /// The TLS path goes through `axum_server`, which owns its accept loop; this
@@ -325,6 +378,48 @@ mod tests {
 
     fn logs_contain(buf: &std::sync::Mutex<Vec<u8>>, needle: &str) -> bool {
         String::from_utf8_lossy(&buf.lock().unwrap()).contains(needle)
+    }
+
+    #[tokio::test]
+    async fn metrics_listener_is_disabled_by_default_and_separate_when_enabled() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let metrics = Arc::new(pccs_rs::metrics::Metrics::new());
+        assert!(start_metrics_listener(Config::default().metrics_listen, metrics.clone())
+            .await
+            .unwrap()
+            .is_none());
+        let listener = start_metrics_listener(Some("127.0.0.1:0".parse().unwrap()), metrics)
+            .await
+            .unwrap()
+            .unwrap();
+        let addr = listener.addr;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("text/plain; version=0.0.4"));
+        assert!(response.contains("pccs_build_info"));
+        listener.stop().await;
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn metrics_nonloopback_warns_but_binds_and_bind_errors_propagate() {
+        let logs = captured_logs();
+        let needle = "is not loopback; metrics have no authentication";
+        let before = log_count(&logs, needle);
+        let metrics = Arc::new(pccs_rs::metrics::Metrics::new());
+        let listener = start_metrics_listener(Some("0.0.0.0:0".parse().unwrap()), metrics.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(log_count(&logs, needle), before + 1);
+        assert!(start_metrics_listener(Some(listener.addr), metrics).await.is_err());
+        listener.stop().await;
     }
 
     #[test]

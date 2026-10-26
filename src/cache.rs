@@ -3,10 +3,12 @@
 use crate::config::{CacheMode, Config};
 use crate::error::{self, PccsError};
 use crate::keys;
+use crate::metrics::{CacheResult, Kind, Upstream};
 use crate::pcs::{PckCertsResponse, PcsClient};
 use crate::store::{
-    AmdKdsRecord, IdentityRecord, NvidiaOcspRecord, PckCertRecord, PckCrlRecord, PlatformCert,
-    PlatformCredentials, PlatformPool, PlatformPublication, RegisteredPlatform, Store, TcbRecord,
+    identity_kind, tcb_kind, AmdKdsRecord, IdentityRecord, NvidiaOcspRecord, PckCertRecord,
+    PckCrlRecord, PlatformCert, PlatformCredentials, PlatformPool, PlatformPublication,
+    RegisteredPlatform, Store, TcbRecord,
 };
 use crate::validate::UpdateType;
 use std::collections::HashMap;
@@ -81,6 +83,21 @@ pub struct Cache {
 }
 
 type RefreshWatch = watch::Receiver<Option<Result<(), PccsError>>>;
+
+/// An attempted refresh is successful only after validation and publication.
+/// Early returns (including tolerated errors and skipped uncacheable bodies)
+/// retain the error outcome without changing the service's return behavior.
+struct RefreshItem<'a> {
+    metrics: &'a crate::metrics::Metrics,
+    kind: Kind,
+    success: bool,
+}
+
+impl Drop for RefreshItem<'_> {
+    fn drop(&mut self) {
+        self.metrics.refresh_item(self.kind, self.success);
+    }
+}
 
 /// How long a failed upstream fetch suppresses a retry by the requests already
 /// queued behind it. Short on purpose — this is stampede control, not caching.
@@ -266,7 +283,8 @@ fn canonicalize_nvidia_rim(path_and_query: &str) -> Result<String, PccsError> {
 }
 
 impl Cache {
-    pub fn new(mut store: Store, pcs: PcsClient, cfg: &Config) -> Self {
+    pub fn new(mut store: Store, mut pcs: PcsClient, cfg: &Config) -> Self {
+        pcs.metrics = store.metrics.clone();
         store.set_readthrough_max_entries(
             usize::try_from(cfg.readthrough_max_entries_per_kind).unwrap_or(usize::MAX),
         );
@@ -313,7 +331,8 @@ impl Cache {
     /// dead upstream turns a burst of requests into a burst of upstream calls
     /// (and a burst of `FAILURE_TTL`-long stalls). The window is deliberately
     /// short: it suppresses the stampede, it does not cache the error.
-    async fn key_lock(&self, key: &str) -> Result<OwnedMutexGuard<()>, PccsError> {
+    async fn key_lock(&self, kind: Kind, key: &str) -> Result<OwnedMutexGuard<()>, PccsError> {
+        let start = std::time::Instant::now();
         let lock = {
             let mut map = self.inflight.lock().await;
             if map.len() > 1024 {
@@ -329,8 +348,9 @@ impl Cache {
             }
         };
         let guard = lock.lock_owned().await;
+        self.store.metrics.singleflight_wait(kind, start.elapsed());
         // Checked *after* acquiring, so it reflects the fetch we waited on.
-        if let Some(e) = self.recent_failure(key).await {
+        if let Some(e) = self.recent_failure(kind, key).await {
             tracing::debug!("reusing recent upstream failure for {key}");
             return Err(e);
         }
@@ -338,16 +358,22 @@ impl Cache {
     }
 
     /// The error a sibling just got for this key, if it is still fresh.
-    async fn recent_failure(&self, key: &str) -> Option<PccsError> {
+    async fn recent_failure(&self, kind: Kind, key: &str) -> Option<PccsError> {
         match self.recent_outcome(key).await {
-            Some(RecentOutcome::Err(e)) => Some(e),
+            Some(RecentOutcome::Err(e)) => {
+                self.store.record_lookup(kind, CacheResult::RecentFailure);
+                Some(e)
+            }
             _ => None,
         }
     }
 
-    async fn recent_non200(&self, key: &str) -> Option<AmdKdsResponse> {
+    async fn recent_non200(&self, kind: Kind, key: &str) -> Option<AmdKdsResponse> {
         match self.recent_outcome(key).await {
-            Some(RecentOutcome::Response(r)) => Some(r),
+            Some(RecentOutcome::Response(r)) => {
+                self.store.record_lookup(kind, CacheResult::RecentNon200);
+                Some(r)
+            }
             _ => None,
         }
     }
@@ -408,7 +434,8 @@ impl Cache {
         self.get_cached_url(
             url,
             self.amd_kds_cache_ttl_secs,
-            "amd kds",
+            Kind::AmdKds,
+            Upstream::AmdKds,
             keys::amd_kds,
             error::AMD_KDS_ACCESS_FAILURE,
             Store::get_amd_kds,
@@ -423,7 +450,8 @@ impl Cache {
         self.get_cached_url(
             url,
             self.nvidia_rim_cache_ttl_secs,
-            "nvidia rim",
+            Kind::NvidiaRim,
+            Upstream::NvidiaRim,
             keys::nvidia_rim,
             error::NVIDIA_RIM_ACCESS_FAILURE,
             Store::get_nvidia_rim,
@@ -446,7 +474,6 @@ impl Cache {
         }
         let url = format!("{}/v3/attest/gpu", self.nvidia_nras_uri);
         let payload = serde_json::to_vec(body).map_err(|_| error::INVALID_REQ)?;
-        self.store.record_upstream();
         let (status, hdrs, body) = self
             .pcs
             .post_json_once(&url, &payload)
@@ -477,9 +504,10 @@ impl Cache {
         let cache_key = request.cache_key;
         let store_key = keys::nvidia_ocsp(&cache_key);
         let now = unix_time();
+        let mut outcome = CacheResult::Miss;
         if let Some(rec) = self.store.get_nvidia_ocsp(&cache_key) {
             if rec.expires_at > now {
-                self.store.record_hit();
+                self.store.record_hit(Kind::NvidiaOcsp);
                 tracing::debug!("cache hit nvidia ocsp");
                 return Ok(AmdKdsResponse {
                     status: 200,
@@ -489,19 +517,20 @@ impl Cache {
                     retry_after: None,
                 });
             }
+            outcome = CacheResult::Expired;
             // LAZY drops it under the key lock instead.
             if self.mode != CacheMode::Lazy {
                 self.drop_expired(&store_key);
             }
         }
-        self.store.record_miss();
+        self.store.record_lookup(Kind::NvidiaOcsp, outcome);
         tracing::info!("cache miss nvidia ocsp key={cache_key}");
         if self.mode != CacheMode::Lazy {
             return Err(error::NO_CACHE_DATA);
         }
 
-        let _guard = self.key_lock(&store_key).await?;
-        if let Some(rec) = self.recent_non200(&store_key).await {
+        let _guard = self.key_lock(Kind::NvidiaOcsp, &store_key).await?;
+        if let Some(rec) = self.recent_non200(Kind::NvidiaOcsp, &store_key).await {
             return Ok(rec);
         }
         let now = unix_time();
@@ -518,7 +547,6 @@ impl Cache {
             self.drop_expired(&store_key);
         }
 
-        self.store.record_upstream();
         let resp = self.note(&store_key, self.post_nvidia_ocsp(body).await).await?;
         if resp.status != 200 {
             self.remember(&store_key, RecentOutcome::Response(resp.clone())).await;
@@ -582,7 +610,8 @@ impl Cache {
         &self,
         url: String,
         ttl: u64,
-        kind: &'static str,
+        kind: Kind,
+        upstream: Upstream,
         key_for: fn(&str) -> String,
         access_failure: PccsError,
         load: fn(&Store, &str) -> Option<AmdKdsRecord>,
@@ -590,27 +619,31 @@ impl Cache {
     ) -> Result<AmdKdsResponse, PccsError> {
         let key = key_for(&url);
         let now = unix_time();
+        let mut outcome = CacheResult::Miss;
         if let Some(rec) = load(&self.store, &url) {
             // deferred: stale-if-error for AMD/NVIDIA | impact: after TTL expiry a throttled upstream turns every request into 502 while a copy exists on disk | trigger: user decision
             if now.saturating_sub(rec.fetched_at) < ttl {
-                self.store.record_hit();
-                tracing::debug!("cache hit {kind}");
+                self.store.record_hit(kind);
+                tracing::debug!(kind = kind.as_str(), "cache hit");
                 return Ok(rec.into());
             }
+            outcome = CacheResult::Expired;
             // LAZY drops it under the key lock instead, so a concurrent fill
             // that just replaced it is never deleted.
             if self.mode != CacheMode::Lazy {
                 self.drop_expired(&key);
             }
         }
-        self.store.record_miss();
-        tracing::info!("cache miss {kind} url={url}");
+        // Expiry is exclusive with a cold miss; the locked re-read below
+        // records neither a second miss nor a hit for the same lookup.
+        self.store.record_lookup(kind, outcome);
+        tracing::info!(kind = kind.as_str(), "cache miss url={url}");
         if self.mode != CacheMode::Lazy {
             return Err(error::NO_CACHE_DATA);
         }
 
-        let _guard = self.key_lock(&key).await?;
-        if let Some(rec) = self.recent_non200(&key).await {
+        let _guard = self.key_lock(kind, &key).await?;
+        if let Some(rec) = self.recent_non200(kind, &key).await {
             return Ok(rec);
         }
         let now = unix_time();
@@ -622,8 +655,8 @@ impl Cache {
             self.drop_expired(&key);
         }
 
-        self.store.record_upstream();
-        let fetched = self.pcs.get_url(&url).await.map_err(|_| access_failure.clone());
+        let fetched =
+            self.pcs.get_url_for(upstream, &url).await.map_err(|_| access_failure.clone());
         let (status, headers, body) = self.note(&key, fetched).await?;
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
@@ -697,12 +730,12 @@ impl Cache {
         let known_platform = self.store.has_platform(qeid, pceid);
         if known_platform {
             if let Some(rec) = self.store.get_pckcert(qeid, cpusvn, pcesvn, pceid) {
-                self.store.record_hit();
+                self.store.record_hit(Kind::Pckcert);
                 tracing::debug!("cache hit pckcert");
                 return Ok(rec);
             }
         }
-        self.store.record_miss();
+        self.store.record_miss(Kind::Pckcert);
         tracing::info!("cache miss pckcert qeid={qeid} pceid={pceid}");
 
         // Try local selection BEFORE upstream single-flight/negative-cache
@@ -724,14 +757,17 @@ impl Cache {
             match self.store.select_platform_cert(qeid, pceid, true, |pool| {
                 self.select_from_pool(pool, cpusvn, pcesvn, pceid)
             }) {
-                Ok(rec) => return Ok(rec),
+                Ok(rec) => {
+                    self.store.record_lookup(Kind::Pckcert, CacheResult::LocalSelect);
+                    return Ok(rec);
+                }
                 Err(e) if self.is_intel || self.mode != CacheMode::Lazy => return Err(e),
                 Err(_) => {}
             }
         }
 
         let key = keys::pckcert(qeid, pceid, cpusvn, pcesvn);
-        let _guard = self.key_lock(&key).await?;
+        let _guard = self.key_lock(Kind::Pckcert, &key).await?;
         if let Some(rec) = self.store.get_pckcert(qeid, cpusvn, pcesvn, pceid) {
             return Ok(rec);
         }
@@ -745,9 +781,13 @@ impl Cache {
                 // A platform may have been registered while waiting for this
                 // raw key. Intel still must not refill a known platform.
                 if self.is_intel && expected.is_some() {
-                    return self.store.select_platform_cert(qeid, pceid, true, |pool| {
+                    let selected = self.store.select_platform_cert(qeid, pceid, true, |pool| {
                         self.select_from_pool(pool, cpusvn, pcesvn, pceid)
                     });
+                    if selected.is_ok() {
+                        self.store.record_lookup(Kind::Pckcert, CacheResult::LocalSelect);
+                    }
+                    return selected;
                 }
                 // PCCS GET is a proxy protocol, not Intel enrollment: forward
                 // only the caller's optional PPID, never saved credentials.
@@ -912,7 +952,8 @@ impl Cache {
         // Single-flight per platform through the existing per-key lock, with
         // the throttle check inside it so queued requests do not each fetch.
         let platform = platform_key(&pool.qe_id, &pool.pce_id);
-        let _guard = self.key_lock(&format!("pool-refetch/{platform}")).await.ok()?;
+        let _guard =
+            self.key_lock(Kind::Pckcert, &format!("pool-refetch/{platform}")).await.ok()?;
         // Re-read under the lock: a concurrent fill or registration may have
         // published the level, replaced the pool, or changed the credential.
         let pool = self.store.get_platform_pool(qeid, pceid)?;
@@ -924,7 +965,6 @@ impl Cache {
             return None;
         }
         self.mark_refetch(&platform).await;
-        self.store.record_upstream();
         let context = PckFetchContext {
             enc_ppid: &pool.enc_ppid,
             platform_manifest: &pool.platform_manifest,
@@ -978,8 +1018,6 @@ impl Cache {
             tracing::error!("Missing encrypted ppid or platform manifest.");
             return Err(error::INVALID_REQ);
         }
-        self.store.record_upstream();
-
         // A PCCS upstream without a platform manifest serves a single cert.
         if !self.is_intel && platform_manifest.is_empty() {
             let rec = self
@@ -1195,11 +1233,12 @@ impl Cache {
         version: u32,
         update: UpdateType,
     ) -> Result<TcbRecord, PccsError> {
+        let kind = tcb_kind(prod_type);
         if let Some(rec) = self.store.get_tcb(prod_type, fmspc, version, update) {
-            self.store.record_hit();
+            self.store.record_hit(kind);
             return Ok(rec);
         }
-        self.store.record_miss();
+        self.store.record_miss(kind);
         if self.mode != CacheMode::Lazy {
             return Err(self.miss_v3(version));
         }
@@ -1210,11 +1249,10 @@ impl Cache {
             return Err(error::NO_CACHE_DATA);
         }
         let key = keys::tcb(keys::prod_name(prod_type), version, fmspc, update.as_str());
-        let _guard = self.key_lock(&key).await?;
+        let _guard = self.key_lock(kind, &key).await?;
         if let Some(rec) = self.store.get_tcb(prod_type, fmspc, version, update) {
             return Ok(rec);
         }
-        self.store.record_upstream();
         let rec =
             self.note(&key, self.pcs.fetch_tcb(prod_type, fmspc, version, update).await).await?;
         if Self::cacheable(crate::headers::tcb_issuer_chain_name(version), &rec.issuer_chain) {
@@ -1229,11 +1267,12 @@ impl Cache {
         version: u32,
         update: UpdateType,
     ) -> Result<IdentityRecord, PccsError> {
+        let kind = identity_kind(enclave_id);
         if let Some(rec) = self.store.get_identity(enclave_id, version, update) {
-            self.store.record_hit();
+            self.store.record_hit(kind);
             return Ok(rec);
         }
-        self.store.record_miss();
+        self.store.record_miss(kind);
         if self.mode != CacheMode::Lazy {
             return Err(self.miss_v3(version));
         }
@@ -1244,11 +1283,10 @@ impl Cache {
             return Err(error::NO_CACHE_DATA);
         }
         let key = keys::identity(keys::identity_name(enclave_id), version, update.as_str());
-        let _guard = self.key_lock(&key).await?;
+        let _guard = self.key_lock(kind, &key).await?;
         if let Some(rec) = self.store.get_identity(enclave_id, version, update) {
             return Ok(rec);
         }
-        self.store.record_upstream();
         let rec =
             self.note(&key, self.pcs.fetch_identity(enclave_id, version, update).await).await?;
         if Self::cacheable(crate::headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN, &rec.issuer_chain) {
@@ -1259,10 +1297,10 @@ impl Cache {
 
     pub async fn get_pckcrl(&self, ca: &str, version: u32) -> Result<PckCrlRecord, PccsError> {
         if let Some(rec) = self.store.get_pckcrl(ca) {
-            self.store.record_hit();
+            self.store.record_hit(Kind::Pckcrl);
             return Ok(rec);
         }
-        self.store.record_miss();
+        self.store.record_miss(Kind::Pckcrl);
         if self.mode != CacheMode::Lazy {
             return Err(self.miss_v3(version));
         }
@@ -1273,11 +1311,10 @@ impl Cache {
             return Err(error::NO_CACHE_DATA);
         }
         let key = keys::pckcrl(ca);
-        let _guard = self.key_lock(&key).await?;
+        let _guard = self.key_lock(Kind::Pckcrl, &key).await?;
         if let Some(rec) = self.store.get_pckcrl(ca) {
             return Ok(rec);
         }
-        self.store.record_upstream();
         let rec = self.note(&key, self.pcs.fetch_pckcrl(ca).await).await?;
         if Self::cacheable(crate::headers::SGX_PCK_CRL_ISSUER_CHAIN, &rec.issuer_chain) {
             self.store.put_pckcrl(&rec)?;
@@ -1287,10 +1324,10 @@ impl Cache {
 
     pub async fn get_rootcacrl(&self, version: u32) -> Result<Vec<u8>, PccsError> {
         if let Some(rec) = self.store.get_rootcacrl() {
-            self.store.record_hit();
+            self.store.record_hit(Kind::Rootcacrl);
             return Ok(rec);
         }
-        self.store.record_miss();
+        self.store.record_miss(Kind::Rootcacrl);
         if self.mode != CacheMode::Lazy {
             return Err(self.miss_v3(version));
         }
@@ -1301,11 +1338,10 @@ impl Cache {
             return Err(error::NO_CACHE_DATA);
         }
         let key = keys::rootcacrl();
-        let _guard = self.key_lock(&key).await?;
+        let _guard = self.key_lock(Kind::Rootcacrl, &key).await?;
         if let Some(rec) = self.store.get_rootcacrl() {
             return Ok(rec);
         }
-        self.store.record_upstream();
         let rec = self.note(&key, self.pcs.fetch_rootcacrl().await).await?;
         self.store.put_rootcacrl(&rec)?;
         Ok(rec)
@@ -1313,10 +1349,10 @@ impl Cache {
 
     pub async fn get_crl(&self, uri: &str, version: u32) -> Result<Vec<u8>, PccsError> {
         if let Some(rec) = self.store.get_crl(uri) {
-            self.store.record_hit();
+            self.store.record_hit(Kind::Crl);
             return Ok(rec);
         }
-        self.store.record_miss();
+        self.store.record_miss(Kind::Crl);
         if self.mode != CacheMode::Lazy {
             return Err(self.miss_v3(version));
         }
@@ -1324,11 +1360,10 @@ impl Cache {
             return Err(error::NO_CACHE_DATA);
         }
         let key = keys::crl(uri);
-        let _guard = self.key_lock(&key).await?;
+        let _guard = self.key_lock(Kind::Crl, &key).await?;
         if let Some(rec) = self.store.get_crl(uri) {
             return Ok(rec);
         }
-        self.store.record_upstream();
         let rec = self.note(&key, self.pcs.fetch_crl(uri).await).await?;
         self.store.put_crl(uri, &rec)?;
         Ok(rec)
@@ -1508,14 +1543,20 @@ impl Cache {
 
             // Different targets still run one at a time.
             let _guard = self.refresh_lock.lock().await;
+            let start = std::time::Instant::now();
             let result = match &certs_fmspc {
                 Some(f) => self.refresh_certs(f).await,
                 None => self.refresh_collateral().await,
             };
+            self.store.metrics.refresh_run(result.is_ok(), start.elapsed());
             let _ = tx.send(Some(result.clone()));
             self.refresh_inflight.lock().await.remove(&target);
             return result;
         }
+    }
+
+    fn refresh_item(&self, kind: Kind) -> RefreshItem<'_> {
+        RefreshItem { metrics: &self.store.metrics, kind, success: false }
     }
 
     async fn refresh_collateral(self: &Arc<Self>) -> Result<(), PccsError> {
@@ -1524,12 +1565,14 @@ impl Cache {
         }
         // Node `refreshPckCrls`: a failed CRL refresh is a 503.
         for rec in self.blocking(|c| c.store.list_pckcrls()).await? {
+            let mut item = self.refresh_item(Kind::Pckcrl);
             let fresh = self.pcs.fetch_pckcrl(&rec.ca).await.map_err(|e| {
                 tracing::error!("Failed to refresh PCK CRL for {}: {e}", rec.ca);
                 error::SERVICE_UNAVAILABLE
             })?;
             if Self::cacheable(crate::headers::SGX_PCK_CRL_ISSUER_CHAIN, &fresh.issuer_chain) {
                 self.store.put_pckcrl(&fresh)?;
+                item.success = true;
             }
         }
 
@@ -1543,6 +1586,7 @@ impl Cache {
             } else {
                 UpdateType::Standard
             };
+            let mut item = self.refresh_item(tcb_kind(rec.prod_type));
             let fresh =
                 self.pcs.fetch_tcb(rec.prod_type, &rec.fmspc, rec.version, upd).await.map_err(
                     |e| {
@@ -1555,6 +1599,7 @@ impl Cache {
                 &fresh.issuer_chain,
             ) {
                 self.store.put_tcb(&fresh)?;
+                item.success = true;
             }
         }
 
@@ -1563,6 +1608,7 @@ impl Cache {
         if self.pcs_version >= 4 {
             for id in [1u8, 2, 3] {
                 for upd in [UpdateType::Standard, UpdateType::Early] {
+                    let mut item = self.refresh_item(identity_kind(id));
                     match self.pcs.fetch_identity(id, 4, upd).await {
                         Ok(fresh) => {
                             if Self::cacheable(
@@ -1570,6 +1616,7 @@ impl Cache {
                                 &fresh.issuer_chain,
                             ) {
                                 self.store.put_identity(&fresh)?;
+                                item.success = true;
                             }
                         }
                         Err(e) => tracing::debug!(
@@ -1584,14 +1631,19 @@ impl Cache {
         // have no separate root-cert row, so the equivalent condition is
         // "the root CA CRL is cached but can no longer be refreshed".
         let had_rootcacrl = self.store.get_rootcacrl().is_some();
+        let mut item = self.refresh_item(Kind::Rootcacrl);
         match self.pcs.fetch_rootcacrl().await {
-            Ok(fresh) => self.store.put_rootcacrl(&fresh)?,
+            Ok(fresh) => {
+                self.store.put_rootcacrl(&fresh)?;
+                item.success = true;
+            }
             Err(e) if had_rootcacrl => {
                 tracing::error!("Failed to refresh the root CA CRL: {e}");
                 return Err(error::INTERNAL_ERROR);
             }
             Err(e) => tracing::debug!("root CA CRL not refreshed: {e}"),
         }
+        drop(item);
 
         // Node `refreshCachedCrls` skips invalid URIs and propagates download
         // failures.
@@ -1600,8 +1652,10 @@ impl Cache {
                 tracing::error!("Invalid CDP URI.");
                 continue;
             }
+            let mut item = self.refresh_item(Kind::Crl);
             let fresh = self.pcs.fetch_crl(&rec.uri).await?;
             self.store.put_crl(&rec.uri, &fresh)?;
+            item.success = true;
         }
         Ok(())
     }
@@ -1628,6 +1682,7 @@ impl Cache {
             // A PCCS upstream has no cert-pool endpoint; re-fetch the selected
             // cert for every known raw TCB instead.
             for raw in &pool.raw_tcbs {
+                let mut item = self.refresh_item(Kind::Pckcert);
                 if let Ok(fresh) = self
                     .pcs
                     .fetch_pckcert_pccs(
@@ -1644,6 +1699,7 @@ impl Cache {
                         &fresh.issuer_chain,
                     ) {
                         self.store.merge_pckcert(&fresh, Some(&expected))?;
+                        item.success = true;
                     }
                 }
             }
@@ -1654,6 +1710,7 @@ impl Cache {
     /// Re-fetch one platform's pool and re-select every raw TCB it knows. The
     /// credential is always the pool's own; the caller's PPID is irrelevant.
     async fn refresh_platform_pool(&self, pool: &PlatformPool) -> Result<(), PccsError> {
+        let mut item = self.refresh_item(Kind::Pckcert);
         let expected = pool.credentials();
         let resp = if !pool.platform_manifest.is_empty() {
             self.pcs.fetch_pckcerts_intel_manifest(&pool.platform_manifest, &pool.pce_id).await
@@ -1689,7 +1746,9 @@ impl Cache {
                     &tcb,
                 )
             },
-        )
+        )?;
+        item.success = true;
+        Ok(())
     }
 
     /// The cron scheduler's run: Node `refreshService.refreshCache` collateral,
@@ -1709,6 +1768,7 @@ impl Cache {
             return Err(error::SERVICE_UNAVAILABLE);
         }
         let _guard = self.refresh_lock.lock().await;
+        let start = std::time::Instant::now();
         // Collateral first, exactly as before: the pool pass is additive, so a
         // collateral failure still reports the way it always has.
         let collateral = self.refresh_collateral().await;
@@ -1718,6 +1778,7 @@ impl Cache {
         // Pools even when collateral failed: a CRL or identity outage has
         // nothing to do with a raised platform TCB.
         self.refresh_platform_pools().await;
+        self.store.metrics.refresh_run(collateral.is_ok(), start.elapsed());
         collateral
     }
 
@@ -2025,6 +2086,11 @@ mod tests {
         assert_eq!((got.status, got.message), (want.status, want.message));
     }
 
+    fn assert_metric(cache: &Cache, sample: &str) {
+        let rendered = cache.store.metrics.render();
+        assert!(rendered.lines().any(|line| line == sample), "missing {sample}\n{rendered}");
+    }
+
     /// Removes the RocksDB directory once the cache is dropped.
     struct TestDir(std::path::PathBuf);
 
@@ -2084,7 +2150,46 @@ mod tests {
             cache.store.put_amd_kds(&amd_record(&url, 0)).unwrap();
             assert!(cache.get_amd_kds("/vcek/v1/Milan/cert_chain").await.is_err());
             assert!(cache.store.get_amd_kds(&url).is_none(), "{mode:?} kept an expired record");
+            assert_metric(
+                &cache,
+                "pccs_cache_lookups_total{kind=\"amd_kds\",result=\"expired\"} 1",
+            );
+            assert_metric(&cache, "pccs_cache_lookups_total{kind=\"amd_kds\",result=\"hit\"} 0");
+            assert_metric(&cache, "pccs_cache_lookups_total{kind=\"amd_kds\",result=\"miss\"} 0");
         }
+    }
+
+    #[tokio::test]
+    async fn amd_non200_replay_records_misses_and_recent_response_without_retry() {
+        use axum::routing::get;
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = calls.clone();
+        let base = spawn(axum::Router::new().route(
+            "/vcek/v1/Milan/cert_chain",
+            get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    axum::http::StatusCode::TOO_MANY_REQUESTS
+                }
+            }),
+        ))
+        .await;
+        let host = base.trim_end_matches("/sgx/certification/v4/");
+        let (_dir, cache) = amd_cache(host, CacheMode::Lazy);
+        for _ in 0..2 {
+            assert_eq!(cache.get_amd_kds("/vcek/v1/Milan/cert_chain").await.unwrap().status, 429);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_metric(&cache, "pccs_cache_lookups_total{kind=\"amd_kds\",result=\"miss\"} 2");
+        assert_metric(
+            &cache,
+            "pccs_cache_lookups_total{kind=\"amd_kds\",result=\"recent_non200\"} 1",
+        );
+        assert_metric(
+            &cache,
+            "pccs_upstream_requests_total{upstream=\"amd_kds\",status=\"429\"} 1",
+        );
     }
 
     #[tokio::test]
@@ -2133,6 +2238,10 @@ mod tests {
             let _ = cache.scheduled_refresh().await;
             assert!(cache.store.get_nvidia_rim(&stale).is_none(), "{mode:?} sweep kept it");
             assert!(cache.store.get_nvidia_rim(&fresh).is_some(), "{mode:?} swept a fresh one");
+            assert_metric(
+                &cache,
+                "pccs_cache_lookups_total{kind=\"nvidia_rim\",result=\"expired\"} 1",
+            );
         }
     }
 
@@ -2156,8 +2265,8 @@ mod tests {
         let (_dir, cache) = cache_with("", CacheMode::Lazy);
         cache.remember("small", response(RECENT_BODY_MAX)).await;
         cache.remember("large", response(RECENT_BODY_MAX + 1)).await;
-        assert!(cache.recent_non200("small").await.is_some());
-        assert!(cache.recent_non200("large").await.is_none());
+        assert!(cache.recent_non200(Kind::AmdKds, "small").await.is_some());
+        assert!(cache.recent_non200(Kind::AmdKds, "large").await.is_none());
     }
 
     fn ocsp_cache(nvidia_ocsp_uri: &str, mode: CacheMode) -> (TestDir, Arc<Cache>) {
@@ -2266,6 +2375,10 @@ mod tests {
             let _ = cache.scheduled_refresh().await;
             assert!(cache.store.get_nvidia_ocsp("stale").is_none(), "{mode:?} sweep kept it");
             assert!(cache.store.get_nvidia_ocsp("fresh").is_some(), "{mode:?} swept a fresh one");
+            assert_metric(
+                &cache,
+                "pccs_cache_lookups_total{kind=\"nvidia_ocsp\",result=\"expired\"} 1",
+            );
         }
     }
 
@@ -2513,6 +2626,39 @@ mod tests {
         assert!(cache.store.get_pckcrl("PROCESSOR").is_none(), "chain-less CRL is not cached");
         cache.get_pckcrl("PROCESSOR", 4).await.unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2, "every request retries upstream");
+
+        // Refresh skips an unusable answer without failing the run, but the
+        // individual item is not a successful cache update.
+        cache
+            .store
+            .put_pckcrl(&PckCrlRecord {
+                ca: "PROCESSOR".into(),
+                pckcrl: vec![1],
+                issuer_chain: "old-chain".into(),
+            })
+            .unwrap();
+        cache.refresh(None, None).await.unwrap();
+        assert_eq!(cache.store.get_pckcrl("PROCESSOR").unwrap().pckcrl, vec![1]);
+        assert_metric(&cache, "pccs_refresh_items_total{kind=\"pckcrl\",result=\"error\"} 1");
+        assert_metric(&cache, "pccs_refresh_items_total{kind=\"pckcrl\",result=\"success\"} 0");
+    }
+
+    #[tokio::test]
+    async fn successful_singleflight_follower_is_not_counted_as_an_initial_hit() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let base = spawn_pccs(calls.clone()).await;
+        let (_dir, cache) = cache_with(&base, CacheMode::Lazy);
+        // Both futures first poll before this current-thread runtime can run
+        // the HTTP mock: both observe the cold key, only one fills it.
+        let (first, follower) = tokio::join!(cache.get_rootcacrl(4), cache.get_rootcacrl(4));
+        assert_eq!(first.unwrap(), vec![0x30, 0x82]);
+        assert_eq!(follower.unwrap(), vec![0x30, 0x82]);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_metric(&cache, "pccs_cache_lookups_total{kind=\"rootcacrl\",result=\"miss\"} 2");
+        assert_metric(&cache, "pccs_cache_lookups_total{kind=\"rootcacrl\",result=\"hit\"} 0");
+        cache.get_rootcacrl(4).await.unwrap();
+        assert_metric(&cache, "pccs_cache_lookups_total{kind=\"rootcacrl\",result=\"hit\"} 1");
+        assert_metric(&cache, "pccs_store_read_duration_seconds_count{kind=\"rootcacrl\"} 5");
     }
 
     #[tokio::test]
@@ -2527,6 +2673,11 @@ mod tests {
         assert_eq!(der, vec![0x30, 0x82]);
         cache.get_rootcacrl(4).await.unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), crl_calls + 1, "second GET is a store hit");
+        assert!(Arc::ptr_eq(&cache.store.metrics, &cache.pcs.metrics));
+        assert_metric(&cache, "pccs_cache_lookups_total{kind=\"rootcacrl\",result=\"miss\"} 1");
+        assert_metric(&cache, "pccs_cache_lookups_total{kind=\"rootcacrl\",result=\"hit\"} 1");
+        assert_metric(&cache, "pccs_store_read_duration_seconds_count{kind=\"rootcacrl\"} 3");
+        assert_metric(&cache, "pccs_cache_singleflight_wait_seconds_count{kind=\"rootcacrl\"} 1");
 
         // A v3 *miss* is EOL, never a network call (a cached record is still
         // served — the store hit above comes first, as in Node).
@@ -2632,6 +2783,12 @@ mod tests {
         // instead of issuing a second upstream call.
         assert_err(&second.unwrap_err(), &error::NO_CACHE_DATA);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_metric(&cache, "pccs_cache_lookups_total{kind=\"sgx_tcb\",result=\"miss\"} 2");
+        assert_metric(
+            &cache,
+            "pccs_cache_lookups_total{kind=\"sgx_tcb\",result=\"recent_failure\"} 1",
+        );
+        assert_metric(&cache, "pccs_cache_singleflight_wait_seconds_count{kind=\"sgx_tcb\"} 2");
     }
 
     #[tokio::test]
@@ -2662,6 +2819,8 @@ mod tests {
         let before = calls.load(Ordering::Relaxed);
         cache.refresh(Some("certs"), Some("00a067110000")).await.unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), before + 2, "one re-fetch per raw TCB");
+        assert_metric(&cache, "pccs_refresh_runs_total{result=\"success\"} 1");
+        assert_metric(&cache, "pccs_refresh_items_total{kind=\"pckcert\",result=\"success\"} 2");
 
         // A non-matching fmspc is skipped entirely.
         cache.refresh(Some("certs"), Some("FFFFFFFFFFFF")).await.unwrap();
@@ -2687,6 +2846,11 @@ mod tests {
             .unwrap();
         let err = cache.refresh(None, None).await.unwrap_err();
         assert_err(&err, &error::SERVICE_UNAVAILABLE);
+        assert_metric(&cache, "pccs_refresh_runs_total{result=\"error\"} 1");
+        assert_metric(&cache, "pccs_refresh_items_total{kind=\"pckcrl\",result=\"error\"} 1");
+        assert!(cache.scheduled_refresh().await.is_err());
+        assert_metric(&cache, "pccs_refresh_runs_total{result=\"error\"} 2");
+        assert_metric(&cache, "pccs_refresh_items_total{kind=\"pckcrl\",result=\"error\"} 2");
     }
 
     #[tokio::test]
@@ -2708,6 +2872,13 @@ mod tests {
         let (_dir, cache) = cache_with("", CacheMode::Lazy);
         cache.refresh(None, None).await.unwrap();
         cache.refresh(Some("certs"), Some("00A067110000")).await.unwrap();
+        cache.scheduled_refresh().await.unwrap();
+        assert_metric(&cache, "pccs_refresh_runs_total{result=\"success\"} 3");
+        let rendered = cache.store.metrics.render();
+        let items: Vec<_> =
+            rendered.lines().filter(|line| line.starts_with("pccs_refresh_items_total{")).collect();
+        assert!(!items.is_empty(), "missing refresh item counters\n{rendered}");
+        assert!(items.iter().all(|line| line.ends_with(" 0")), "{rendered}");
     }
 
     #[tokio::test]
@@ -2858,6 +3029,10 @@ TQENAQIRAgIzMzAfBgsqhkiG+E0BDQECEgQQIiIiIiIiIiIiIiIiIiIiIjAAAwEA
         assert_eq!(rec.fmspc, "1234567890AB");
         assert_eq!(rec.ca, "PLATFORM");
         assert_eq!(rec.issuer_chain, "pck-chain");
+        assert_metric(
+            &cache,
+            "pccs_cache_lookups_total{kind=\"pckcert\",result=\"local_select\"} 1",
+        );
         // The pool now holds the fetched certs, and the raw TCB is known.
         let pool = cache.store.get_platform_pool("QEM", "4444").unwrap();
         assert_eq!(pool.certs.len(), 1);
