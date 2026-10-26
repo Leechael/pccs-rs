@@ -13,6 +13,7 @@ pub mod headers;
 pub mod health;
 pub mod intel_import;
 pub mod keys;
+pub mod metrics;
 pub mod ocsp;
 pub mod pcs;
 pub mod routes;
@@ -42,6 +43,7 @@ pub fn app_state(cfg: Config) -> AppState {
 pub fn create_app(state: AppState) -> Router {
     let body_limit = state.config.max_body_size;
     let pcs_ver = state.config.pcs_version();
+    let metrics_state = (state.cache.store.metrics.clone(), state.config.server_timing);
 
     // Node mounts `v3EolWarning` with `app.use`, so every v3 request carries
     // the header — including ones that match no route. A fallback inside the
@@ -71,6 +73,7 @@ pub fn create_app(state: AppState) -> Router {
         // preflight (answered without calling next) still gets a fresh id.
         .layer(middleware::from_fn(routes::handlers::nras_cors))
         .layer(middleware::from_fn(auth::add_request_id))
+        .layer(middleware::from_fn_with_state(metrics_state, metrics::http_middleware))
         .with_state(state)
 }
 

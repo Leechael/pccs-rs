@@ -1001,7 +1001,9 @@ async fn migration_cert_refresh_preserves_shared_tcb_on_selection_failure() {
     let mut cfg = cfg_empty();
     cfg.uri = uri;
     cfg.cache_mode = CacheMode::Lazy;
-    let router = app_cfg(cfg);
+    let state = pccs_rs::app_state(cfg);
+    let metrics = state.cache.store.metrics.clone();
+    let router = pccs_rs::create_app(state);
     let (status, _, _) = send(
         router.clone(),
         post_user(
@@ -1026,6 +1028,23 @@ async fn migration_cert_refresh_preserves_shared_tcb_on_selection_failure() {
     let (status, _, body) = send(router.clone(), get_admin(&refresh)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body.as_ref(), b"No cache data for this platform.");
+    let rendered = metrics.render();
+    assert!(
+        rendered.contains("pccs_refresh_items_total{kind=\"pckcert\",result=\"error\"} 1\n"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("pccs_refresh_items_total{kind=\"pckcert\",result=\"success\"} 0\n"),
+        "{rendered}"
+    );
+    for result in ["success", "error"] {
+        assert!(
+            rendered.contains(&format!(
+                "pccs_refresh_items_total{{kind=\"sgx_tcb\",result=\"{result}\"}} 0\n"
+            )),
+            "ephemeral selection TCB is not a refreshed item: {rendered}"
+        );
+    }
     for (path, expected) in
         [(tcb_path.clone(), old_standard), (format!("{tcb_path}&update=early"), old_early)]
     {

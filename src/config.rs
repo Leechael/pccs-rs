@@ -178,6 +178,14 @@ pub struct ServeArgs {
     #[arg(long, env = "PCCS_PORT")]
     pub port: Option<u16>,
 
+    /// Separate plain-HTTP Prometheus listener (disabled when unset).
+    #[arg(long, env = "PCCS_METRICS_LISTEN")]
+    pub metrics_listen: Option<std::net::SocketAddr>,
+
+    /// Include identifier-free per-request timing in Server-Timing.
+    #[arg(long, env = "PCCS_SERVER_TIMING", action = clap::ArgAction::Set)]
+    pub server_timing: Option<bool>,
+
     /// Plain HTTP (Caddy / reverse-proxy). Default on unless --https.
     #[arg(long, default_value_t = false)]
     pub http: bool,
@@ -365,6 +373,8 @@ struct JsonConfig {
 struct TomlConfig {
     host: Option<String>,
     port: Option<u16>,
+    metrics_listen: Option<std::net::SocketAddr>,
+    server_timing: Option<bool>,
     https: Option<bool>,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
@@ -406,6 +416,9 @@ struct TomlConfig {
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// Disabled by default; never mounted on the collateral listener.
+    pub metrics_listen: Option<std::net::SocketAddr>,
+    pub server_timing: bool,
     pub http: bool,
     pub https: bool,
     pub cert: PathBuf,
@@ -460,6 +473,8 @@ impl Default for Config {
         Self {
             host: "127.0.0.1".into(),
             port: 8081,
+            metrics_listen: None,
+            server_timing: false,
             http: true,
             https: false,
             cert: PathBuf::from("certs/file.crt"),
@@ -667,6 +682,12 @@ fn apply_toml(cfg: &mut Config, file: TomlConfig) {
     if let Some(p) = file.port {
         cfg.port = p;
     }
+    if let Some(addr) = file.metrics_listen {
+        cfg.metrics_listen = Some(addr);
+    }
+    if let Some(enabled) = file.server_timing {
+        cfg.server_timing = enabled;
+    }
     if let Some(https) = file.https {
         cfg.https = https;
         cfg.http = !https;
@@ -781,6 +802,12 @@ fn apply_cli(cfg: &mut Config, c: ServeArgs) {
     }
     if let Some(p) = c.port {
         cfg.port = p;
+    }
+    if let Some(addr) = c.metrics_listen {
+        cfg.metrics_listen = Some(addr);
+    }
+    if let Some(enabled) = c.server_timing {
+        cfg.server_timing = enabled;
     }
     // Only override the file when a transport flag is actually passed.
     // `--https` / `--http` are clap store-true, so the unset default is false.
@@ -1034,6 +1061,32 @@ mod tests {
     {
         let cli = ServeArgs::parse_from(args);
         Config::from_serve_args(cli, None)
+    }
+
+    #[test]
+    fn metrics_config_is_opt_in_and_cli_overrides_toml() {
+        let _env = clear_pccs_env();
+        let mut cfg = Config::default();
+        assert_eq!(cfg.metrics_listen, None);
+        assert!(!cfg.server_timing);
+        let file: TomlConfig =
+            toml::from_str("metrics_listen = '127.0.0.1:9090'\nserver_timing = true").unwrap();
+        apply_toml(&mut cfg, file);
+        assert_eq!(cfg.metrics_listen, Some("127.0.0.1:9090".parse().unwrap()));
+        assert!(cfg.server_timing);
+        apply_cli(
+            &mut cfg,
+            ServeArgs::parse_from([
+                "pccs-rs",
+                "--metrics-listen",
+                "[::1]:9091",
+                "--server-timing",
+                "false",
+            ]),
+        );
+        assert_eq!(cfg.metrics_listen, Some("[::1]:9091".parse().unwrap()));
+        assert!(!cfg.server_timing);
+        assert!(toml::from_str::<TomlConfig>("metrics_listen = 'invalid'").is_err());
     }
 
     #[test]

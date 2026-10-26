@@ -4,13 +4,14 @@
 use crate::config::{CacheMode, RocksDbOpts};
 use crate::error::{self, PccsError};
 use crate::keys;
+use crate::metrics::{CacheResult, Kind, Metrics};
 use crate::validate::UpdateType;
 use rocksdb::{BlockBasedOptions, Cache, Direction, IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PckCertRecord {
@@ -194,9 +195,7 @@ struct AppraisalList {
 pub struct Store {
     db: DB,
     pub cache_mode: CacheMode,
-    pub hits: AtomicU64,
-    pub misses: AtomicU64,
-    pub upstream_fetches: AtomicU64,
+    pub metrics: Arc<Metrics>,
     /// Serialises read-modify-write sequences that a scan could otherwise
     /// interleave with: the registration-queue drain, the per-platform pool
     /// upsert, and the appraisal-policy list upsert.
@@ -235,6 +234,22 @@ fn be_u64(bytes: &[u8]) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_be_bytes)
 }
 
+pub(crate) fn tcb_kind(prod_type: u8) -> Kind {
+    if prod_type == 1 {
+        Kind::TdxTcb
+    } else {
+        Kind::SgxTcb
+    }
+}
+
+pub(crate) fn identity_kind(enclave_id: u8) -> Kind {
+    match enclave_id {
+        2 => Kind::QveIdentity,
+        3 => Kind::TdqeIdentity,
+        _ => Kind::QeIdentity,
+    }
+}
+
 impl Store {
     pub fn open(path: &Path, cache_mode: CacheMode, rocks: &RocksDbOpts) -> Result<Self, String> {
         let mut opts = Options::default();
@@ -252,9 +267,7 @@ impl Store {
         let store = Self {
             db,
             cache_mode,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            upstream_fetches: AtomicU64::new(0),
+            metrics: Arc::new(Metrics::default()),
             reg_lock: Mutex::new(()),
             platform_lock: Mutex::new(()),
             appraisal_lock: Mutex::new(()),
@@ -393,14 +406,16 @@ impl Store {
         true
     }
 
-    pub fn record_hit(&self) {
-        self.hits.fetch_add(1, Ordering::Relaxed);
+    pub fn record_lookup(&self, kind: Kind, result: CacheResult) {
+        self.metrics.cache_lookup(kind, result);
     }
-    pub fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::Relaxed);
+
+    pub fn record_hit(&self, kind: Kind) {
+        self.record_lookup(kind, CacheResult::Hit);
     }
-    pub fn record_upstream(&self) {
-        self.upstream_fetches.fetch_add(1, Ordering::Relaxed);
+
+    pub fn record_miss(&self, kind: Kind) {
+        self.record_lookup(kind, CacheResult::Miss);
     }
 
     /// Lightweight health check: returns `true` if the DB is usable, `false`
@@ -415,6 +430,15 @@ impl Store {
         // allocating a `Vec<u8>` copy per lookup.
         let v = self.db.get_pinned(key.as_bytes()).ok().flatten()?;
         serde_json::from_slice(&v).ok()
+    }
+
+    /// Time individual response reads, not scans or FIFO/index bookkeeping.
+    fn read_json<T: for<'de> Deserialize<'de>>(&self, kind: Kind, key: &str) -> Option<T> {
+        let start = Instant::now();
+        let value = self.db.get_pinned(key.as_bytes());
+        let elapsed = start.elapsed();
+        self.metrics.store_read(kind, elapsed);
+        serde_json::from_slice(&value.ok().flatten()?).ok()
     }
 
     fn put_json<T: Serialize>(&self, key: &str, val: &T) -> Result<(), PccsError> {
@@ -451,7 +475,8 @@ impl Store {
         pcesvn: &str,
         pceid: &str,
     ) -> Option<PckCertRecord> {
-        let rec: PckCertRecord = self.get_json(&keys::pckcert(qeid, pceid, cpusvn, pcesvn))?;
+        let rec: PckCertRecord =
+            self.read_json(Kind::Pckcert, &keys::pckcert(qeid, pceid, cpusvn, pcesvn))?;
         let matches = rec.qeid.eq_ignore_ascii_case(qeid)
             && rec.pceid.eq_ignore_ascii_case(pceid)
             && rec.cpusvn.eq_ignore_ascii_case(cpusvn)
@@ -471,7 +496,7 @@ impl Store {
 
     /// Node `platformsDao.getPlatform` — one row, one `DB::get`.
     pub fn get_platform_pool(&self, qeid: &str, pceid: &str) -> Option<PlatformPool> {
-        let pool: PlatformPool = self.get_json(&keys::platform(qeid, pceid))?;
+        let pool: PlatformPool = self.read_json(Kind::Pckcert, &keys::platform(qeid, pceid))?;
         if !pool.qe_id.eq_ignore_ascii_case(qeid) || !pool.pce_id.eq_ignore_ascii_case(pceid) {
             tracing::warn!("platform record does not match its key; treating as a miss");
             return None;
@@ -779,7 +804,10 @@ impl Store {
     /// the platform) just to answer "is this platform known?" is pure waste on
     /// a `/pckcert` cache hit, so this stops at the raw `DB::get`.
     pub fn has_platform(&self, qeid: &str, pceid: &str) -> bool {
-        self.db.get_pinned(keys::platform(qeid, pceid).as_bytes()).ok().flatten().is_some()
+        let start = Instant::now();
+        let value = self.db.get_pinned(keys::platform(qeid, pceid).as_bytes());
+        self.metrics.store_read(Kind::Pckcert, start.elapsed());
+        value.ok().flatten().is_some()
     }
 
     pub fn list_platform_pools(&self) -> Vec<PlatformPool> {
@@ -869,8 +897,10 @@ impl Store {
         version: u32,
         update: UpdateType,
     ) -> Option<TcbRecord> {
-        let rec: TcbRecord =
-            self.get_json(&keys::tcb(keys::prod_name(prod_type), version, fmspc, update.as_str()))?;
+        let rec: TcbRecord = self.read_json(
+            tcb_kind(prod_type),
+            &keys::tcb(keys::prod_name(prod_type), version, fmspc, update.as_str()),
+        )?;
         if rec.prod_type != prod_type
             || rec.version != version
             || !rec.fmspc.eq_ignore_ascii_case(fmspc)
@@ -902,11 +932,10 @@ impl Store {
         version: u32,
         update: UpdateType,
     ) -> Option<IdentityRecord> {
-        let rec: IdentityRecord = self.get_json(&keys::identity(
-            keys::identity_name(enclave_id),
-            version,
-            update.as_str(),
-        ))?;
+        let rec: IdentityRecord = self.read_json(
+            identity_kind(enclave_id),
+            &keys::identity(keys::identity_name(enclave_id), version, update.as_str()),
+        )?;
         if rec.enclave_id != enclave_id
             || rec.version != version
             || !rec.update_type.eq_ignore_ascii_case(update.as_str())
@@ -932,7 +961,7 @@ impl Store {
     }
 
     pub fn get_pckcrl(&self, ca: &str) -> Option<PckCrlRecord> {
-        let rec: PckCrlRecord = self.get_json(&keys::pckcrl(ca))?;
+        let rec: PckCrlRecord = self.read_json(Kind::Pckcrl, &keys::pckcrl(ca))?;
         if !rec.ca.eq_ignore_ascii_case(ca) {
             tracing::warn!("pckcrl record does not match its key; treating as a miss");
             return None;
@@ -952,7 +981,7 @@ impl Store {
     }
 
     pub fn get_rootcacrl(&self) -> Option<Vec<u8>> {
-        self.get_json::<Vec<u8>>(&keys::rootcacrl())
+        self.read_json::<Vec<u8>>(Kind::Rootcacrl, &keys::rootcacrl())
     }
 
     pub fn put_rootcacrl(&self, crl: &[u8]) -> Result<(), PccsError> {
@@ -960,7 +989,7 @@ impl Store {
     }
 
     pub fn get_crl(&self, uri: &str) -> Option<Vec<u8>> {
-        self.get_json::<CrlRecord>(&keys::crl(uri)).map(|r| r.crl)
+        self.read_json::<CrlRecord>(Kind::Crl, &keys::crl(uri)).map(|r| r.crl)
     }
 
     pub fn put_crl(&self, uri: &str, crl: &[u8]) -> Result<(), PccsError> {
@@ -975,7 +1004,7 @@ impl Store {
     }
 
     pub fn get_amd_kds(&self, url: &str) -> Option<AmdKdsRecord> {
-        let rec: AmdKdsRecord = self.get_json(&keys::amd_kds(url))?;
+        let rec: AmdKdsRecord = self.read_json(Kind::AmdKds, &keys::amd_kds(url))?;
         if rec.url != url {
             tracing::warn!("amd kds record does not match its key; treating as a miss");
             return None;
@@ -1039,7 +1068,7 @@ impl Store {
     }
 
     pub fn get_nvidia_rim(&self, url: &str) -> Option<AmdKdsRecord> {
-        let rec: AmdKdsRecord = self.get_json(&keys::nvidia_rim(url))?;
+        let rec: AmdKdsRecord = self.read_json(Kind::NvidiaRim, &keys::nvidia_rim(url))?;
         if rec.url != url {
             tracing::warn!("nvidia rim record does not match its key; treating as a miss");
             return None;
@@ -1052,7 +1081,8 @@ impl Store {
     }
 
     pub fn get_nvidia_ocsp(&self, cache_key: &str) -> Option<NvidiaOcspRecord> {
-        let rec: NvidiaOcspRecord = self.get_json(&keys::nvidia_ocsp(cache_key))?;
+        let rec: NvidiaOcspRecord =
+            self.read_json(Kind::NvidiaOcsp, &keys::nvidia_ocsp(cache_key))?;
         if rec.cache_key != cache_key {
             tracing::warn!("nvidia ocsp record does not match its key; treating as a miss");
             return None;
@@ -2042,15 +2072,22 @@ mod tests {
     }
 
     #[test]
-    fn counters_count() {
+    fn hot_reads_record_store_duration_but_scans_do_not() {
         let (_dir, s) = temp_store();
-        s.record_hit();
-        s.record_hit();
-        s.record_miss();
-        s.record_upstream();
-        assert_eq!(s.hits.load(Ordering::Relaxed), 2);
-        assert_eq!(s.misses.load(Ordering::Relaxed), 1);
-        assert_eq!(s.upstream_fetches.load(Ordering::Relaxed), 1);
+        assert!(s.get_pckcrl("PROCESSOR").is_none());
+        s.put_pckcrl(&PckCrlRecord {
+            ca: "PROCESSOR".into(),
+            pckcrl: vec![1, 2],
+            issuer_chain: "chain".into(),
+        })
+        .unwrap();
+        assert!(s.get_pckcrl("PROCESSOR").is_some());
+        assert_eq!(s.list_pckcrls().len(), 1);
+        let rendered = s.metrics.render();
+        assert!(
+            rendered.contains("pccs_store_read_duration_seconds_count{kind=\"pckcrl\"} 2"),
+            "{rendered}"
+        );
     }
 
     #[test]

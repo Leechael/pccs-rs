@@ -6,6 +6,7 @@
 use crate::config::Config;
 use crate::error::{self, PccsError};
 use crate::headers;
+use crate::metrics::{Metrics, Upstream, UpstreamStatus};
 use crate::store::{IdentityRecord, PckCertRecord, PckCrlRecord, TcbRecord};
 use crate::validate::UpdateType;
 use base64::Engine;
@@ -17,9 +18,10 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 /// Node `pcs_client.js` HTTP_TIMEOUT.
@@ -88,6 +90,54 @@ pub struct PckCertsResponse {
     pub issuer_chain: String,
 }
 
+/// Follows the request future on cancellation, so abandoned requests cannot
+/// leave the in-flight gauge elevated.
+struct InflightGuard<'a>(&'a Metrics);
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.inflight_sub();
+    }
+}
+
+/// Permit waits remain observable when cancellation interrupts acquisition.
+struct PermitWaitGuard<'a> {
+    metrics: &'a Metrics,
+    start: Instant,
+}
+
+impl Drop for PermitWaitGuard<'_> {
+    fn drop(&mut self) {
+        // permit_wait also accumulates request-local Upstream timing.
+        self.metrics.permit_wait(self.start.elapsed());
+    }
+}
+
+/// Backoff is part of client-stage Server-Timing, not attempt latency.
+struct BackoffTimer(Instant);
+
+impl Drop for BackoffTimer {
+    fn drop(&mut self) {
+        crate::metrics::timing_add(crate::metrics::TimingStage::Upstream, self.0.elapsed());
+    }
+}
+
+/// Records even if an outer deadline or caller cancellation drops the future.
+/// Error is the default until a completed attempt supplies a more specific status.
+struct AttemptGuard<'a> {
+    metrics: &'a Metrics,
+    upstream: Upstream,
+    status: UpstreamStatus,
+    start: Instant,
+}
+
+impl Drop for AttemptGuard<'_> {
+    fn drop(&mut self) {
+        // Also accumulates request-local Upstream timing, exactly once.
+        self.metrics.upstream_attempt(self.upstream, self.status, self.start.elapsed());
+    }
+}
+
 pub struct PcsClient {
     base: String,
     api_key: String,
@@ -96,7 +146,14 @@ pub struct PcsClient {
     client: AnyClient,
     /// Bounds how many upstream requests are in flight at once.
     permits: Arc<Semaphore>,
+    #[cfg(test)]
     pub calls: Arc<AtomicU64>,
+    pub metrics: Arc<Metrics>,
+    pcs_endpoint: Option<Uri>,
+    amd_kds_endpoint: Option<Uri>,
+    nvidia_rim_endpoint: Option<Uri>,
+    #[cfg(test)]
+    request_timeout: Duration,
 }
 
 impl PcsClient {
@@ -164,7 +221,14 @@ impl PcsClient {
             max_attempts: cfg.upstream_max_attempts.max(1),
             client,
             permits: Arc::new(Semaphore::new(cfg.upstream_max_concurrent.max(1))),
+            #[cfg(test)]
             calls: Arc::new(AtomicU64::new(0)),
+            metrics: Arc::new(Metrics::new()),
+            pcs_endpoint: uri.parse().ok(),
+            amd_kds_endpoint: amd_kds_uri.parse().ok(),
+            nvidia_rim_endpoint: nvidia_rim_uri.parse().ok(),
+            #[cfg(test)]
+            request_timeout: REQUEST_TIMEOUT,
         })
     }
 
@@ -172,6 +236,7 @@ impl PcsClient {
         !self.base.is_empty()
     }
 
+    #[cfg(test)]
     pub fn call_count(&self) -> u64 {
         self.calls.load(Ordering::Relaxed)
     }
@@ -201,13 +266,61 @@ impl PcsClient {
         if !self.enabled() {
             return Err(error::NO_CACHE_DATA);
         }
-        self.send(url, None, true).await
+        self.send(url, None, true, self.upstream_for_url(url)).await
     }
 
     /// AMD KDS / NVIDIA RIM fetch. Never attaches the Intel API key and never
     /// applies the Intel `/v3/` EOL check — those belong to Intel paths only.
     pub async fn get_url(&self, url: &str) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
-        self.send(url, None, false).await
+        self.get_url_for(self.upstream_for_url(url), url).await
+    }
+
+    /// Explicit service identity for callers that know the endpoint's role.
+    /// This also disambiguates services sharing a configured proxy/mock origin.
+    pub async fn get_url_for(
+        &self,
+        upstream: Upstream,
+        url: &str,
+    ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
+        self.send(url, None, false, upstream).await
+    }
+
+    /// Best-effort compatibility classification for arbitrary URL fetches.
+    /// Only bounded service enums reach metrics; URLs are never metric labels.
+    fn upstream_for_url(&self, url: &str) -> Upstream {
+        let Ok(uri) = url.parse::<Uri>() else { return Upstream::Pccs };
+        if crate::validate::is_valid_crl_uri(url) {
+            return if uri.path().starts_with("/IntelSGXRootCA.") {
+                Upstream::IntelCerts
+            } else {
+                Upstream::IntelPcs
+            };
+        }
+        let host = uri.host().unwrap_or("");
+        if host.eq_ignore_ascii_case("api.trustedservices.intel.com")
+            || host.eq_ignore_ascii_case("validation.api.trustedservices.intel.com")
+        {
+            return Upstream::IntelPcs;
+        }
+        let same_origin = |endpoint: &Uri| {
+            uri.scheme() == endpoint.scheme() && uri.authority() == endpoint.authority()
+        };
+        // Callers sharing a proxy/mock origin across services use get_url_for.
+        // The compatibility API gives the configured PCS base precedence.
+        if self.pcs_endpoint.as_ref().is_some_and(same_origin) {
+            return if self.is_intel { Upstream::IntelPcs } else { Upstream::Pccs };
+        }
+        if self.amd_kds_endpoint.as_ref().is_some_and(same_origin)
+            || host.eq_ignore_ascii_case("kdsintf.amd.com")
+        {
+            return Upstream::AmdKds;
+        }
+        if self.nvidia_rim_endpoint.as_ref().is_some_and(same_origin)
+            || host.eq_ignore_ascii_case("rim.attestation.nvidia.com")
+        {
+            return Upstream::NvidiaRim;
+        }
+        Upstream::Pccs
     }
 
     /// One JSON POST through the pooled client. No Intel `/v3/` gate, no API
@@ -217,27 +330,19 @@ impl PcsClient {
         url: &str,
         body: &[u8],
     ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
+        #[cfg(test)]
         self.calls.fetch_add(1, Ordering::Relaxed);
         let uri: Uri = url.parse().map_err(|_| error::INTERNAL_ERROR)?;
         let req = Request::post(uri)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::copy_from_slice(body)))
             .map_err(|_| error::INTERNAL_ERROR)?;
-        let _permit = match self.permits.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return Err(error::INTERNAL_ERROR),
-        };
-        match tokio::time::timeout(REQUEST_TIMEOUT, self.attempt(req)).await {
-            Err(_) => {
-                tracing::warn!("upstream request {} timed out", redact_url(url));
-                Err(error::PCS_ACCESS_FAILURE)
-            }
-            Ok(Err(e)) => Err(e),
-            Ok(Ok(v)) => {
-                tracing::info!("upstream request {} -> {}", redact_url(url), v.0);
-                Ok(v)
-            }
+        let _permit = self.acquire_permit().await?;
+        let result = self.measured_attempt(req, Upstream::NvidiaNras, url).await;
+        if let Ok(v) = &result {
+            tracing::info!("upstream request {} -> {}", redact_url(url), v.0);
         }
+        result
     }
 
     /// One binary POST through the pooled client. Used by NVIDIA OCSP: no Intel
@@ -248,27 +353,19 @@ impl PcsClient {
         content_type: &str,
         body: &[u8],
     ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
+        #[cfg(test)]
         self.calls.fetch_add(1, Ordering::Relaxed);
         let uri: Uri = url.parse().map_err(|_| error::INTERNAL_ERROR)?;
         let req = Request::post(uri)
             .header(hyper::header::CONTENT_TYPE, content_type)
             .body(Full::new(Bytes::copy_from_slice(body)))
             .map_err(|_| error::INTERNAL_ERROR)?;
-        let _permit = match self.permits.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return Err(error::INTERNAL_ERROR),
-        };
-        match tokio::time::timeout(REQUEST_TIMEOUT, self.attempt(req)).await {
-            Err(_) => {
-                tracing::warn!("upstream request {} timed out", redact_url(url));
-                Err(error::PCS_ACCESS_FAILURE)
-            }
-            Ok(Err(e)) => Err(e),
-            Ok(Ok(v)) => {
-                tracing::info!("upstream request {} -> {}", redact_url(url), v.0);
-                Ok(v)
-            }
+        let _permit = self.acquire_permit().await?;
+        let result = self.measured_attempt(req, Upstream::NvidiaOcsp, url).await;
+        if let Ok(v) = &result {
+            tracing::info!("upstream request {} -> {}", redact_url(url), v.0);
         }
+        result
     }
 
     /// `body = Some(json)` issues a POST with `Content-Type: application/json`
@@ -280,19 +377,23 @@ impl PcsClient {
         url: &str,
         body: Option<Vec<u8>>,
         attach_key: bool,
+        upstream: Upstream,
     ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
         if attach_key {
             Self::check_v3(url)?;
         }
+        #[cfg(test)]
         self.calls.fetch_add(1, Ordering::Relaxed);
         let send_key = attach_key && Self::wants_api_key(url) && !self.api_key.is_empty();
         let mut last = error::PCS_ACCESS_FAILURE;
         let mut throttled = 0u32;
         let mut delay: Option<Duration> = None;
+        let mut throttled_retry = false;
         for attempt in 0..self.max_attempts {
             if attempt > 0 {
                 let backoff =
                     delay.take().unwrap_or(Duration::from_millis(50u64 << attempt.min(5)));
+                let _backoff_timer = BackoffTimer(Instant::now());
                 tokio::time::sleep(backoff).await;
             }
             let uri: Uri = url.parse().map_err(|_| error::INTERNAL_ERROR)?;
@@ -313,23 +414,22 @@ impl PcsClient {
                     req.headers_mut().insert(n, v);
                 }
             }
-            let _permit = match self.permits.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return Err(error::INTERNAL_ERROR),
-            };
-            let attempt_result = tokio::time::timeout(REQUEST_TIMEOUT, self.attempt(req)).await;
-            match attempt_result {
-                Err(_) => {
-                    tracing::warn!("upstream request {} timed out", redact_url(url));
-                    last = error::PCS_ACCESS_FAILURE;
-                }
-                Ok(Err(e)) => {
+            let _permit = self.acquire_permit().await?;
+            if throttled_retry {
+                self.metrics.upstream_throttled(upstream);
+                throttled_retry = false;
+            }
+            match self.measured_attempt(req, upstream, url).await {
+                Err(e) => {
                     last = e;
                 }
-                Ok(Ok((status, hdrs, body))) => {
+                Ok((status, hdrs, body)) => {
                     if status == 429 || status == 503 {
                         throttled += 1;
                         if throttled < MAX_THROTTLED_ATTEMPTS && attempt + 1 < self.max_attempts {
+                            // Count only when the next attempt actually starts,
+                            // not if cancellation interrupts its backoff/wait.
+                            throttled_retry = true;
                             delay = retry_after(&hdrs);
                             last = error::PCS_ACCESS_FAILURE;
                             continue;
@@ -341,6 +441,51 @@ impl PcsClient {
             }
         }
         Err(last)
+    }
+
+    async fn acquire_permit(
+        &self,
+    ) -> Result<(tokio::sync::OwnedSemaphorePermit, InflightGuard<'_>), PccsError> {
+        let wait = PermitWaitGuard { metrics: &self.metrics, start: Instant::now() };
+        let permit =
+            self.permits.clone().acquire_owned().await.map_err(|_| error::INTERNAL_ERROR)?;
+        drop(wait);
+        self.metrics.inflight_add();
+        Ok((permit, InflightGuard(&self.metrics)))
+    }
+
+    /// The attempt clock covers transport and the full body read, not waiting
+    /// for a permit, request construction, or retry backoff.
+    async fn measured_attempt(
+        &self,
+        req: Request<Full<Bytes>>,
+        upstream: Upstream,
+        url: &str,
+    ) -> Result<(u16, HeaderMap, Vec<u8>), PccsError> {
+        let mut attempt = AttemptGuard {
+            metrics: &self.metrics,
+            upstream,
+            status: UpstreamStatus::Error,
+            start: Instant::now(),
+        };
+        #[cfg(not(test))]
+        let timeout = REQUEST_TIMEOUT;
+        #[cfg(test)]
+        let timeout = self.request_timeout;
+        let result = tokio::time::timeout(timeout, self.attempt(req)).await;
+        attempt.status = match &result {
+            Err(_) => UpstreamStatus::Timeout,
+            Ok(Err(_)) => UpstreamStatus::Error,
+            Ok(Ok((status, _, _))) => UpstreamStatus::from_status(*status),
+        };
+        drop(attempt);
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!("upstream request {} timed out", redact_url(url));
+                Err(error::PCS_ACCESS_FAILURE)
+            }
+        }
     }
 
     /// One request plus a size-capped body read.
@@ -464,7 +609,8 @@ impl PcsClient {
             "pceid": pceid,
         })
         .to_string();
-        let (status, h, body) = self.send(&url, Some(payload.into_bytes()), true).await?;
+        let (status, h, body) =
+            self.send(&url, Some(payload.into_bytes()), true, self.upstream_for_url(&url)).await?;
         Self::parse_pckcerts(status, &h, &body)
     }
 
@@ -1052,6 +1198,604 @@ mod tests {
         (seen, app)
     }
 
+    fn metric_value(metrics: &crate::metrics::Metrics, sample: &str) -> f64 {
+        let rendered = metrics.render();
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(sample).and_then(|s| s.strip_prefix(' ')))
+            .unwrap_or_else(|| panic!("missing metric {sample}\n{rendered}"))
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn metrics_record_http_404_attempt_and_wait() {
+        let (seen, app) = recorder();
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        assert!(client.fetch_pckcert_pccs("qe", "aa", "bb", "cc", None).await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_requests_total{upstream=\"pccs\",status=\"404\"}"
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_attempt_duration_seconds_count{upstream=\"pccs\"}"
+            ),
+            1.0
+        );
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_count"), 1.0);
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn metrics_record_429_retries_but_not_final_throttle() {
+        use axum::routing::any;
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls2 = calls.clone();
+        let app = axum::Router::new().fallback(any(move || {
+            let calls = calls2.clone();
+            async move {
+                let status = if calls.fetch_add(1, Ordering::Relaxed) < 2 { 429 } else { 200 };
+                hyper::Response::builder()
+                    .status(status)
+                    .header(hyper::header::RETRY_AFTER, "0")
+                    .body(axum::body::Body::from("body"))
+                    .unwrap()
+            }
+        }));
+        let base = spawn(app).await;
+        let cfg = Config { uri: base.clone(), upstream_max_attempts: 6, ..Config::default() };
+        let client = PcsClient::new(&cfg).unwrap();
+        assert_eq!(client.get_url_for(Upstream::AmdKds, &base).await.unwrap().0, 200);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_requests_total{upstream=\"amd_kds\",status=\"429\"}"
+            ),
+            2.0
+        );
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_requests_total{upstream=\"amd_kds\",status=\"200\"}"
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_value(&client.metrics, "pccs_upstream_throttled_total{upstream=\"amd_kds\"}"),
+            2.0
+        );
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_attempt_duration_seconds_count{upstream=\"amd_kds\"}"
+            ),
+            3.0
+        );
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_count"), 3.0);
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 0.0);
+
+        // A no-retry POST returning 429/503 is an attempt, not a retry event.
+        let app = axum::Router::new().fallback(any(|| async { StatusCode::TOO_MANY_REQUESTS }));
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        assert_eq!(client.get_url_for(Upstream::NvidiaRim, &base).await.unwrap().0, 429);
+        assert_eq!(client.post_json_once(&base, b"{}").await.unwrap().0, 429);
+        assert_eq!(
+            client.post_bytes_once(&base, "application/ocsp-request", b"ocsp").await.unwrap().0,
+            429
+        );
+        let rendered = client.metrics.render();
+        assert!(rendered
+            .lines()
+            .filter(|line| line.starts_with("pccs_upstream_throttled_total{"))
+            .all(|line| line.ends_with(" 0")));
+        for upstream in ["nvidia_rim", "nvidia_nras", "nvidia_ocsp"] {
+            assert_eq!(
+                metric_value(
+                    &client.metrics,
+                    &format!(
+                        "pccs_upstream_requests_total{{upstream=\"{upstream}\",status=\"429\"}}"
+                    )
+                ),
+                1.0
+            );
+        }
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_count"), 3.0);
+    }
+
+    #[tokio::test]
+    async fn metrics_distinguish_body_timeouts_from_transport_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Send a successful head, then stall the body: timing must include
+        // response collection, not stop as soon as response headers arrive.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0; 4096];
+                    assert!(socket.read(&mut buf).await.unwrap() > 0);
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\n")
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let url = format!("http://{addr}/timeout");
+        let cfg = Config { upstream_max_attempts: 2, ..Config::test_default() };
+        let mut client = PcsClient::new(&cfg).unwrap();
+        client.request_timeout = Duration::from_millis(30);
+        assert!(client.get_url_for(Upstream::AmdKds, &url).await.is_err());
+        assert!(client.post_json_once(&url, b"{}").await.is_err());
+        assert!(client.post_bytes_once(&url, "application/ocsp-request", b"ocsp").await.is_err());
+        for (upstream, count) in [("amd_kds", 2.0), ("nvidia_nras", 1.0), ("nvidia_ocsp", 1.0)] {
+            assert_eq!(metric_value(&client.metrics, &format!("pccs_upstream_requests_total{{upstream=\"{upstream}\",status=\"timeout\"}}")), count);
+            assert_eq!(
+                metric_value(
+                    &client.metrics,
+                    &format!(
+                        "pccs_upstream_attempt_duration_seconds_count{{upstream=\"{upstream}\"}}"
+                    )
+                ),
+                count
+            );
+            assert!(
+                metric_value(
+                    &client.metrics,
+                    &format!(
+                        "pccs_upstream_attempt_duration_seconds_sum{{upstream=\"{upstream}\"}}"
+                    )
+                ) >= count * 0.025
+            );
+        }
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_count"), 4.0);
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 0.0);
+        server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = PcsClient::new(&cfg).unwrap();
+        assert!(client
+            .get_url_for(Upstream::AmdKds, &format!("http://{addr}/refused"))
+            .await
+            .is_err());
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_requests_total{upstream=\"amd_kds\",status=\"error\"}"
+            ),
+            2.0
+        );
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 0.0);
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_requests_total{upstream=\"amd_kds\",status=\"timeout\"}"
+            ),
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_separate_permit_wait_from_post_attempt_time() {
+        use axum::routing::any;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicU64::new(0));
+        let app = axum::Router::new().fallback(any({
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    "body"
+                }
+            }
+        }));
+        let base = spawn(app).await;
+        let cfg =
+            Config { uri: base.clone(), upstream_max_concurrent: 1, ..Config::test_default() };
+        let client = Arc::new(PcsClient::new(&cfg).unwrap());
+        let first = tokio::spawn({
+            let client = client.clone();
+            let url = base.clone();
+            async move { client.post_bytes_once(&url, "application/ocsp-request", b"ocsp").await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 1.0);
+        let second = tokio::spawn({
+            let client = client.clone();
+            let url = base.clone();
+            async move { client.post_json_once(&url, b"{}").await }
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 1.0);
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_count"), 1.0);
+        release.notify_one();
+        assert_eq!(first.await.unwrap().unwrap().0, 200);
+        assert_eq!(second.await.unwrap().unwrap().0, 200);
+        let wait = metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_sum");
+        let first_duration = metric_value(
+            &client.metrics,
+            "pccs_upstream_attempt_duration_seconds_sum{upstream=\"nvidia_ocsp\"}",
+        );
+        let second_duration = metric_value(
+            &client.metrics,
+            "pccs_upstream_attempt_duration_seconds_sum{upstream=\"nvidia_nras\"}",
+        );
+        assert!(wait >= 0.06, "the blocked request's permit wait was not observed: {wait}");
+        assert!(
+            first_duration >= 0.06,
+            "the active request's response wait was not observed: {first_duration}"
+        );
+        assert!(
+            second_duration < wait,
+            "permit wait leaked into the NRAS attempt: {second_duration} >= {wait}"
+        );
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_count"), 2.0);
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn metrics_record_cancelled_permit_wait_without_attempt() {
+        let cfg = Config { upstream_max_concurrent: 1, ..Config::test_default() };
+        let client = PcsClient::new(&cfg).unwrap();
+        // Occupy the sole slot; the public request must never touch the network.
+        let _held = client.permits.clone().acquire_owned().await.unwrap();
+        let request = client.post_json_once("http://127.0.0.1:1/attest", b"{}");
+        assert!(tokio::time::timeout(Duration::from_millis(30), request).await.is_err());
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_count"), 1.0);
+        assert!(metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_sum") >= 0.025);
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 0.0);
+        assert!(client
+            .metrics
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("pccs_upstream_requests_total{"))
+            .all(|line| line.ends_with(" 0")));
+    }
+
+    #[tokio::test]
+    async fn metrics_server_timing_includes_retry_backoff_but_attempt_histogram_does_not() {
+        use axum::routing::any;
+        use tower::ServiceExt;
+        let calls = Arc::new(AtomicU64::new(0));
+        let app = axum::Router::new().fallback(any(move || {
+            let calls = calls.clone();
+            async move {
+                let status = if calls.fetch_add(1, Ordering::Relaxed) == 0 { 429 } else { 200 };
+                hyper::Response::builder()
+                    .status(status)
+                    .body(axum::body::Body::from("body"))
+                    .unwrap()
+            }
+        }));
+        let base = spawn(app).await;
+        let cfg = Config { upstream_max_attempts: 2, ..Config::test_default() };
+        let client = Arc::new(PcsClient::new(&cfg).unwrap());
+        let app = axum::Router::new()
+            .route(
+                "/test",
+                any({
+                    let client = client.clone();
+                    move || {
+                        let client = client.clone();
+                        let url = base.clone();
+                        async move {
+                            assert_eq!(
+                                client.get_url_for(Upstream::NvidiaRim, &url).await.unwrap().0,
+                                200
+                            );
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                (client.metrics.clone(), true),
+                crate::metrics::http_middleware,
+            ));
+        let response = app
+            .oneshot(Request::get("/test").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let header = response.headers().get("server-timing").unwrap().to_str().unwrap();
+        let upstream_ms: f64 = header
+            .split(", ")
+            .find_map(|part| part.strip_prefix("upstream;dur="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let attempt_ms = metric_value(
+            &client.metrics,
+            "pccs_upstream_attempt_duration_seconds_sum{upstream=\"nvidia_rim\"}",
+        ) * 1000.0;
+        assert!(
+            upstream_ms >= attempt_ms + 80.0,
+            "backoff missing from upstream timing: {header}; attempts {attempt_ms}ms"
+        );
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_attempt_duration_seconds_count{upstream=\"nvidia_rim\"}"
+            ),
+            2.0
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_inflight_is_released_on_cancellation_for_all_request_methods() {
+        use axum::routing::any;
+        for method in ["get", "json", "bytes"] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let app = axum::Router::new().fallback(any({
+                let entered = entered.clone();
+                move || {
+                    let entered = entered.clone();
+                    async move {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                        "never"
+                    }
+                }
+            }));
+            let base = spawn(app).await;
+            let client = Arc::new(client_for(&base));
+            let request = tokio::spawn({
+                let client = client.clone();
+                async move {
+                    match method {
+                        "get" => client.get_url_for(Upstream::NvidiaRim, &base).await,
+                        "json" => client.post_json_once(&base, b"{}").await,
+                        _ => {
+                            client.post_bytes_once(&base, "application/ocsp-request", b"ocsp").await
+                        }
+                    }
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+            assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 1.0, "{method}");
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 0.0, "{method}");
+            assert_eq!(
+                metric_value(&client.metrics, "pccs_upstream_permit_wait_seconds_count"),
+                1.0,
+                "{method}"
+            );
+            let upstream = match method {
+                "get" => "nvidia_rim",
+                "json" => "nvidia_nras",
+                _ => "nvidia_ocsp",
+            };
+            assert_eq!(
+                metric_value(
+                    &client.metrics,
+                    &format!(
+                        "pccs_upstream_requests_total{{upstream=\"{upstream}\",status=\"error\"}}"
+                    )
+                ),
+                1.0
+            );
+            assert_eq!(
+                metric_value(
+                    &client.metrics,
+                    &format!(
+                        "pccs_upstream_attempt_duration_seconds_count{{upstream=\"{upstream}\"}}"
+                    )
+                ),
+                1.0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_record_attempt_dropped_by_outer_timeout() {
+        use axum::routing::any;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().fallback(any({
+            let entered = entered.clone();
+            move || {
+                let entered = entered.clone();
+                async move {
+                    entered.notify_one();
+                    std::future::pending::<()>().await;
+                    "never"
+                }
+            }
+        }));
+        let base = spawn(app).await;
+        let client = client_for(&base);
+        let mut request = Box::pin(client.get_url_for(Upstream::AmdKds, &base));
+        tokio::select! {
+            _ = entered.notified() => {},
+            result = &mut request => panic!("request completed before outer timeout: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("request did not reach mock"),
+        }
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 1.0);
+        // Simulates the cache's shorter refetch deadline dropping the request.
+        assert!(tokio::time::timeout(Duration::from_millis(30), request).await.is_err());
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_requests_total{upstream=\"amd_kds\",status=\"error\"}"
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_attempt_duration_seconds_count{upstream=\"amd_kds\"}"
+            ),
+            1.0
+        );
+        assert!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_attempt_duration_seconds_sum{upstream=\"amd_kds\"}"
+            ) >= 0.025
+        );
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 0.0);
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_requests_total{upstream=\"amd_kds\",status=\"timeout\"}"
+            ),
+            0.0,
+            "only the client's own timeout uses timeout status"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_classify_configured_mock_get_endpoints() {
+        let (_, app) = recorder();
+        let amd = spawn(app).await;
+        let (_, app) = recorder();
+        let rim = spawn(app).await;
+        let (_, app) = recorder();
+        let pcs = spawn(app).await;
+        let cfg = Config {
+            uri: pcs.clone(),
+            amd_kds_uri: format!("  {amd}vcek/v1  "),
+            nvidia_rim_uri: format!("  {rim}v1/rim  "),
+            upstream_max_attempts: 1,
+            ..Config::test_default()
+        };
+        let client = PcsClient::new(&cfg).unwrap();
+        for (url, upstream) in [(&amd, "amd_kds"), (&rim, "nvidia_rim"), (&pcs, "pccs")] {
+            assert_eq!(client.get_url(url).await.unwrap().0, 404);
+            assert_eq!(
+                metric_value(
+                    &client.metrics,
+                    &format!(
+                        "pccs_upstream_requests_total{{upstream=\"{upstream}\",status=\"404\"}}"
+                    )
+                ),
+                1.0
+            );
+        }
+        // Explicit identity still works when all services share one mock URL.
+        assert_eq!(client.get_url_for(Upstream::NvidiaRim, &pcs).await.unwrap().0, 404);
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_requests_total{upstream=\"nvidia_rim\",status=\"404\"}"
+            ),
+            2.0
+        );
+        assert!(!client.metrics.render().contains("127.0.0.1"), "URLs cannot become labels");
+        assert_eq!(client.upstream_for_url(INTEL_ROOT_CA_CRL_URL), Upstream::IntelCerts);
+        assert_eq!(
+            client.upstream_for_url("https://certprx.adsdcsp.com/IntelSGXRootCA.der"),
+            Upstream::IntelCerts
+        );
+        assert_eq!(
+            client
+                .upstream_for_url("https://api.trustedservices.intel.com/sgx/certification/v4/tcb"),
+            Upstream::IntelPcs
+        );
+        assert_eq!(
+            client.upstream_for_url(
+                "https://validation.api.trustedservices.intel.com/sgx/certification/v4/tcb"
+            ),
+            Upstream::IntelPcs
+        );
+        assert_eq!(client.upstream_for_url("https://unrecognized.example/crl"), Upstream::Pccs);
+    }
+
+    #[test]
+    fn metrics_classify_all_valid_intel_crl_endpoints() {
+        let client = PcsClient::new(&Config::test_default()).unwrap();
+        for url in [
+            INTEL_ROOT_CA_CRL_URL,
+            "https://certprx.adsdcsp.com/IntelSGXRootCA.crl",
+            "https://foo-certificates.trustedservices.intel.com/IntelSGXRootCA.crl",
+        ] {
+            assert_eq!(client.upstream_for_url(url), Upstream::IntelCerts, "{url}");
+        }
+        for url in [
+            "https://api.trustedservices.intel.com/sgx/certification/v4/pckcrl?ca=processor",
+            "https://uswest.az.sgxprod.adsdcsp.com/sgx/certification/v4/pckcrl?ca=processor",
+            "https://uswest.az.sgxnp.adsdcsp.com/sgx/certification/v4/pckcrl?ca=platform",
+        ] {
+            assert_eq!(client.upstream_for_url(url), Upstream::IntelPcs, "{url}");
+        }
+        for url in [
+            "https://evil.certificates.trustedservices.intel.com/IntelSGXRootCA.crl",
+            "https://certificates.trustedservices.intel.com.evil.test/IntelSGXRootCA.crl",
+            "https://uswest.az.sgxprod.adsdcsp.com.evil.test/sgx/certification/v4/pckcrl?ca=processor",
+            "https://evil.uswest.az.sgxnp.adsdcsp.com/sgx/certification/v4/pckcrl?ca=platform",
+        ] {
+            assert_eq!(client.upstream_for_url(url), Upstream::Pccs, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_do_not_count_throttled_retry_cancelled_during_backoff() {
+        use axum::routing::any;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().fallback(any({
+            let entered = entered.clone();
+            move || {
+                let entered = entered.clone();
+                async move {
+                    entered.notify_one();
+                    hyper::Response::builder()
+                        .status(429)
+                        .header(hyper::header::RETRY_AFTER, "30")
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }
+        }));
+        let base = spawn(app).await;
+        let cfg = Config { uri: base.clone(), upstream_max_attempts: 2, ..Config::test_default() };
+        let client = Arc::new(PcsClient::new(&cfg).unwrap());
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { client.get_url_for(Upstream::AmdKds, &base).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+        // The handler notified before returning its response. Wait for the
+        // completed attempt, rather than assuming which task is scheduled next.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.metrics.render().contains("status=\"429\"} 1\n") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(metric_value(&client.metrics, "pccs_upstream_inflight"), 0.0);
+        assert!(client
+            .metrics
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("pccs_upstream_throttled_total{"))
+            .all(|line| line.ends_with(" 0")));
+    }
+
     #[tokio::test]
     async fn pckcert_pccs_normalises_and_encodes() {
         let (seen, app) = recorder();
@@ -1425,6 +2169,24 @@ mod tests {
             calls.load(Ordering::Relaxed),
             u64::from(MAX_THROTTLED_ATTEMPTS),
             "a 429/503 storm is not amplified by the full retry budget"
+        );
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_requests_total{upstream=\"pccs\",status=\"503\"}"
+            ),
+            3.0
+        );
+        assert_eq!(
+            metric_value(&client.metrics, "pccs_upstream_throttled_total{upstream=\"pccs\"}"),
+            2.0
+        );
+        assert_eq!(
+            metric_value(
+                &client.metrics,
+                "pccs_upstream_attempt_duration_seconds_count{upstream=\"pccs\"}"
+            ),
+            3.0
         );
     }
 

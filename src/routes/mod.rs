@@ -1,3 +1,4 @@
+// When adding a route, update metrics::ROUTES.
 pub mod handlers;
 
 use crate::auth::{self, AppState};
