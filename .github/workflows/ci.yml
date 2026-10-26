@@ -29,3 +29,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --all-targets
+
+  version-check:
+    name: binary --version matches Cargo.toml
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build pccs-rs binary
+        run: cargo build --bin pccs-rs
+      - name: Verify --version matches Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(grep '^version =' Cargo.toml | head -n1 | sed 's/.*"\([^"]*\)".*/\1/')
+          actual=$(./target/debug/pccs-rs --version | awk '{print $2}')
+          echo "Cargo.toml version: $expected"
+          echo "binary --version:   $actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "ERROR: binary --version ($actual) does not match Cargo.toml ($expected)" >&2
+            exit 1
+          fi

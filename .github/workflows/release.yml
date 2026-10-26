@@ -187,13 +187,31 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # The released binaries read their version from CARGO_PKG_VERSION, which
+      # comes from Cargo.toml. Make the tagged commit carry the matching
+      # version so image, .deb and local builds all agree.
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: bump Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          semver="${version#v}"
+          sed -i "s/^version = \".*\"/version = \"$semver\"/" Cargo.toml
+          cargo update -p pccs-rs --offline
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): bump version to $version"
+          git push origin HEAD
+
       - name: create and push tag
         shell: bash
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$version" -m "release $version"
           git push origin "$version"
 

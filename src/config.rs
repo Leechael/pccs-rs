@@ -114,6 +114,7 @@ impl CacheMode {
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "pccs-rs",
+    version,
     about = "Rust collateral cache for Intel PCS and AMD KDS (RocksDB, Caddy-friendly HTTP)"
 )]
 pub struct Cli {
