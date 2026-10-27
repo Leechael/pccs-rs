@@ -262,12 +262,26 @@ jobs:
           git tag -a "$version" -m "release $version"
           git push origin "$version"
 
+  # Each leg builds natively (no emulation) and uploads its files as a workflow
+  # artifact. Nothing here talks to the Release API; `publish` does that once.
   build:
-    name: Build x86_64-linux
+    name: Build ${{ matrix.arch }}-linux
     needs: [prepare, create-tag]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -279,8 +293,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-gnu-ubuntu-20.04-${{ hashFiles('Cargo.lock') }}
+          key: release-gnu-ubuntu-20.04-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
       - name: Build release binary (glibc 2.31)
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git"
           docker run --rm \
@@ -290,6 +306,7 @@ jobs:
             -w /src \
             -e CARGO_TERM_COLOR=always \
             -e DEBIAN_FRONTEND=noninteractive \
+            -e TARGET \
             ubuntu:20.04 \
             bash -lc '
               set -euo pipefail
@@ -300,53 +317,85 @@ jobs:
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
                 | sh -s -- -y --default-toolchain stable --profile minimal
               . "$HOME/.cargo/env"
-              cargo build --release --locked --bin pccs-rs --target x86_64-unknown-linux-gnu
+              cargo build --release --locked --bin pccs-rs --target "$TARGET"
             '
       - name: Verify release binary version
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           expected="${{ needs.create-tag.outputs.version }}"
           expected="${expected#v}"
-          actual=$(./target/x86_64-unknown-linux-gnu/release/pccs-rs --version)
+          actual=$("./target/$TARGET/release/pccs-rs" --version)
           echo "expected=pccs-rs $expected actual=$actual"
           if [ "pccs-rs $expected" != "$actual" ]; then
             echo "ERROR: release binary --version ($actual) does not match tag ($expected)" >&2
             exit 1
           fi
       - name: Package tarball and deb
+        env:
+          TARGET: ${{ matrix.target }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
           mkdir -p dist
-          tar -C target/x86_64-unknown-linux-gnu/release -czf dist/pccs-rs-x86_64-unknown-linux-gnu.tar.gz pccs-rs
-          (cd dist && sha256sum pccs-rs-x86_64-unknown-linux-gnu.tar.gz > pccs-rs-x86_64-unknown-linux-gnu.tar.gz.sha256)
+          tar -C "target/$TARGET/release" -czf "dist/pccs-rs-$TARGET.tar.gz" pccs-rs
+          (cd dist && sha256sum "pccs-rs-$TARGET.tar.gz" > "pccs-rs-$TARGET.tar.gz.sha256")
           VERSION="${{ needs.create-tag.outputs.version }}"
           VERSION="${VERSION#v}"
           chmod +x packaging/build-deb.sh
           ./packaging/build-deb.sh \
             --version "$VERSION" \
-            --binary target/x86_64-unknown-linux-gnu/release/pccs-rs \
+            --arch "$DEB_ARCH" \
+            --binary "target/$TARGET/release/pccs-rs" \
             --output dist
-          (cd dist && sha256sum "pccs-rs_${VERSION}_amd64.deb" > "pccs-rs_${VERSION}_amd64.deb.sha256")
+          (cd dist && sha256sum "pccs-rs_${VERSION}_${DEB_ARCH}.deb" > "pccs-rs_${VERSION}_${DEB_ARCH}.deb.sha256")
       - name: Verify deb metadata and packaged binary version
+        env:
+          DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
           set -euo pipefail
           expected="${{ needs.create-tag.outputs.version }}"
           expected="${expected#v}"
-          deb="dist/pccs-rs_${expected}_amd64.deb"
+          deb="dist/pccs-rs_${expected}_${DEB_ARCH}.deb"
           test "$(dpkg-deb --field "$deb" Version)" = "$expected"
+          test "$(dpkg-deb --field "$deb" Architecture)" = "$DEB_ARCH"
           extracted=$(mktemp -d)
           trap 'rm -rf "$extracted"' EXIT
           dpkg-deb --extract "$deb" "$extracted"
           actual=$("$extracted/usr/bin/pccs-rs" --version)
           echo "expected=pccs-rs $expected actual=$actual"
           test "$actual" = "pccs-rs $expected"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.deb_arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Single publisher: runs once after every build leg succeeded, so a failed
+  # leg means no release and the Release API is never raced or called twice.
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare, create-tag, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           CHANGELOG: ${{ needs.create-tag.outputs.changelog }}
           VERSION: ${{ needs.create-tag.outputs.version }}
           REPO_LOWER: ${{ needs.prepare.outputs.repo_lower }}
         run: |
           set -euo pipefail
+          ls -l dist
+          test "$(find dist -type f | wc -l)" -eq 8
           image_tag="${VERSION#v}"
           {
             echo "## changelog"
@@ -364,13 +413,25 @@ jobs:
             --title "$VERSION" \
             --notes-file /tmp/release-notes.md
 
-  docker:
-    name: Publish GHCR image
+  # Per-arch images are built natively and pushed by digest only (no tags).
+  # `docker-manifest` stitches the digests into one multi-arch tag set.
+  docker-build:
+    name: Build GHCR image (${{ matrix.platform }})
     needs: [prepare, create-tag]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            pair: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            pair: arm64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -399,14 +460,13 @@ jobs:
         continue-on-error: true
         with:
           context: .
-          push: true
           provenance: false
           sbom: false
-          platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.prepare.outputs.repo_lower }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.pair }}
       - name: Wait before retry
         if: steps.build1.outcome == 'failure'
         run: sleep 60
@@ -416,14 +476,13 @@ jobs:
         continue-on-error: true
         with:
           context: .
-          push: true
           provenance: false
           sbom: false
-          platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.prepare.outputs.repo_lower }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.pair }}
       - name: Wait before retry
         if: steps.build2.outcome == 'failure'
         run: sleep 180
@@ -432,25 +491,120 @@ jobs:
         if: steps.build2.outcome == 'failure'
         with:
           context: .
-          push: true
           provenance: false
           sbom: false
-          platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.prepare.outputs.repo_lower }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.pair }}
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build3.outputs.digest || steps.build2.outputs.digest || steps.build1.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    name: Publish GHCR multi-arch manifest
+    needs: [prepare, create-tag, docker-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          flavor: |
+            latest=true
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.create-tag.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.create-tag.outputs.version }}
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.repo_lower }}
+        run: |
+          set -euo pipefail
+          test "$(find . -type f | wc -l)" -eq 2
+          # Build the argument vectors explicitly instead of word-splitting.
+          tag_args=()
+          while read -r tag; do tag_args+=(-t "$tag"); done \
+            < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          src=()
+          for d in *; do src+=("$IMAGE@sha256:$d"); done
+          for attempt in 1 2 3; do
+            docker buildx imagetools create "${tag_args[@]}" "${src[@]}" && exit 0
+            echo "imagetools create failed (attempt $attempt)" >&2
+            sleep $((attempt * 30))
+          done
+          exit 1
+      - name: Inspect manifest list
+        env:
+          VERSION: ${{ needs.create-tag.outputs.version }}
+          REPO_LOWER: ${{ needs.prepare.outputs.repo_lower }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${REPO_LOWER}:${VERSION#v}"
+          out=$(docker buildx imagetools inspect "$image")
+          echo "$out"
+          grep -q 'Platform:[[:space:]]*linux/amd64' <<< "$out"
+          grep -q 'Platform:[[:space:]]*linux/arm64' <<< "$out"
+
+  docker-verify:
+    name: Verify GHCR image (${{ matrix.platform }})
+    needs: [prepare, create-tag, docker-manifest]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Verify GHCR image version
-        if: steps.build1.outcome == 'success' || steps.build2.outcome == 'success' || steps.build3.outcome == 'success'
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           expected="${{ needs.create-tag.outputs.version }}"
           expected="${expected#v}"
           image="ghcr.io/${{ needs.prepare.outputs.repo_lower }}:$expected"
-          docker pull "$image"
-          actual=$(docker run --rm --platform linux/amd64 "$image" --version)
+          docker pull --platform "$PLATFORM" "$image"
+          actual=$(docker run --rm --platform "$PLATFORM" "$image" --version)
           echo "expected=pccs-rs $expected actual=$actual"
           if [ "pccs-rs $expected" != "$actual" ]; then
-            echo "ERROR: image --version ($actual) does not match tag ($expected)" >&2
+            echo "ERROR: $PLATFORM image --version ($actual) does not match tag ($expected)" >&2
             exit 1
           fi
