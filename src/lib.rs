@@ -64,9 +64,14 @@ pub fn create_app(state: AppState) -> Router {
             .nest("/tdx/certification/v4", routes::tdx_router());
     }
 
-    app.nest("/healthz", routes::healthz_router())
-        .fallback(routes::handlers::not_found)
-        .layer(DefaultBodyLimit::max(body_limit))
+    app = app.nest("/healthz", routes::healthz_router()).fallback(routes::handlers::not_found);
+    if let Some(max_age) = state.config.collateral_cache_max_age_secs {
+        app = app.layer(middleware::from_fn_with_state(
+            max_age,
+            routes::handlers::collateral_cache_control,
+        ));
+    }
+    app.layer(DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn(routes::handlers::reject_unexpected_body))
         .layer(middleware::from_fn(routes::handlers::reject_trailing_slash))
         // CORS wraps the body-limit 413, but stays inside Request-ID so OPTIONS

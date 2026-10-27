@@ -49,6 +49,11 @@ db_path = "/var/lib/pccs-rs"
 # pool_refetch_interval_seconds = 86400
 # Re-fetch known platform pools during the scheduled refresh. Default true.
 # scheduled_pool_refresh = true
+# Opt-in, for running behind a CDN. When set, Intel collateral GET/HEAD routes
+# (tcb, qe/qve identity, pckcrl, rootcacrl) answer 200 with
+# "Cache-Control: public, max-age=N" and errors with "no-store". Unset (the
+# default) adds no header; 0 is treated as unset. Env: PCCS_COLLATERAL_CACHE_MAX_AGE.
+# collateral_cache_max_age_seconds = 900
 # rocksdb_block_cache_mb = 8
 # rocksdb_write_buffer_mb = 64
 # rocksdb_max_write_buffers = 2

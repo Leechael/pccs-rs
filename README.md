@@ -248,6 +248,36 @@ Upstream requests: 120s total, 10s connect, 16 MiB response cap,
 `upstream_max_attempts` tries (429/503 retried at most twice, honouring
 `Retry-After`).
 
+### Running behind a CDN
+
+Intel collateral (TCB info, QE/QVE identity, PCK CRL, root CA CRL) is the same
+few hundred objects for every client, so a CDN can serve most of it. By
+default pccs-rs sends no `Cache-Control`, so nothing is cached. Opt in with:
+
+| CLI | env | TOML |
+|-----|-----|------|
+| `--collateral-cache-max-age` | `PCCS_COLLATERAL_CACHE_MAX_AGE` | `collateral_cache_max_age_seconds` |
+
+With `N` set, `GET`/`HEAD` on these routes (SGX v4 and v3, TDX v4: `tcb`,
+`qe/identity`, `qve/identity`, `pckcrl`, `rootcacrl`) answer `200` with
+`Cache-Control: public, max-age=N` and every other status with
+`Cache-Control: no-store`, so a CDN never keeps a 404 or 5xx. The configured
+value replaces any `Cache-Control` the response already carried. Unset keeps
+today's behaviour; `0` is treated as unset (a startup warning is logged).
+
+`/pckcert`, AMD KDS (`/vcek`, `/vlek`), NVIDIA, `/healthz`, admin and write
+routes never get the header. PCK certificates stay uncached.
+
+Cloudflare does not cache extensionless paths by default, so a Cache Rule is
+required: match `GET` on `/sgx/certification/*` and `/tdx/certification/*`,
+mark it eligible for cache, set Edge TTL to "use cache-control header if
+present", and do not cache when the origin sends `no-store`. Exclude
+`/pckcert` if you want to be explicit; the origin never marks it cacheable.
+
+Trade-off: the CDN TTL adds up to `N` seconds on top of the cache refresh
+interval before a new TCB info or CRL is visible to clients. Values between
+600 and 1800 are a reasonable start.
+
 ### Caching modes
 
 | Mode | GET miss | POST /platforms | Refresh | NRAS `POST /nvidia/nras/attest/gpu` |

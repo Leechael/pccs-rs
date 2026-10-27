@@ -302,6 +302,12 @@ pub struct ServeArgs {
     #[arg(long, env = "PCCS_KEEPALIVE_TIMEOUT_SECONDS")]
     pub keepalive_timeout_seconds: Option<u64>,
 
+    /// Send `Cache-Control: public, max-age=N` on Intel collateral 200s (and
+    /// `no-store` on their errors) so a CDN can cache them. Unset = no header;
+    /// 0 is treated as unset.
+    #[arg(long, env = "PCCS_COLLATERAL_CACHE_MAX_AGE")]
+    pub collateral_cache_max_age: Option<u64>,
+
     /// Max concurrent upstream PCS requests. Default 64.
     #[arg(long, env = "PCCS_UPSTREAM_MAX_CONCURRENT")]
     pub upstream_max_concurrent: Option<usize>,
@@ -405,6 +411,7 @@ struct TomlConfig {
     request_timeout_seconds: Option<u64>,
     headers_timeout_seconds: Option<u64>,
     keepalive_timeout_seconds: Option<u64>,
+    collateral_cache_max_age_seconds: Option<u64>,
     upstream_max_concurrent: Option<usize>,
     upstream_max_attempts: Option<u32>,
     upstream_pool_idle_seconds: Option<u64>,
@@ -455,6 +462,9 @@ pub struct Config {
     pub upstream_max_concurrent: usize,
     pub upstream_max_attempts: u32,
     pub upstream_pool_idle_secs: u64,
+    /// `Some(n)` (n > 0): Intel collateral routes carry `Cache-Control:
+    /// public, max-age=n` on 200 and `no-store` otherwise. `None`: no header.
+    pub collateral_cache_max_age_secs: Option<u64>,
     /// Intel PCS + LAZY only: re-fetch a known platform's PCK cert pool when a
     /// `/pckcert` GET asks for a raw TCB the pool has never seen.
     pub pool_refetch_on_new_tcb: bool,
@@ -513,6 +523,7 @@ impl Default for Config {
             upstream_max_concurrent: DEFAULT_UPSTREAM_MAX_CONCURRENT,
             upstream_max_attempts: DEFAULT_UPSTREAM_MAX_ATTEMPTS,
             upstream_pool_idle_secs: DEFAULT_UPSTREAM_POOL_IDLE_SECS,
+            collateral_cache_max_age_secs: None,
             pool_refetch_on_new_tcb: DEFAULT_POOL_REFETCH_ON_NEW_TCB,
             pool_refetch_interval_secs: DEFAULT_POOL_REFETCH_INTERVAL_SECS,
             scheduled_pool_refresh: DEFAULT_SCHEDULED_POOL_REFRESH,
@@ -676,6 +687,18 @@ fn load_toml(path: &Path) -> TomlConfig {
     })
 }
 
+/// 0 would tell a CDN to cache nothing while still looking configured, so it
+/// is treated as unset.
+fn set_collateral_cache_max_age(cfg: &mut Config, secs: u64) {
+    if secs == 0 {
+        cfg.collateral_cache_max_age_secs = None;
+        cfg.warnings
+            .push("collateral_cache_max_age is 0; Cache-Control header stays disabled".into());
+    } else {
+        cfg.collateral_cache_max_age_secs = Some(secs);
+    }
+}
+
 fn apply_toml(cfg: &mut Config, file: TomlConfig) {
     if let Some(h) = file.host {
         cfg.host = h;
@@ -789,6 +812,9 @@ fn apply_toml(cfg: &mut Config, file: TomlConfig) {
     if let Some(v) = file.pool_refetch_on_new_tcb {
         cfg.pool_refetch_on_new_tcb = v;
     }
+    if let Some(n) = file.collateral_cache_max_age_seconds {
+        set_collateral_cache_max_age(cfg, n);
+    }
     if let Some(n) = file.pool_refetch_interval_seconds {
         cfg.pool_refetch_interval_secs = n;
     }
@@ -809,6 +835,9 @@ fn apply_cli(cfg: &mut Config, c: ServeArgs) {
     }
     if let Some(enabled) = c.server_timing {
         cfg.server_timing = enabled;
+    }
+    if let Some(n) = c.collateral_cache_max_age {
+        set_collateral_cache_max_age(cfg, n);
     }
     // Only override the file when a transport flag is actually passed.
     // `--https` / `--http` are clap store-true, so the unset default is false.
@@ -1514,9 +1543,44 @@ mod tests {
             "# pool_refetch_on_new_tcb = true",
             "# pool_refetch_interval_seconds = 86400",
             "# scheduled_pool_refresh = true",
+            "# collateral_cache_max_age_seconds = 900",
         ] {
             assert!(DEFAULT_CONFIG_TOML.contains(key), "template must mention {key}");
         }
+    }
+
+    #[test]
+    fn collateral_cache_max_age_env_file_and_zero() {
+        let _env = clear_pccs_env();
+        assert_eq!(Config::default().collateral_cache_max_age_secs, None);
+        let file: TomlConfig = toml::from_str("collateral_cache_max_age_seconds = 600").unwrap();
+        let mut cfg = Config::default();
+        apply_toml(&mut cfg, file);
+        assert_eq!(cfg.collateral_cache_max_age_secs, Some(600));
+        assert!(cfg.warnings.is_empty());
+
+        // CLI/env overrides the file.
+        apply_cli(&mut cfg, ServeArgs::parse_from(["pccs-rs", "--collateral-cache-max-age", "60"]));
+        assert_eq!(cfg.collateral_cache_max_age_secs, Some(60));
+
+        // 0 from either source means unset, with a warning.
+        let file: TomlConfig = toml::from_str("collateral_cache_max_age_seconds = 0").unwrap();
+        let mut cfg = Config::default();
+        apply_toml(&mut cfg, file);
+        assert_eq!(cfg.collateral_cache_max_age_secs, None);
+        assert_eq!(cfg.warnings.len(), 1);
+        let mut cfg = Config { collateral_cache_max_age_secs: Some(5), ..Config::default() };
+        apply_cli(&mut cfg, ServeArgs::parse_from(["pccs-rs", "--collateral-cache-max-age", "0"]));
+        assert_eq!(cfg.collateral_cache_max_age_secs, None);
+    }
+
+    #[test]
+    fn collateral_cache_max_age_reads_env_var() {
+        let _env = clear_pccs_env();
+        std::env::set_var("PCCS_COLLATERAL_CACHE_MAX_AGE", "900");
+        let cfg = parse_serve(["pccs-rs"]);
+        std::env::remove_var("PCCS_COLLATERAL_CACHE_MAX_AGE");
+        assert_eq!(cfg.collateral_cache_max_age_secs, Some(900));
     }
 
     #[test]
