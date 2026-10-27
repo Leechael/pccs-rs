@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assemble an amd64 .deb from a pre-built pccs-rs binary.
+# Assemble a .deb (amd64 by default, or arm64 via --arch) from a pre-built pccs-rs binary.
 # Prefer dpkg-deb when present; fall back to ar+tar so the script can be
 # checked on macOS. The GitHub release job runs this on Linux.
 set -euo pipefail
@@ -11,7 +11,7 @@ ARCH="amd64"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 usage() {
-  echo "usage: $0 --version VERSION --binary PATH [--output DIR]" >&2
+  echo "usage: $0 --version VERSION --binary PATH [--output DIR] [--arch amd64|arm64]" >&2
   exit 2
 }
 
@@ -40,11 +40,16 @@ while [[ $# -gt 0 ]]; do
     --version) VERSION="${2:-}"; shift 2 ;;
     --binary) BINARY="${2:-}"; shift 2 ;;
     --output) OUTPUT="${2:-}"; shift 2 ;;
+    --arch) ARCH="${2:-}"; shift 2 ;;
     *) usage ;;
   esac
 done
 [[ -n "$VERSION" && -n "$BINARY" ]] || usage
 [[ -f "$BINARY" ]] || { echo "binary not found: $BINARY" >&2; exit 1; }
+case "$ARCH" in
+  amd64|arm64) ;;
+  *) echo "unsupported Debian architecture: $ARCH" >&2; exit 1 ;;
+esac
 if [[ ! "$VERSION" =~ ^[0-9][A-Za-z0-9.+~-]*$ ]]; then
   echo "invalid Debian package version: $VERSION" >&2
   exit 1
