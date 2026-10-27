@@ -5,7 +5,7 @@ use crate::error::{self, PccsBytes, PccsError, PccsJson};
 use crate::headers;
 use crate::store::RegisteredPlatform;
 use crate::validate::{self, PlatformsSource};
-use axum::extract::{FromRequestParts, OriginalUri, Request, State};
+use axum::extract::{FromRequestParts, MatchedPath, OriginalUri, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
@@ -143,6 +143,52 @@ pub async fn nras_cors(req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;
     if nras {
         insert_nras_cors(response.headers_mut());
+    }
+    response
+}
+
+// --------------- Intel collateral Cache-Control ---------------
+
+/// MatchedPath templates (see `metrics::ROUTES`) whose responses a CDN may
+/// cache: platform-independent Intel collateral. pckcert, AMD, NVIDIA, health,
+/// admin and unmatched routes are deliberately absent.
+const CACHEABLE_COLLATERAL: &[&str] = &[
+    "/sgx/certification/v3/pckcrl",
+    "/sgx/certification/v3/tcb",
+    "/sgx/certification/v3/qe/identity",
+    "/sgx/certification/v3/qve/identity",
+    "/sgx/certification/v3/rootcacrl",
+    "/sgx/certification/v4/pckcrl",
+    "/sgx/certification/v4/tcb",
+    "/sgx/certification/v4/qe/identity",
+    "/sgx/certification/v4/qve/identity",
+    "/sgx/certification/v4/rootcacrl",
+    "/tdx/certification/v4/tcb",
+    "/tdx/certification/v4/qe/identity",
+];
+
+/// Opt-in `Cache-Control` for cacheable collateral: `public, max-age=N` on 200,
+/// `no-store` on anything else, so a CDN never keeps a 404 or 5xx. It replaces
+/// any `Cache-Control` already on the response.
+pub async fn collateral_cache_control(
+    State(max_age): State<u64>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let cacheable = matches!(*req.method(), Method::GET | Method::HEAD)
+        && req
+            .extensions()
+            .get::<MatchedPath>()
+            .is_some_and(|path| CACHEABLE_COLLATERAL.contains(&path.as_str()));
+    let mut response = next.run(req).await;
+    if cacheable {
+        let value = if response.status() == StatusCode::OK {
+            HeaderValue::from_str(&format!("public, max-age={max_age}"))
+                .expect("numeric Cache-Control value")
+        } else {
+            HeaderValue::from_static("no-store")
+        };
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
     }
     response
 }
