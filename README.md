@@ -3,8 +3,18 @@
 Rust + Tokio replacement for
 [Intel PCCS](https://github.com/intel/confidential-computing.tee.dcap.pccs)
 (Provisioning Certificate Caching Service). HTTP API is 1:1 with Node PCCS
-(SGX v3 + v4, TDX v4) and also provides read-through caches for AMD KDS (`/vcek/`, `/vlek/`), NVIDIA RIM (`/v1/rim/`), and NVIDIA OCSP (`POST /ocsp`), plus a CORS proxy for NVIDIA NRAS GPU attestation (`POST /nvidia/nras/attest/gpu`).
+(SGX v3 + v4, TDX v4) and also provides read-through caches for AMD KDS (`/vcek/`, `/vlek/`), NVIDIA RIM (`/v1/rim/`), and NVIDIA OCSP (`POST /ocsp`), plus a stateless proxy for NVIDIA NRAS GPU attestation (`POST /nvidia/nras/attest/gpu`).
 The cache is RocksDB and survives restart.
+
+Collateral endpoints carry permissive CORS (`Access-Control-Allow-Origin: *`,
+`Expose-Headers` covers the Intel issuer-chain/`SGX-TCBm` headers that
+browser clients such as dcap-qvl read, `Max-Age: 86400`), and OPTIONS
+preflight is answered for those paths: Intel `/sgx/certification/v3|v4` and
+`/tdx/certification/v4` collateral reads, AMD `/vcek/` `/vlek/`, NVIDIA
+`/v1/rim/`, `/ocsp` and `/nvidia/nras`. All served data is public signed
+collateral and auth uses non-ambient `user-token`/`admin-token` headers, so
+`*` exposes nothing sensitive; the static value also keeps CDN-cached copies
+valid for every origin (no `Vary: Origin`).
 
 Sit it behind Caddy or nginx. This repo does not ship a reverse-proxy config.
 
@@ -191,10 +201,8 @@ db_path = "/var/lib/pccs-rs"
 - The NVIDIA NRAS host defaults to `https://nras.attestation.nvidia.com`.
   `POST /nvidia/nras/attest/gpu` is a **stateless CORS proxy** to
   `{host}/v3/attest/gpu`. Responses are nonce-bound and are **not** stored in
-  RocksDB. `Cache-Control: no-store`. CORS (`Access-Control-Allow-Origin: *`,
-  `Allow-Methods: POST, OPTIONS`, `Allow-Headers: Content-Type`,
-  `Expose-Headers: Retry-After`) is applied to every `/nvidia/nras` response,
-  including extractor errors and `413`.
+  RocksDB. `Cache-Control: no-store` is applied to every `/nvidia/nras`
+  response (and its preflight), including extractor errors and `413`.
   Example:
   `curl -sS -X POST http://127.0.0.1:8081/nvidia/nras/attest/gpu -H 'Content-Type: application/json' -d '{"nonce":"…","evidence_list":[…]}'`
 - `api_key` is sent where Node sends it: on `pckcerts`, and on every request
@@ -422,6 +430,11 @@ REQ / OFFLINE answer `461` for those platforms until refilled.
   expires at `nextUpdate`; non-LAZY miss is 404)
 - NVIDIA NRAS CORS proxy `POST /nvidia/nras/attest/gpu` →
   `nras.attestation.nvidia.com/v3/attest/gpu` (no persistence; OFFLINE is 503)
+- Collateral-scoped CORS (`Access-Control-Allow-Origin: *` on Intel/AMD/
+  NVIDIA collateral responses, OPTIONS preflight answered on those paths,
+  `Expose-Headers` covers the Intel issuer-chain and `SGX-TCBm` headers) for
+  browser clients such as dcap-qvl. Node PCCS sends no CORS headers at all;
+  this is an intentional addition.
 - Auth, Request-ID (always freshly generated), v3 Warning, Intel headers,
   `text/html` error bodies, body limit (413 `Content too large.`),
   `x-powered-by` not set
