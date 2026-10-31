@@ -116,33 +116,93 @@ pub async fn post_nvidia_ocsp(
     Ok(amd_response(state.cache.get_nvidia_ocsp(&body).await?))
 }
 
-// --------------- NVIDIA NRAS (GPU attestation) ---------------
+// --------------- CORS ---------------
 
-fn insert_nras_cors(headers: &mut HeaderMap) {
+/// `Access-Control-Expose-Headers`: every custom header a browser client may
+/// need to read. dcap-qvl's `getHeader` pulls the Intel issuer chains and
+/// `SGX-TCBm` from collateral responses; without an expose entry the browser
+/// hides non-safelisted headers even when the origin is allowed.
+const CORS_EXPOSE_HEADERS: &str = concat!(
+    "Retry-After, Request-ID, Warning, ",
+    "SGX-TCBm, SGX-FMSPC, SGX-PCK-Certificate-CA-Type, ",
+    "SGX-PCK-Certificate-Issuer-Chain, SGX-PCK-CRL-Issuer-Chain, ",
+    "TCB-Info-Issuer-Chain, SGX-TCB-Info-Issuer-Chain, SGX-Enclave-Identity-Issuer-Chain"
+);
+
+fn insert_cors(headers: &mut HeaderMap) {
     insert(headers, "access-control-allow-origin", "*");
-    insert(headers, "access-control-allow-methods", "POST, OPTIONS");
-    insert(headers, "access-control-allow-headers", "Content-Type");
-    insert(headers, "access-control-expose-headers", "Retry-After");
-    insert(headers, "cache-control", "no-store");
+    insert(headers, "access-control-allow-methods", "GET, HEAD, POST, PUT, OPTIONS");
+    insert(headers, "access-control-allow-headers", "Content-Type, user-token, admin-token");
+    insert(headers, "access-control-expose-headers", CORS_EXPOSE_HEADERS);
+    insert(headers, "access-control-max-age", "86400");
 }
 
 fn is_nras_path(path: &str) -> bool {
     path == "/nvidia/nras" || path.starts_with("/nvidia/nras/")
 }
 
-/// Path-scoped CORS for `/nvidia/nras`. Wraps `DefaultBodyLimit` so 413 still
-/// gets ACAO, but sits inside `add_request_id`. OPTIONS is answered here so
-/// preflight does not depend on a matching POST route.
-pub async fn nras_cors(req: Request, next: Next) -> Response {
+/// Path prefixes of the Intel collateral routers (see `create_app`).
+const INTEL_PREFIXES: &[&str] =
+    &["/sgx/certification/v3", "/sgx/certification/v4", "/tdx/certification/v4"];
+
+/// CORS scope: the public, signed-collateral endpoints (Intel, AMD, NVIDIA)
+/// that browser clients such as dcap-qvl fetch. Operator endpoints
+/// (`platforms`, `platformcollateral`, `refresh`), `/healthz` and unmatched
+/// routes are deliberately excluded.
+fn is_collateral_path(path: &str) -> bool {
+    // AMD KDS and NVIDIA RIM read-through caches.
+    if path.starts_with("/vcek/") || path.starts_with("/vlek/") || path.starts_with("/v1/rim/") {
+        return true;
+    }
+    // NVIDIA OCSP cache and the NRAS proxy.
+    if path == "/ocsp" || is_nras_path(path) {
+        return true;
+    }
+    // Intel collateral leaves. `GET /appraisalpolicy` is a public read; only
+    // its PUT is admin-guarded, and a CORS header on that 401 is harmless.
+    let Some(rest) = INTEL_PREFIXES.iter().find_map(|p| path.strip_prefix(p)) else {
+        return false;
+    };
+    matches!(
+        rest,
+        "/pckcert"
+            | "/pckcrl"
+            | "/tcb"
+            | "/qe/identity"
+            | "/qve/identity"
+            | "/rootcacrl"
+            | "/crl"
+            | "/appraisalpolicy"
+    )
+}
+
+/// Collateral-scoped CORS. The matched endpoints only serve public,
+/// Intel/AMD/NVIDIA-signed collateral, and auth uses non-ambient
+/// `user-token`/`admin-token` headers, so a static
+/// `Access-Control-Allow-Origin: *` exposes nothing sensitive and stays valid
+/// on CDN-cached copies (no `Vary: Origin` needed). OPTIONS preflight is
+/// answered here for collateral paths so it does not depend on a matching
+/// route. `Cache-Control: no-store` stays scoped to the nonce-bound
+/// `/nvidia/nras` proxy. Wraps `DefaultBodyLimit` so 413 still gets ACAO, but
+/// sits inside `add_request_id` so preflight (answered without calling next)
+/// still gets a fresh id.
+pub async fn cors(req: Request, next: Next) -> Response {
+    if !is_collateral_path(req.uri().path()) {
+        return next.run(req).await;
+    }
     let nras = is_nras_path(req.uri().path());
-    if nras && req.method() == Method::OPTIONS {
+    if req.method() == Method::OPTIONS {
         let mut headers = HeaderMap::new();
-        insert_nras_cors(&mut headers);
+        insert_cors(&mut headers);
+        if nras {
+            insert(&mut headers, "cache-control", "no-store");
+        }
         return (StatusCode::NO_CONTENT, headers).into_response();
     }
     let mut response = next.run(req).await;
+    insert_cors(response.headers_mut());
     if nras {
-        insert_nras_cors(response.headers_mut());
+        insert(response.headers_mut(), "cache-control", "no-store");
     }
     response
 }
@@ -192,6 +252,8 @@ pub async fn collateral_cache_control(
     }
     response
 }
+
+// --------------- NVIDIA NRAS (GPU attestation) ---------------
 
 pub async fn post_nvidia_nras_attest_gpu(
     State(state): State<AppState>,

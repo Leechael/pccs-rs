@@ -76,7 +76,7 @@ pub fn create_app(state: AppState) -> Router {
         .layer(middleware::from_fn(routes::handlers::reject_trailing_slash))
         // CORS wraps the body-limit 413, but stays inside Request-ID so OPTIONS
         // preflight (answered without calling next) still gets a fresh id.
-        .layer(middleware::from_fn(routes::handlers::nras_cors))
+        .layer(middleware::from_fn(routes::handlers::cors))
         .layer(middleware::from_fn(auth::add_request_id))
         .layer(middleware::from_fn_with_state(metrics_state, metrics::http_middleware))
         .with_state(state)

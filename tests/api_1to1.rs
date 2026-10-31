@@ -3153,8 +3153,10 @@ fn assert_nras_cors(headers: &axum::http::HeaderMap) {
     let methods = headers.get("access-control-allow-methods").unwrap().to_str().unwrap();
     assert!(methods.contains("POST"), "{methods}");
     assert!(methods.contains("OPTIONS"), "{methods}");
-    assert_eq!(headers.get("access-control-allow-headers").unwrap(), "Content-Type");
-    assert_eq!(headers.get("access-control-expose-headers").unwrap(), "Retry-After");
+    let allow = headers.get("access-control-allow-headers").unwrap().to_str().unwrap();
+    assert!(allow.contains("Content-Type"), "{allow}");
+    let expose = headers.get("access-control-expose-headers").unwrap().to_str().unwrap();
+    assert!(expose.contains("Retry-After"), "{expose}");
     assert_eq!(headers.get("cache-control").unwrap(), "no-store");
 }
 
@@ -3249,6 +3251,93 @@ async fn nvidia_nras_prefix_does_not_match_nras_extra() {
     let (status, headers, _) = send(app(), req).await;
     assert_ne!(status, StatusCode::NO_CONTENT);
     assert!(headers.get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
+async fn cors_get_collateral_exposes_intel_issuer_chain_headers() {
+    // Browser dcap-qvl sends simple GETs and reads issuer chains via
+    // `getHeader`; the browser hides non-safelisted headers unless exposed.
+    for path in [PCKCERT, TCB, QE, PCKCRL, "/tdx/certification/v4/tcb?fmspc=ABCDABCDABCD"] {
+        let (status, h, _) = send(app(), get(path)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(h.get("access-control-allow-origin").unwrap(), "*", "{path}");
+        let expose = h.get("access-control-expose-headers").unwrap().to_str().unwrap();
+        for name in [
+            headers::SGX_PCK_CRL_ISSUER_CHAIN,
+            headers::TCB_INFO_ISSUER_CHAIN,
+            headers::SGX_TCB_INFO_ISSUER_CHAIN,
+            headers::SGX_ENCLAVE_IDENTITY_ISSUER_CHAIN,
+            headers::SGX_PCK_CERTIFICATE_ISSUER_CHAIN,
+            headers::SGX_TCBM,
+        ] {
+            assert!(expose.contains(name), "{path}: expose {expose} missing {name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cors_options_preflight_is_answered_for_collateral_paths() {
+    for path in [
+        "/sgx/certification/v4/tcb",
+        "/sgx/certification/v3/pckcrl",
+        "/tdx/certification/v4/qe/identity",
+        "/vcek/v1/Milan/cert_chain",
+        "/vlek/v1/Milan/cert_chain",
+        "/v1/rim/some-rim",
+        "/ocsp",
+    ] {
+        let req = Request::builder().method("OPTIONS").uri(path).body(Body::empty()).unwrap();
+        let (status, h, _) = send(app(), req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{path}");
+        assert_eq!(h.get("access-control-allow-origin").unwrap(), "*", "{path}");
+        let methods = h.get("access-control-allow-methods").unwrap().to_str().unwrap();
+        assert!(methods.contains("GET") && methods.contains("HEAD"), "{path}: {methods}");
+        assert!(h.get("access-control-max-age").is_some(), "{path}");
+        // Non-NRAS preflights stay cacheable; no-store is NRAS-only.
+        assert!(h.get("cache-control").is_none(), "{path}");
+    }
+
+    // Operator endpoints, health probes and unknown routes stay CORS-free.
+    for path in [
+        "/sgx/certification/v4/platforms",
+        "/sgx/certification/v4/platformcollateral",
+        "/sgx/certification/v4/refresh",
+        "/healthz/ready",
+        "/no/such/route",
+    ] {
+        let req = Request::builder().method("OPTIONS").uri(path).body(Body::empty()).unwrap();
+        let (status, h, _) = send(app(), req).await;
+        assert_ne!(status, StatusCode::NO_CONTENT, "{path}");
+        assert!(h.get("access-control-allow-origin").is_none(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn cors_headers_follow_errors_on_collateral_paths_only() {
+    // A browser client must see the real status on collateral endpoints, not
+    // a CORS TypeError: cache-miss 404s and 400s carry ACAO.
+    let (status, h, _) = send(app(), get("/sgx/certification/v4/tcb?fmspc=FFFFFFFFFFFF")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(h.get("access-control-allow-origin").unwrap(), "*");
+
+    let (status, h, _) = send(app(), get("/sgx/certification/v4/tcb?fmspc=invalidFmspc")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(h.get("access-control-allow-origin").unwrap(), "*");
+
+    // Outside the collateral scope, responses carry no CORS headers.
+    let (status, h, _) = send(app(), get("/no/such/route")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(h.get("access-control-allow-origin").is_none());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/sgx/certification/v4/platforms")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, h, _) = send(app(), req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(h.get("access-control-allow-origin").is_none());
 }
 
 #[tokio::test]
